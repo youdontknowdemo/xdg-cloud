@@ -213,15 +213,19 @@ redirect_one() {
     info "ok: $ln -> $target"; return 0
   fi
 
-  # missing local dir: just symlink
-  if [ ! -e "$localpath" ]; then
-    run ln -s "$target" "$localpath"; return 0
-  fi
-
-  # existing plain symlink pointing elsewhere
+  # any other symlink (dangling, or pointing elsewhere): leave it untouched.
+  # NOTE: this must precede the `[ ! -e ]` check below — `-e` dereferences a
+  # symlink, so a DANGLING link (target gone) reports "missing" and would fall
+  # into the `ln -s` branch, which then fails ("File exists") on the still-present
+  # link inode and, under `set -e`, aborts the whole --apply run.
   if [ -L "$localpath" ]; then
     warn "$ln is a symlink to '$(readlink "$localpath")'; leaving it. Remove manually if you want it repointed."
     return 0
+  fi
+
+  # truly missing (not a file, not a symlink): just symlink
+  if [ ! -e "$localpath" ]; then
+    run ln -s "$target" "$localpath"; return 0
   fi
 
   # populated real directory
