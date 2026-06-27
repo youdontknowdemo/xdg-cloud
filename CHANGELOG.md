@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `redirect_one()` (`cloud-xdg-provision.sh`): dangling-symlink detection now
+  checks `[ -L ]` before `[ ! -e ]`. A dead symlink previously returned false
+  for `-e` (target gone), was misclassified as "missing", and caused `ln -s` to
+  fail on the still-present inode — aborting the entire `--apply` run under
+  `set -e`.
+
+### Added
+- `tests/smoke.sh`: apply-mode idempotency section — `cloud-xdg-provision.sh
+  --apply` is now exercised in a sandboxed `HOME` and re-run to assert
+  idempotency (ADR §10 #3). Regression guard for the dangling-symlink abort
+  fixed above.
+
+### Known issues / tracked for future work
+- Filter correctness: rclone filter excludes not yet asserted in tests (F2).
+- `redirect_one()` edge-case matrix not yet automated (F3).
+- `resolve_cloud_root()` picks the first alphabetically if two Google Drive
+  accounts are mounted; no disambiguation logic yet (F4).
+- `--version` flag not yet implemented (deferred per ADR §7) (F6).
+- ADR §8.1 sample `.shellcheckrc` differs from the as-built file (F7).
+
 ## [0.1.0] - 2026-06-26
 
 ### Added
@@ -26,5 +47,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `VERSION` file (`0.1.0`) as the single source of truth for the release string.
 - MIT `LICENSE`.
 
-[Unreleased]: https://github.com/Pipulate/xdg-cloud/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/Pipulate/xdg-cloud/releases/tag/v0.1.0
+[Unreleased]: https://github.com/miklevin/xdg-cloud/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/miklevin/xdg-cloud/releases/tag/v0.1.0

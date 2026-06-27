@@ -72,7 +72,7 @@ Options:
   --apply            Actually create dirs / run sync (default is dry-run).
   --sync             Perform a ONE-WAY backup (local -> cloud, deletions archived).
   --bisync           Perform a TWO-WAY sync (uses rclone bisync; see notes).
-  --root PATH        Home tree root (default: \$HOME).
+  --root PATH        Home tree root (default: \$HOME_TREE_ROOT / \$HOME).
   --remote NAME      rclone remote name (default: \$RCLONE_REMOTE / gdrive).
   --dest PATH        Subpath inside the remote (default: \$DRIVE_SUBDIR / Backup/home).
   --max-delete N     Abort a sync that would delete more than N files (default: $MAX_DELETE).
@@ -151,6 +151,8 @@ ensure_home_tree() {
 # a final catch-all deny so nothing slips through by accident.
 # ---------------------------------------------------------------------------
 write_filter() {
+  # Ensure the target dir exists — $TMPDIR may point at a path not yet created.
+  mkdir -p "${TMPDIR:-/tmp}"
   cat > "$FILTER_FILE" <<'FILTEREOF'
 # === NEVER sync: high-churn, machine-specific, or lock-sensitive ===
 - /Cache/**

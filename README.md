@@ -158,6 +158,14 @@ System root dirs (/ /usr /etc /var /opt /Applications /System /Library):
 (Folder names follow `--style`; `mac` capitalizes them. `home-tree.sh` uses the
 capitalized `SAFE_DIRS` set: `Documents Pictures Music Videos Projects Notes`.)
 
+> **Directory-set divergence between the two scripts:**
+> `cloud-xdg-provision.sh` manages `Desktop`, `Downloads`, `Public`, and
+> `Templates` in addition to the shared set — these map to XDG user-dirs that
+> exist on most desktops. `home-tree.sh` manages `Notes` instead — a common
+> personal folder with no XDG variable. Neither script is wrong; they cater to
+> different usage patterns. If you switch strategies later, check for any
+> directories in one set that you also want managed by the other.
+
 ---
 
 ## Known traps
@@ -195,6 +203,15 @@ make version    # print the version string from VERSION
 The pre-commit hook (committed at `hooks/pre-commit`) runs `make lint` and blocks
 any commit that fails shellcheck. It is **not** active until you run
 `make install` once after cloning.
+
+> **Testing `--apply` manually:** `cloud-xdg-provision.sh --apply` creates
+> symlinks under the real `$HOME`. To test without touching your home directory,
+> override `HOME` explicitly:
+> ```sh
+> mkdir -p /tmp/xdg-test-home && HOME=/tmp/xdg-test-home \
+>   /bin/bash bin/cloud-xdg-provision.sh --cloud-root /tmp/xdg-test-cloud --apply
+> ```
+> `make test` does this automatically (sandboxed `HOME` per ADR §10).
 
 ## License
 

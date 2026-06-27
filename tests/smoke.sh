@@ -45,11 +45,15 @@ assert_contains() {
 
 echo "smoke: cloud-xdg-provision.sh dry-run"
 out="$(/bin/bash "${repo}/bin/cloud-xdg-provision.sh" --cloud-root "${cloud_root}" 2>&1)"
-assert_contains "${out}" "DRY-RUN" "cloud-xdg-provision.sh reports DRY-RUN and exits 0"
+# Assert the specific banner line (proves the script reached main() and detected
+# its mode) — not merely that "DRY-RUN" appears somewhere an error could echo it.
+assert_contains "${out}" "platform=" "cloud-xdg-provision.sh prints its platform/mode banner"
+assert_contains "${out}" "mode=DRY-RUN" "cloud-xdg-provision.sh banner reports DRY-RUN mode"
 
 echo "smoke: home-tree.sh dry-run"
 out="$(/bin/bash "${repo}/bin/home-tree.sh" --root "${home_root}" 2>&1)"
-assert_contains "${out}" "DRY-RUN" "home-tree.sh reports DRY-RUN and exits 0"
+assert_contains "${out}" "platform:" "home-tree.sh prints its platform/mode banner"
+assert_contains "${out}" "mode: DRY-RUN" "home-tree.sh banner reports DRY-RUN mode"
 
 # ---------------------------------------------------------------------------
 # Apply-mode idempotency (ADR §10 #3) — cloud-xdg-provision.sh only.

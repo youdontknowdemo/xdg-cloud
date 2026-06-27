@@ -18,6 +18,9 @@ Thumbs.db
 tests/sandbox/*
 !tests/sandbox/.gitkeep
 
+# === Temporary / editor backup files ===
+*.bak
+
 # === Script-generated artifacts ===
 # cloud-xdg-provision.sh --relocate renames originals aside before symlinking:
 *.pre-offload-*
