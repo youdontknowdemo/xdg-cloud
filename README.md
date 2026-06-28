@@ -189,6 +189,40 @@ capitalized `SAFE_DIRS` set: `Documents Pictures Music Videos Projects Notes`.)
   state.
 - **Don't run both scripts on one home.** See the warning at the top.
 
+### macOS: special home folders & iCloud Drive (important)
+
+macOS treats `Desktop`, `Documents`, `Downloads`, `Music`, `Movies`, `Pictures`,
+and `Public` as **protected special folders**, and `cloud-xdg-provision.sh
+--relocate` **cannot move them** on macOS. This is by design, not a bug:
+
+- **It's an ACL, not TCC.** Each special folder carries a
+  `group:everyone deny delete` ACL (`ls -lde ~/Public` shows it) that macOS
+  applies to preserve the standard home layout. Renaming a directory needs the
+  `delete` right, so `mv ~/Public …` returns `Permission denied`. **Full Disk
+  Access does not help** — all five macOS access layers (POSIX, ACL, TCC, SIP,
+  sandbox) must independently approve, and a `deny` ACE wins regardless of FDA.
+  Stripping the ACL (`chmod -N`) is *not* recommended: its reversibility and
+  side effects are undocumented. `--relocate` detects this and skips the folder
+  (nothing copied), so your data is never touched.
+- **Use Apple's native feature for Desktop + Documents.** The only supported way
+  to put these in iCloud is *System Settings → [your name] → iCloud → iCloud
+  Drive → "Desktop & Documents Folders"* (both move together; it's
+  FileProvider-backed, not a symlink you can imitate).
+- **Music / Movies / Pictures / Public have no folder-level iCloud option.**
+  Leave them local. Use the **Photos app** (iCloud Photos) and **Apple Music**
+  for the two that have app-native cloud; the rest stay on local disk.
+- 🚩 **iCloud "Optimize Mac Storage" is a dataloss footgun for this tool.** With
+  it on, iCloud evicts local files to invisible *dataless placeholders* — and
+  copying a placeholder with `rsync`/`cp` (what `--relocate` uses) moves an
+  **empty stub**, losing the real data. Evicted files are also invisible to Time
+  Machine and Spotlight. **Turn off "Optimize Mac Storage"** (or right-click →
+  "Keep Downloaded") before relocating anything out of an iCloud path.
+
+**Net:** on macOS the symlink-relocate model is correct for the *non-special*
+dirs (`Projects`, `Templates`, and any custom folders with no `deny delete`
+ACL); for the protected home folders, use Apple's native iCloud feature instead.
+The model is fully portable on Linux/XDG, where these ACLs don't exist.
+
 ---
 
 ## Development
