@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# xdg-cloud pre-commit hook — blocks commits that fail shellcheck.
+# Installed via `make install` (symlinked into .git/hooks/pre-commit).
+set -euo pipefail
+if ! command -v shellcheck >/dev/null 2>&1; then
+  printf 'pre-commit: shellcheck not found — install it, or run "make lint" manually.\n' >&2
+  exit 1
+fi
+exec make --no-print-directory lint
