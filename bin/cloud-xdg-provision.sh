@@ -417,7 +417,42 @@ verify_copy() {
 }
 
 relocate_dir() {
-  local src="$1" dst="$2" stamp aside copier probe n
+  local src="$1" dst="$2" stamp aside copier probe n acl_listing
+
+  # B6 (issue #9): macOS 'group:everyone deny delete' ACL on standard special
+  # folders. macOS stamps Desktop/Documents/Downloads/Music/Movies/Pictures/Public
+  # with a deny-delete ACL. Renaming a dir needs the `delete` right, so `mv` fails —
+  # and NO macOS layer can rescue it: a deny ACE always wins, so Full Disk Access
+  # CANNOT override it (verified on a real Mac: FDA granted + effective + rebooted,
+  # still blocked). This is NOT a TCC problem, so the old "grant Full Disk Access
+  # and retry" advice was wrong and could never work. Detect the ACL on the ACTUAL
+  # dir (not by hardcoded name) so this naturally covers the standard folders AND
+  # any other ACL-protected dir, while unprotected custom dirs (Projects, Templates,
+  # …) relocate normally. macOS only — `ls -lde` is a BSD/macOS extension. Caught
+  # BEFORE the B5 cloud guard and the B2 rename-probe so the accurate message wins
+  # and nothing is copied or moved. `ls -lde` is the documented way to read a dir's
+  # ACL on macOS; we capture it and case-match (no `ls | grep`) for the deny ACE.
+  if [ "$PLATFORM" = "macos" ]; then
+    acl_listing="$(ls -lde "$src" 2>/dev/null || true)"
+    case "$acl_listing" in
+      *"deny delete"*)
+        warn "cannot relocate $src — macOS protects it with a 'group:everyone deny delete' ACL."
+        warn "  This is the ACL, NOT TCC: Full Disk Access CANNOT override a deny ACE."
+        case "$(basename "$src")" in
+          Desktop|Documents)
+            warn "  Use Apple's native feature instead: System Settings > [Apple ID] > iCloud >"
+            warn "  iCloud Drive > 'Desktop & Documents Folders'. Skipping — nothing copied." ;;
+          Music|Movies|Pictures|Public)
+            warn "  There is no folder-level iCloud option for this dir (use the Photos app or"
+            warn "  Apple Music where applicable; otherwise leave it local). Skipping — nothing copied." ;;
+          *)
+            warn "  This dir cannot be relocated while the deny-delete ACL is present."
+            warn "  Skipping — nothing copied." ;;
+        esac
+        return 0 ;;
+    esac
+  fi
+
   stamp="$(date +%Y%m%d-%H%M%S)"
   # Guarantee a UNIQUE aside name. The stamp is second-resolution, so a
   # same-second re-run (or a leftover stale aside) could collide — and
@@ -443,10 +478,11 @@ relocate_dir() {
     return 0
   fi
 
-  # B2: macOS TCC pre-flight. macOS blocks access to protected dirs (~/Desktop,
-  # ~/Documents, ~/Downloads, ~/Pictures, ~/Movies) unless the terminal has Full
-  # Disk Access — and the failure otherwise lands at `mv` AFTER rsync has already
-  # copied everything. Probe up-front so we fail fast having copied NOTHING.
+  # B2: macOS TCC pre-flight, for a GENUINE permission block that is NOT the
+  # deny-delete ACL (that case was caught and skipped above with accurate guidance).
+  # A terminal without Full Disk Access can still be blocked from renaming some dirs,
+  # and the failure otherwise lands at `mv` AFTER rsync has already copied
+  # everything. Probe up-front so we fail fast having copied NOTHING.
   # We probe with the EXACT operation relocate performs — renaming the dir — which
   # is a faithful TCC test. The rename is immediately reverted, AND an
   # EXIT/INT/TERM trap guarantees the revert if the process is killed at ANY point
@@ -458,10 +494,10 @@ relocate_dir() {
     trap 'mv "$probe" "$src" 2>/dev/null || true' EXIT INT TERM
     if ! mv "$src" "$probe" 2>/dev/null; then
       trap - EXIT INT TERM
-      warn "cannot rename $src — macOS is blocking access (TCC)."
-      warn "  Protected dirs (Documents, Desktop, Downloads, Pictures, Movies) need"
-      warn "  Full Disk Access: System Settings > Privacy & Security > Full Disk Access"
-      warn "  → add your terminal, then retry. Skipping this dir — nothing copied."
+      warn "cannot rename $src — macOS is blocking the rename (not the deny-delete ACL)."
+      warn "  If your terminal lacks Full Disk Access, grant it: System Settings >"
+      warn "  Privacy & Security > Full Disk Access → add your terminal, then retry."
+      warn "  Skipping this dir — nothing copied."
       return 0
     fi
     mv "$probe" "$src"

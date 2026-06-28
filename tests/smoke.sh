@@ -288,6 +288,64 @@ assert_contains "${out}" "does not look like a live cloud mount" "dry-run warns 
 #     by the relocate group above; the failure path stays a real-macOS TEST target. ---
 echo "smoke: B2 macOS TCC pre-flight — SKIPPED (failure path needs real TCC / read-only HOME)"
 
+# --- Group B6 (issue #9): macOS 'group:everyone deny delete' ACL on a special folder
+#     is DETECTED and the dir is SKIPPED with accurate native-iCloud guidance — NOT
+#     the misleading "grant Full Disk Access and retry" advice (FDA cannot override a
+#     deny ACE). Gated on real macOS + `chmod +a`: the ACL is an APFS/macOS feature
+#     and is genuinely unreproducible elsewhere, so non-macOS skips with a reason.
+#     This is the regression the old B2-SKIPPED note called a "real-macOS TEST target":
+#     `chmod +a` on a SINGLE dir reproduces it faithfully without a read-only HOME. ---
+b6_supported=0
+if [ "$(uname -s)" = "Darwin" ]; then
+  b6probe="${sandbox}/b6-aclprobe"
+  mkdir -p "${b6probe}"
+  if chmod +a "group:everyone deny delete" "${b6probe}" 2>/dev/null; then
+    b6_supported=1
+    # Strip the ACL so the EXIT-trap rm -rf can delete the probe (deny-delete would
+    # otherwise block removing the dir itself).
+    chmod -a "group:everyone deny delete" "${b6probe}" 2>/dev/null || true
+  fi
+  rm -rf "${b6probe}"
+fi
+if [ "${b6_supported}" -eq 1 ]; then
+  echo "smoke: B6 — macOS deny-delete ACL special folder is skipped with accurate guidance"
+  b6h="${sandbox}/b6-home"; b6c="${sandbox}/b6-cloud"
+  mkdir -p "${b6h}/Documents" "${b6c}"
+  printf 'notes\n' > "${b6h}/Documents/notes.txt"
+  chmod +a "group:everyone deny delete" "${b6h}/Documents"
+  set +e
+  out="$(HOME="${b6h}" /bin/bash "${PROV}" --cloud-root "${b6c}" --apply --relocate --allow-local-root 2>&1)"
+  rc=$?
+  set -e
+  # Strip the ACL NOW (output is captured) so cleanup is robust even if an assert
+  # below fails and the EXIT trap fires with the dir still ACL-protected.
+  chmod -a "group:everyone deny delete" "${b6h}/Documents" 2>/dev/null || true
+  pass_if "${rc}" "ACL-protected dir run exits 0 (skips cleanly)" \
+    "run failed (exit ${rc}) instead of skipping the ACL dir: ${out}"
+  # (a) NOT relocated: still a real dir (not a symlink), contents intact, no aside.
+  if [ -d "${b6h}/Documents" ] && [ ! -L "${b6h}/Documents" ] && [ -f "${b6h}/Documents/notes.txt" ]; then
+    ok "ACL-protected Documents left in place (real dir, not a symlink)"
+  else
+    fail "ACL-protected Documents was altered/relocated despite the deny-delete ACL"
+  fi
+  if ls -d "${b6h}"/Documents.pre-offload-* >/dev/null 2>&1; then
+    fail "an aside dir was created even though the ACL dir should be skipped"
+  else
+    ok "no *.pre-offload-* aside created (nothing was moved)"
+  fi
+  # (b) accurate guidance is printed.
+  assert_contains "${out}" "deny delete" "skip message names the deny-delete ACL"
+  assert_contains "${out}" "NOT TCC" "skip message states it is the ACL, not TCC"
+  assert_contains "${out}" "Desktop & Documents Folders" \
+    "Documents skip points to Apple's native iCloud feature"
+  # (c) the misleading "grant FDA and retry" advice is NOT shown for the ACL case
+  #     (the B2/TCC path owns that wording — it must not leak here).
+  assert_not_contains "${out}" "add your terminal, then retry" \
+    "no misleading 'grant Full Disk Access and retry' advice for the ACL case"
+else
+  echo "smoke: B6 macOS deny-delete ACL — SKIPPED (needs real macOS + chmod +a ACL support)"
+fi
+
 # --- Group 6: home-tree.sh rclone filter is the single source of truth for what may
 #     reach the cloud (review BLOCKING-3; home-tree.sh:153). A dropped deny line would
 #     leak SQLite/secrets. Inspect the generated filter directly — no rclone needed. ---
