@@ -54,11 +54,27 @@ REDIRECT_DOWNLOADS=0  # downloads is triage/ephemeral; off by default
 ALLOW_LOCAL_ROOT=0 # 1 = skip the cloud-mount liveness check (B4 override)
 FAST_VERIFY=0      # 1 = size/mtime post-copy verify instead of checksum (B3)
 
-# State for the relocate recovery trap (see relocate_dir / relocate_recovery_msg).
+# State for the single master cleanup trap (cleanup_handler). bash 3.2 allows only
+# ONE handler per signal and has no trap-stacking, so the concurrency lock (#5c),
+# the macOS TCC-probe revert (B2), and the mid-relocate recovery message (B3) must
+# all be served by ONE handler driven by these flags — NOT by separate `trap`
+# install/clear pairs that would clobber each other. relocate_dir toggles the
+# PROBE_*/RELOCATE_* flags around its critical windows; main() owns the LOCK_* flags.
 RELOCATE_ACTIVE=0
 RELOCATE_SRC=""
 RELOCATE_ASIDE=""
 RELOCATE_DST=""
+
+# macOS TCC rename-probe state (B2): set ACTIVE before the rename so an interrupt in
+# the sub-millisecond window is always reverted by the master handler.
+PROBE_ACTIVE=0
+PROBE_PATH=""
+PROBE_SRC=""
+
+# Concurrency lock state (#5c). LOCK_OWNED guards release so we never rmdir a lock
+# we did not create (e.g. the die path when another run already holds it).
+LOCK_DIR=""
+LOCK_OWNED=0
 
 SELF="$(basename "$0")"
 
@@ -102,17 +118,65 @@ run()  {
   fi
 }
 
-# Recovery trap for the relocate mv->ln window. If the shell exits unexpectedly
-# between renaming the original aside and creating the replacement symlink, the
-# tree is in a recoverable-but-confusing half-state; print plainly where the data
-# is so the user never panics or deletes the wrong thing. Armed only around that
-# window (see relocate_dir); a no-op otherwise.
-relocate_recovery_msg() {
-  [ "${RELOCATE_ACTIVE:-0}" -eq 1 ] || return 0
-  warn "INTERRUPTED mid-relocate — your data is SAFE, here is the state:"
-  warn "  original:  moved to '$RELOCATE_ASIDE' if the rename finished, else still at '$RELOCATE_SRC'"
-  warn "  cloud copy: '$RELOCATE_DST'"
-  warn "  the symlink '$RELOCATE_SRC' may not exist yet. Re-run to finish. Delete NOTHING until verified."
+# Single master cleanup handler — installed once (see install_cleanup_trap, called
+# from main() right after the lock is acquired) on EXIT INT TERM. It serves THREE
+# independent responsibilities, each gated on its own flag, so they never clobber
+# one another the way separate `trap`/`trap -` pairs would under bash 3.2:
+#   1. PROBE_ACTIVE  — revert an interrupted macOS TCC rename-probe (B2).
+#   2. RELOCATE_ACTIVE — print the mid-relocate recovery message (B3): if the shell
+#      exits between renaming the original aside and creating the replacement
+#      symlink, the tree is in a recoverable-but-confusing half-state; show plainly
+#      where the data is so the user never panics or deletes the wrong thing.
+#   3. LOCK_OWNED — release the concurrency lock (#5c) on EVERY exit path (success,
+#      die/error, INT/TERM) so a crash never strands a stale lock.
+# All three windows are apply-mode-only (relocate's probe/recovery code and the
+# lock are only armed when DRY_RUN=0), so a dry-run Ctrl-C prints nothing spurious.
+cleanup_handler() {
+  if [ "${PROBE_ACTIVE:-0}" -eq 1 ]; then
+    mv "$PROBE_PATH" "$PROBE_SRC" 2>/dev/null || true
+  fi
+  if [ "${RELOCATE_ACTIVE:-0}" -eq 1 ]; then
+    warn "INTERRUPTED mid-relocate — your data is SAFE, here is the state:"
+    warn "  original:  moved to '$RELOCATE_ASIDE' if the rename finished, else still at '$RELOCATE_SRC'"
+    warn "  cloud copy: '$RELOCATE_DST'"
+    warn "  the symlink '$RELOCATE_SRC' may not exist yet. Re-run to finish. Delete NOTHING until verified."
+  fi
+  if [ "${LOCK_OWNED:-0}" -eq 1 ] && [ -n "${LOCK_DIR:-}" ]; then
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    LOCK_OWNED=0
+  fi
+}
+
+install_cleanup_trap() { trap cleanup_handler EXIT INT TERM; }
+
+# #5a: refuse to run as root. This tool creates dirs and symlinks under the
+# invoking user's $HOME; as root those entries would be root-owned (and, via sudo,
+# $HOME may not even be the intended user's), leaving a home the user can't manage.
+# Cheapest possible refusal — called first in main(), before any filesystem work.
+guard_not_root() {
+  if [ "$(id -u)" = "0" ]; then
+    die "refuse to run as root — it would create root-owned entries in your home. Run as your normal user."
+  fi
+}
+
+# #5c: atomic concurrency lock. Two simultaneous runs against the same home could
+# race on the same dirs/symlinks (and on the relocate mv->ln window). Stock macOS
+# bash 3.2 has no flock, so we use `mkdir` as the atomic primitive: it succeeds for
+# exactly one racer and fails for the rest. Apply-mode only (a dry-run mutates
+# nothing, so it needs no lock). The lock is released by the master cleanup_handler
+# (LOCK_OWNED-gated) on every exit path. Keyed per-home under $XDG_CACHE_HOME.
+acquire_lock() {
+  [ "$DRY_RUN" -eq 0 ] || return 0
+  LOCK_DIR="$XDG_CACHE_HOME/cloud-xdg-provision.lock"
+  # The atomic `mkdir "$LOCK_DIR"` needs its parent to exist; ensure_local_base
+  # creates $XDG_CACHE_HOME later, so make it here first (idempotent, -p).
+  mkdir -p "$XDG_CACHE_HOME"
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    LOCK_OWNED=1
+  else
+    die "another run is in progress (lock: $LOCK_DIR).
+  If no other run is active, the lock is stale — remove it and retry: rmdir '$LOCK_DIR'"
+  fi
 }
 
 usage() {
@@ -178,11 +242,30 @@ esac
 resolve_cloud_root() {
   if [ -n "$CLOUD_ROOT" ]; then return 0; fi
   if [ "$PLATFORM" = "macos" ]; then
-    local d
+    # Issue #4: with several Google accounts mounted there are multiple
+    # ~/Library/CloudStorage/GoogleDrive-* dirs. The old code took the FIRST match
+    # silently — so the wrong account could be chosen with no warning. Collect ALL
+    # candidates (dirs that actually contain "My Drive"); use the one only if it is
+    # unambiguous, otherwise refuse and make the user disambiguate with --cloud-root.
+    # bash 3.2: count via a loop + accumulate a newline-listed string (no arrays).
+    local d count first candidates
+    count=0; first=""; candidates=""
     for d in "$HOME"/Library/CloudStorage/GoogleDrive-*; do
-      if [ -d "$d/My Drive" ]; then CLOUD_ROOT="$d/My Drive"; return 0; fi
+      [ -d "$d/My Drive" ] || continue          # also skips the literal glob when nothing matches
+      count=$((count + 1))
+      if [ -z "$first" ]; then first="$d/My Drive"; fi
+      candidates="${candidates}    $d/My Drive
+"
     done
-    die "No Google Drive mount found. Pass --cloud-root PATH."
+    if [ "$count" -eq 0 ]; then
+      die "No Google Drive mount found. Pass --cloud-root PATH."
+    fi
+    if [ "$count" -gt 1 ]; then
+      die "Multiple Google Drive mounts found — refusing to guess which one you mean:
+${candidates}  Pass --cloud-root PATH to choose one explicitly."
+    fi
+    CLOUD_ROOT="$first"
+    return 0
   fi
   die "CLOUD_ROOT unset. On $PLATFORM, set it to your mounted drive path (e.g. an rclone mount). Pass --cloud-root PATH."
 }
@@ -288,9 +371,11 @@ cloud_name() {
   if [ "$STYLE" = "mac" ]; then printf '%s' "$2"; else printf '%s' "$1"; fi
 }
 
-# local home dir name for current platform
+# local home dir name for current platform.  $1 = the Apple/macOS name, $2 = the
+# Linux/XDG name.  (Issue #7: the canonical name is not needed here — local naming
+# only ever differs between macOS and Linux — so it is no longer a parameter.)
 local_name() {
-  if [ "$PLATFORM" = "macos" ]; then printf '%s' "$2"; else printf '%s' "$3"; fi
+  if [ "$PLATFORM" = "macos" ]; then printf '%s' "$1"; else printf '%s' "$2"; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -333,7 +418,7 @@ redirect_one() {
   fi
 
   cn="$(cloud_name "$canon" "$mac")"
-  ln="$(local_name "$canon" "$mac" "$lin")"
+  ln="$(local_name "$mac" "$lin")"
   target="$CLOUD_ROOT/$cn"
   localpath="$HOME/$ln"
 
@@ -484,16 +569,17 @@ relocate_dir() {
   # and the failure otherwise lands at `mv` AFTER rsync has already copied
   # everything. Probe up-front so we fail fast having copied NOTHING.
   # We probe with the EXACT operation relocate performs — renaming the dir — which
-  # is a faithful TCC test. The rename is immediately reverted, AND an
-  # EXIT/INT/TERM trap guarantees the revert if the process is killed at ANY point
-  # during the probe — armed BEFORE the first rename so even the sub-millisecond
-  # window can't strand the dir (the revert is a harmless no-op if the rename
-  # never happened). macOS only; dry-run never touches anything.
+  # is a faithful TCC test. The rename is immediately reverted, AND the master
+  # cleanup_handler (already installed by main()) guarantees the revert if the
+  # process is killed at ANY point during the probe: we set PROBE_ACTIVE=1 BEFORE
+  # the first rename so even the sub-millisecond window can't strand the dir (the
+  # revert is a harmless no-op if the rename never happened). macOS only; dry-run
+  # never touches anything.
   if [ "$DRY_RUN" -eq 0 ] && [ "$PLATFORM" = "macos" ]; then
     probe="${src}.tcc-probe.$$"
-    trap 'mv "$probe" "$src" 2>/dev/null || true' EXIT INT TERM
+    PROBE_SRC="$src"; PROBE_PATH="$probe"; PROBE_ACTIVE=1
     if ! mv "$src" "$probe" 2>/dev/null; then
-      trap - EXIT INT TERM
+      PROBE_ACTIVE=0
       warn "cannot rename $src — macOS is blocking the rename (not the deny-delete ACL)."
       warn "  If your terminal lacks Full Disk Access, grant it: System Settings >"
       warn "  Privacy & Security > Full Disk Access → add your terminal, then retry."
@@ -501,7 +587,7 @@ relocate_dir() {
       return 0
     fi
     mv "$probe" "$src"
-    trap - EXIT INT TERM
+    PROBE_ACTIVE=0
   fi
 
   log "RELOCATE  $src  ->  $dst   (copier: $copier)"
@@ -521,16 +607,18 @@ relocate_dir() {
   fi
 
   # Recovery net for the mv -> ln window: if the shell exits unexpectedly here
-  # (set -e abort, SIGINT, crash), print plainly where everything is. Armed only
-  # in apply mode — in dry-run the run-lines are no-op prints, so a Ctrl-C there
-  # must not print a spurious "INTERRUPTED mid-relocate" message.
+  # (set -e abort, SIGINT, crash), the master cleanup_handler prints plainly where
+  # everything is. Armed only in apply mode by raising RELOCATE_ACTIVE — in dry-run
+  # the run-lines are no-op prints, so a Ctrl-C there must not print a spurious
+  # "INTERRUPTED mid-relocate" message (the handler stays silent while the flag is 0).
   if [ "$DRY_RUN" -eq 0 ]; then
     RELOCATE_ACTIVE=1; RELOCATE_SRC="$src"; RELOCATE_ASIDE="$aside"; RELOCATE_DST="$dst"
-    trap relocate_recovery_msg EXIT INT TERM
   fi
   run mv "$src" "$aside"
   run ln -s "$dst" "$src"
-  if [ "$DRY_RUN" -eq 0 ]; then trap - EXIT INT TERM; RELOCATE_ACTIVE=0; fi
+  # Window closed: lower the flag so the master handler no longer treats a later
+  # exit as mid-relocate. The trap itself stays installed (it still owns the lock).
+  if [ "$DRY_RUN" -eq 0 ]; then RELOCATE_ACTIVE=0; fi
 
   info "Original kept at: $aside"
   info "The script CANNOT confirm the cloud upload is durable — providers upload"
@@ -540,10 +628,21 @@ relocate_dir() {
 
 write_user_dirs() {
   [ "$PLATFORM" = "macos" ] && { info "macOS: user-dirs.dirs not used (symlinks handle it)."; return 0; }
-  local f="$XDG_CONFIG_HOME/user-dirs.dirs"
+  local f="$XDG_CONFIG_HOME/user-dirs.dirs" bak stamp n
   log "Writing XDG user-dirs: $f"
   if [ "$DRY_RUN" -eq 1 ]; then info "[dry-run] would write $f"; return 0; fi
   mkdir -p "$XDG_CONFIG_HOME"
+  # #5b: never overwrite an existing user-dirs.dirs without a backup — the user may
+  # have hand-tuned it. Copy it aside to a timestamped .bak first. A counter keeps
+  # the name unique if two runs land in the same second (second-resolution stamp).
+  if [ -e "$f" ]; then
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    bak="${f}.bak-${stamp}"
+    n=1
+    while [ -e "$bak" ]; do bak="${f}.bak-${stamp}.${n}"; n=$((n + 1)); done
+    cp "$f" "$bak"
+    info "Backed up existing user-dirs.dirs -> $bak"
+  fi
   {
     printf '# Generated by %s — points XDG user dirs at the cloud ontology.\n' "$SELF"
     local line canon xdgvar cn
@@ -584,9 +683,15 @@ EOF
 # Main
 # ---------------------------------------------------------------------------
 main() {
+  guard_not_root                # #5a — cheapest refusal, before any filesystem work
   resolve_cloud_root
   normalize_cloud_root
   check_cloud_liveness
+  # #5c — take the lock once the cheap validations have passed, then install the
+  # single master cleanup trap that owns lock release + probe revert + relocate
+  # recovery for the rest of the run (apply mode; a no-op installer in dry-run).
+  acquire_lock
+  install_cleanup_trap
   log "============================================================="
   log " cloud-xdg-provision  platform=$PLATFORM  style=$STYLE  mode=$([ "$DRY_RUN" -eq 1 ] && echo DRY-RUN || echo APPLY)"
   log " cloud root: $CLOUD_ROOT"

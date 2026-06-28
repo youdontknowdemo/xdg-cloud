@@ -511,4 +511,140 @@ mkdir -p "${g11h}" "${g11c}"
 out="$(HOME="${g11h}" /bin/bash "${PROV}" --cloud-root "${g11c}" 2>&1)"   # dry-run
 assert_contains "${out}" 'My\ Cloud\ Drive' "dry-run backslash-escapes spaces in the cloud path"
 
+# ===========================================================================
+# Robustness wins (issues #4 / #5 / #7) — same isolation rules as the groups above.
+# ===========================================================================
+
+# --- Issue #4: multiple ~/Library/CloudStorage/GoogleDrive-*/My Drive mounts must
+#     NOT be silently first-matched — resolve_cloud_root dies with a disambiguation
+#     message listing the candidates. macOS-gated: the auto-detect runs only on
+#     macOS (elsewhere resolve_cloud_root takes the generic 'CLOUD_ROOT unset' die). ---
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo "smoke: #4 — multiple Google Drive mounts are refused with a disambiguation message"
+  i4h="${sandbox}/i4-home"
+  mkdir -p "${i4h}/Library/CloudStorage/GoogleDrive-a@x.com/My Drive"
+  mkdir -p "${i4h}/Library/CloudStorage/GoogleDrive-b@y.com/My Drive"
+  set +e
+  out="$(HOME="${i4h}" /bin/bash "${PROV}" 2>&1)"   # dry-run, no --cloud-root → auto-detect
+  rc=$?
+  set -e
+  assert_nonzero "${rc}" "multi-mount auto-detect exits non-zero (refuses to guess)"
+  assert_contains "${out}" "Multiple Google Drive mounts found" "multi-mount death names the ambiguity"
+  assert_contains "${out}" "--cloud-root" "multi-mount death tells the user to pass --cloud-root"
+  assert_contains "${out}" "GoogleDrive-a@x.com/My Drive" "candidate list includes the first mount"
+  assert_contains "${out}" "GoogleDrive-b@y.com/My Drive" "candidate list includes the second mount"
+  # Single-mount sanity: exactly one candidate resolves cleanly (the count==1 path).
+  i4h1="${sandbox}/i4-home-single"
+  mkdir -p "${i4h1}/Library/CloudStorage/GoogleDrive-solo@x.com/My Drive"
+  set +e
+  out="$(HOME="${i4h1}" /bin/bash "${PROV}" 2>&1)"   # dry-run
+  rc=$?
+  set -e
+  pass_if "${rc}" "single Google Drive mount auto-detects cleanly (exit 0)" \
+    "single-mount auto-detect failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "GoogleDrive-solo@x.com/My Drive" "single mount is used as the cloud root"
+else
+  echo "smoke: #4 multiple Google Drive mounts — SKIPPED (auto-detect is macOS-only)"
+fi
+
+# --- Issue #5c: concurrency lock. A second run is refused while the lock dir
+#     exists; a normal run releases it (no stale lock left behind). XDG_CACHE_HOME
+#     is set explicitly so the lock path is deterministic regardless of the outer
+#     environment. Cross-platform (apply mode + --allow-local-root). ---
+echo "smoke: #5c — concurrency lock refuses a second run, releases on exit"
+i5h="${sandbox}/i5-home"; i5c="${sandbox}/i5-cloud"; i5cache="${i5h}/.cache"
+mkdir -p "${i5cache}" "${i5c}"
+lockdir="${i5cache}/cloud-xdg-provision.lock"
+mkdir -p "${lockdir}"   # simulate another run already holding the lock
+set +e
+out="$(HOME="${i5h}" XDG_CACHE_HOME="${i5cache}" /bin/bash "${PROV}" \
+  --cloud-root "${i5c}" --apply --allow-local-root 2>&1)"
+rc=$?
+set -e
+assert_nonzero "${rc}" "apply is refused while a lock exists"
+assert_contains "${out}" "another run is in progress" "lock refusal explains why"
+if [ -d "${lockdir}" ]; then
+  ok "pre-existing lock left intact (a refused run must not remove a lock it didn't create)"
+else
+  fail "a refused run removed a lock it did not own"
+fi
+rmdir "${lockdir}"
+# With the lock cleared, a clean run must acquire AND release it — no stale lock.
+set +e
+out="$(HOME="${i5h}" XDG_CACHE_HOME="${i5cache}" /bin/bash "${PROV}" \
+  --cloud-root "${i5c}" --apply --allow-local-root 2>&1)"
+rc=$?
+set -e
+pass_if "${rc}" "apply runs cleanly once the lock is gone (exit 0)" \
+  "apply failed after lock cleared (exit ${rc}): ${out}"
+if [ -d "${lockdir}" ]; then
+  fail "lock dir was left behind after a normal run (trap did not release it)"
+else
+  ok "lock released on exit — no stale lock remains (master cleanup trap fired)"
+fi
+
+# --- Issue #5b: write_user_dirs backs up a pre-existing user-dirs.dirs before
+#     overwriting it. That path is non-macOS only, so we force PLATFORM=linux via a
+#     `uname` PATH-shim (the script reads `uname -s` at load). --allow-local-root
+#     makes check_cloud_liveness return BEFORE the Linux GNU-stat liveness probe, so
+#     the shimmed run stays portable on this macOS host. Skips with reason if the
+#     shimmed non-macOS path proves unstable here. ---
+echo "smoke: #5b — existing user-dirs.dirs is backed up before overwrite (uname-shim forces Linux)"
+i6shim="${sandbox}/i6-shim"
+mkdir -p "${i6shim}"
+cat > "${i6shim}/uname" <<'UNAMESH'
+#!/bin/sh
+case "$1" in
+  -s) echo "Linux" ;;
+  *) exec /usr/bin/uname "$@" ;;
+esac
+UNAMESH
+chmod +x "${i6shim}/uname"
+i6h="${sandbox}/i6-home"; i6c="${sandbox}/i6-cloud"
+i6cfg="${i6h}/.config"; i6cache="${i6h}/.cache"
+mkdir -p "${i6cfg}" "${i6cache}" "${i6c}"
+printf 'XDG_DOCUMENTS_DIR="/old/hand/tuned/path"\n' > "${i6cfg}/user-dirs.dirs"
+set +e
+out="$(HOME="${i6h}" XDG_CONFIG_HOME="${i6cfg}" XDG_CACHE_HOME="${i6cache}" \
+  PATH="${i6shim}:${PATH}" /bin/bash "${PROV}" \
+  --cloud-root "${i6c}" --apply --allow-local-root 2>&1)"
+rc=$?
+set -e
+if [ "${rc}" -eq 0 ]; then
+  ok "shimmed-Linux apply run exits 0"
+  if ls -d "${i6cfg}"/user-dirs.dirs.bak-* >/dev/null 2>&1; then
+    ok "user-dirs.dirs.bak-* backup was created before overwrite"
+  else
+    fail "no user-dirs.dirs.bak-* backup was created"
+  fi
+  bakfile=""
+  for bf in "${i6cfg}"/user-dirs.dirs.bak-*; do
+    [ -e "${bf}" ] || continue
+    bakfile="${bf}"; break
+  done
+  if [ -n "${bakfile}" ] && grep -q '/old/hand/tuned/path' "${bakfile}"; then
+    ok "backup preserves the original hand-tuned content"
+  else
+    fail "backup did not preserve the original content"
+  fi
+  assert_contains "${out}" "Backed up existing user-dirs.dirs" "run reports the backup it made"
+  if grep -q "${i6c}" "${i6cfg}/user-dirs.dirs"; then
+    ok "live user-dirs.dirs was rewritten to point into the cloud root"
+  else
+    fail "user-dirs.dirs was not rewritten after backup"
+  fi
+else
+  echo "  SKIP: #5b backup — shimmed non-macOS path unstable on this host (exit ${rc})"
+fi
+
+# --- Issue #7 (dead local_name param): covered by the M1 mac/xdg folder-name group
+#     above, which exercises local_name("$mac","$lin") via the ~/Movies symlink
+#     target check. No separate assertion needed. ---
+
+# --- Issue #5a (root-refusal guard): SKIPPED — exercising the refusal needs uid 0,
+#     and `id` cannot be safely stubbed under set -euo pipefail without masking real
+#     failures. The guard is a 2-line `[ "$(id -u)" = "0" ] && die`; verified by
+#     inspection. ---
+echo "smoke: #5a root-refusal guard — SKIPPED (needs uid 0; not stubbable here)"
+
 echo "smoke: PASS"
