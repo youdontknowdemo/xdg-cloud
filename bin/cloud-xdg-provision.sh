@@ -51,6 +51,14 @@ set -euo pipefail
 DRY_RUN=1          # 1 = print only; --apply to act
 DO_RELOCATE=0      # move existing populated dirs into the cloud, then symlink
 REDIRECT_DOWNLOADS=0  # downloads is triage/ephemeral; off by default
+ALLOW_LOCAL_ROOT=0 # 1 = skip the cloud-mount liveness check (B4 override)
+FAST_VERIFY=0      # 1 = size/mtime post-copy verify instead of checksum (B3)
+
+# State for the relocate recovery trap (see relocate_dir / relocate_recovery_msg).
+RELOCATE_ACTIVE=0
+RELOCATE_SRC=""
+RELOCATE_ASIDE=""
+RELOCATE_DST=""
 
 SELF="$(basename "$0")"
 
@@ -86,6 +94,19 @@ run()  {
   else printf '  [run]     %s\n' "$*"; "$@"; fi
 }
 
+# Recovery trap for the relocate mv->ln window. If the shell exits unexpectedly
+# between renaming the original aside and creating the replacement symlink, the
+# tree is in a recoverable-but-confusing half-state; print plainly where the data
+# is so the user never panics or deletes the wrong thing. Armed only around that
+# window (see relocate_dir); a no-op otherwise.
+relocate_recovery_msg() {
+  [ "${RELOCATE_ACTIVE:-0}" -eq 1 ] || return 0
+  warn "INTERRUPTED mid-relocate — your data is SAFE, here is the state:"
+  warn "  original:  moved to '$RELOCATE_ASIDE' if the rename finished, else still at '$RELOCATE_SRC'"
+  warn "  cloud copy: '$RELOCATE_DST'"
+  warn "  the symlink '$RELOCATE_SRC' may not exist yet. Re-run to finish. Delete NOTHING until verified."
+}
+
 usage() {
   cat <<EOF
 $SELF — provision a cloud-resident, cross-OS user-data ontology and redirect
@@ -99,6 +120,16 @@ Usage: $SELF [options]
   --redirect-downloads   Also symlink Downloads (off by default; it's triage).
   --style xdg|mac        Cloud folder naming (default: xdg / lowercase).
   --cloud-root PATH      Cloud user-data home (auto-detected on macOS).
+  --allow-local-root     Skip the cloud-mount liveness check. Needed for backends
+                         that sync a PLAIN LOCAL folder on your home device rather
+                         than a FUSE mount (insync, Dropbox CLI, Maestral) — these
+                         are same-device and can't be auto-distinguished from a
+                         dropped mount. Use deliberately: the check exists so a
+                         dropped/unmounted cloud mount doesn't silently migrate
+                         your data to local disk.
+  --fast-verify          After a relocate copy, verify with size+mtime instead of
+                         a full checksum read-back. Faster on huge libraries, but
+                         will NOT catch a silent FUSE async-upload failure.
   -h, --help             This help.
 
 Nothing is moved without --apply --relocate together.
@@ -113,6 +144,8 @@ while [ $# -gt 0 ]; do
     --apply)              DRY_RUN=0 ;;
     --relocate)           DO_RELOCATE=1 ;;
     --redirect-downloads) REDIRECT_DOWNLOADS=1 ;;
+    --allow-local-root)   ALLOW_LOCAL_ROOT=1 ;;
+    --fast-verify)        FAST_VERIFY=1 ;;
     --style)              shift; STYLE="${1:?--style needs xdg|mac}" ;;
     --cloud-root)         shift; CLOUD_ROOT="${1:?--cloud-root needs a path}" ;;
     -h|--help)            usage; exit 0 ;;
@@ -144,6 +177,98 @@ resolve_cloud_root() {
     die "No Google Drive mount found. Pass --cloud-root PATH."
   fi
   die "CLOUD_ROOT unset. On $PLATFORM, set it to your mounted drive path (e.g. an rclone mount). Pass --cloud-root PATH."
+}
+
+# Normalize CLOUD_ROOT to an absolute, trailing-slash-free path.
+#   Why: a RELATIVE --cloud-root is a silent footgun. `mkdir -p "$CLOUD_ROOT/$cn"`
+#   resolves the relative part against the CWD, but `ln -s "$target" "$localpath"`
+#   stores the target VERBATIM and the kernel resolves it against the symlink's
+#   own dir ($HOME) on access — so the link points somewhere that was never
+#   created: a DANGLING link. A trailing slash separately breaks the idempotency
+#   check (readlink output never carries it, so "$target" != stored link → the
+#   script thinks the link is wrong every re-run). Stock macOS has no realpath/
+#   `readlink -f`, so we normalize in pure bash 3.2.
+normalize_cloud_root() {
+  case "$CLOUD_ROOT" in
+    /*) : ;;                                    # already absolute
+    *)  CLOUD_ROOT="$(pwd)/$CLOUD_ROOT" ;;      # absolutize against CWD
+  esac
+  # Strip trailing slash(es), but never reduce a bare "/" to the empty string.
+  while [ "$CLOUD_ROOT" != "/" ] && [ "${CLOUD_ROOT%/}" != "$CLOUD_ROOT" ]; do
+    CLOUD_ROOT="${CLOUD_ROOT%/}"
+  done
+}
+
+# B4: is CLOUD_ROOT a LIVE cloud location, or a dead/empty local directory?
+#   An unmounted FUSE mountpoint is just an empty dir on the local filesystem, so
+#   without this check an apply/relocate would silently copy gigabytes to local
+#   disk and move the originals aside — the user believing it's cloud-backed.
+#   Detection MUST branch on platform (per security review):
+#     * macOS: iCloud + Google-Drive File-Provider roots live on the SAME APFS
+#       volume as $HOME, so a device-id test gives false negatives. Recognise the
+#       known provider roots by path instead.
+#     * Linux/Termux: require the backing filesystem TYPE to be FUSE. A live
+#       rclone / google-drive-ocamlfuse mount reports fuse; a dropped mountpoint
+#       or a non-cloud mount (ext4 USB, tmpfs, a second partition) reports its
+#       real type and is refused — closing the device-only false-PASS. The bare
+#       device-id test is kept only as a fallback when fstype is undeterminable.
+#       Note: this does NOT regress insync/Dropbox-CLI/Maestral — those sync a
+#       same-device, non-FUSE local folder, so they were already refused by the
+#       device test too and still need --allow-local-root (friction, not danger).
+#   Returns 0 = positive evidence of a live cloud root; 1 = not (or unknown).
+cloud_root_is_live() {
+  case "$PLATFORM" in
+    macos)
+      case "$CLOUD_ROOT" in
+        "$HOME"/Library/CloudStorage/*)       return 0 ;;  # Google Drive / OneDrive / Dropbox / Box (File Provider)
+        "$HOME"/Library/Mobile\ Documents/*)  return 0 ;;  # iCloud Drive
+        *)                                    return 1 ;;
+      esac ;;
+    linux|termux)
+      local probe fstype dev_root dev_home
+      probe="$CLOUD_ROOT"
+      while [ ! -e "$probe" ] && [ "$probe" != "/" ]; do probe="$(dirname "$probe")"; done
+      # `stat -f -c %T` names the fstype. Only a KNOWN-concrete-local filesystem
+      # returns "not cloud" — anything unrecognised (empty, or an old coreutils
+      # printing the raw fuse magic as "UNKNOWN (0x65735546)") FALLS THROUGH to the
+      # device heuristic rather than over-refusing a possibly-live mount. This is
+      # fail-safe: refuse only what we're sure is local.
+      fstype="$(stat -f -c %T "$probe" 2>/dev/null || true)"
+      case "$fstype" in
+        fuse|fuseblk|fuse.*) return 0 ;;                                  # live FUSE cloud mount
+        ext2|ext3|ext4|xfs|btrfs|tmpfs|vfat|exfat|ntfs|zfs|f2fs) return 1 ;;  # known local FS, not cloud
+        *) : ;;                                                           # empty / UNKNOWN (0x…) → fall through to st_dev
+      esac
+      # Device fallback (fstype undeterminable): a different device than $HOME is
+      # weak evidence of a separate mount. RESIDUAL (acceptable — retained aside
+      # backup is the net, --allow-local-root is the escape hatch): a non-cloud
+      # mount like /mnt/usb on a host where fstype is unreadable would false-PASS.
+      dev_root="$(stat -c %d "$probe" 2>/dev/null || true)"
+      dev_home="$(stat -c %d "$HOME"  2>/dev/null || true)"
+      if [ -n "$dev_root" ] && [ -n "$dev_home" ] && [ "$dev_root" != "$dev_home" ]; then
+        return 0
+      fi
+      return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Gate apply/relocate on cloud-root liveness (B4). Dry-run only warns so users can
+# still preview a plan before the mount is up.
+check_cloud_liveness() {
+  [ "$ALLOW_LOCAL_ROOT" -eq 1 ] && return 0
+  cloud_root_is_live && return 0
+  if [ "$DRY_RUN" -eq 0 ]; then
+    die "CLOUD_ROOT does not look like a live cloud mount:
+    $CLOUD_ROOT
+  On macOS it should be under ~/Library/CloudStorage/ (Google Drive etc.) or
+  ~/Library/Mobile Documents/ (iCloud). On Linux/Termux it must be a mounted
+  FUSE filesystem (a different device than \$HOME) — an unmounted mountpoint is
+  an empty local dir, and migrating into it would copy your data to local disk
+  while the originals are moved aside. Bring the mount up, or pass
+  --allow-local-root if you really mean a plain local directory."
+  fi
+  warn "CLOUD_ROOT does not look like a live cloud mount; --apply will refuse it without --allow-local-root."
 }
 
 # style-applied cloud folder name
@@ -243,19 +368,125 @@ redirect_one() {
   run ln -s "$target" "$localpath"
 }
 
+# Verify a relocate copy before the original is moved aside (B3).
+#   IMPORTANT (per security review): this proves INTEGRITY, not DURABILITY. The
+#   -c checksum read-back is served from the FUSE mount's local VFS cache — the
+#   same cache that may not have uploaded to the provider yet — so it confirms the
+#   bytes are correctly present in the mount's *view*, NOT that they are safely on
+#   the provider. Async upload failure (quota/token/network, hours later) is NOT
+#   caught here. The thing that actually protects against that is the RETAINED
+#   `aside` backup (see relocate_dir) — never gate keeping that backup on verify.
+#   What -c DOES catch: a truncated/corrupt copy AT VERIFY TIME (read-back through
+#   the cache); it does NOT prove the async cloud upload will complete — that's
+#   precisely why the aside backup is retained. --fast-verify drops -c to
+#   size+mtime; the aside covers the rest. cp-fallback (no rsync) compares file
+#   count + exact byte totals.
+#   Returns 0 = verified identical; 1 = mismatch (caller must NOT move the original).
+verify_copy() {
+  local vsrc="$1" vdst="$2" vcopier="$3" diff n_src n_dst b_src b_dst
+  if [ "$vcopier" = "rsync -a" ]; then
+    # -n dry-run; print the name of anything that still differs. A non-empty,
+    # non-directory line means a file is missing or mismatched at the destination.
+    # Default adds -c (checksum read-back); --fast-verify drops it to size+mtime.
+    if [ "$FAST_VERIFY" -eq 1 ]; then
+      diff="$(rsync -a -n --out-format='%n' "$vsrc/" "$vdst/" 2>/dev/null)" || diff="__RSYNC_ERR__"
+    else
+      diff="$(rsync -ac -n --out-format='%n' "$vsrc/" "$vdst/" 2>/dev/null)" || diff="__RSYNC_ERR__"
+    fi
+    if [ "$diff" = "__RSYNC_ERR__" ]; then
+      warn "verification rsync could not read the destination ($vdst)."
+      return 1
+    fi
+    diff="$(printf '%s\n' "$diff" | grep -v '/$' | grep -v '^$' || true)"
+    [ -z "$diff" ] && return 0
+    warn "post-copy verification found unsynced/changed files:"; printf '%s\n' "$diff" | sed 's/^/      /' >&2
+    return 1
+  fi
+  # cp fallback: compare file count and total bytes (best effort without rsync).
+  n_src="$(find "$vsrc" -type f 2>/dev/null | wc -l | tr -d ' ')"
+  n_dst="$(find "$vdst" -type f 2>/dev/null | wc -l | tr -d ' ')"
+  b_src="$(find "$vsrc" -type f -exec wc -c {} + 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+  b_dst="$(find "$vdst" -type f -exec wc -c {} + 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+  if [ "$n_src" = "$n_dst" ] && [ "$b_src" = "$b_dst" ]; then return 0; fi
+  warn "post-copy verification (count/bytes) mismatch: src=$n_src files/$b_src B  dst=$n_dst files/$b_dst B"
+  return 1
+}
+
 relocate_dir() {
-  local src="$1" dst="$2" stamp aside copier
+  local src="$1" dst="$2" stamp aside copier probe
   stamp="$(date +%Y%m%d-%H%M%S)"
   aside="${src}.pre-offload-${stamp}"
   if command -v rsync >/dev/null 2>&1; then copier="rsync -a"; else copier="cp -a"; fi
+
+  # B5: refuse to migrate INTO a cloud folder that already has content. It may be
+  # data synced from ANOTHER machine (the multi-OS use case); `rsync -a` would
+  # overwrite newer cloud files with our older local ones, and the aside backup
+  # only preserves the LOCAL original — the clobbered cloud file would be lost.
+  if [ -d "$dst" ] && [ -n "$(ls -A "$dst" 2>/dev/null)" ]; then
+    warn "cloud destination is not empty: $dst"
+    warn "  It may hold data synced from another machine. Refusing to migrate"
+    warn "  $src into it (would risk clobbering newer cloud files with no backup)."
+    warn "  Reconcile manually — merge or rename the existing cloud folder — then retry."
+    return 0
+  fi
+
+  # B2: macOS TCC pre-flight. macOS blocks access to protected dirs (~/Desktop,
+  # ~/Documents, ~/Downloads, ~/Pictures, ~/Movies) unless the terminal has Full
+  # Disk Access — and the failure otherwise lands at `mv` AFTER rsync has already
+  # copied everything. Probe up-front so we fail fast having copied NOTHING.
+  # We probe with the EXACT operation relocate performs — renaming the dir — which
+  # is a faithful TCC test. The rename is immediately reverted, AND an
+  # EXIT/INT/TERM trap guarantees the revert if the process is killed at ANY point
+  # during the probe — armed BEFORE the first rename so even the sub-millisecond
+  # window can't strand the dir (the revert is a harmless no-op if the rename
+  # never happened). macOS only; dry-run never touches anything.
+  if [ "$DRY_RUN" -eq 0 ] && [ "$PLATFORM" = "macos" ]; then
+    probe="${src}.tcc-probe.$$"
+    trap 'mv "$probe" "$src" 2>/dev/null || true' EXIT INT TERM
+    if ! mv "$src" "$probe" 2>/dev/null; then
+      trap - EXIT INT TERM
+      warn "cannot rename $src — macOS is blocking access (TCC)."
+      warn "  Protected dirs (Documents, Desktop, Downloads, Pictures, Movies) need"
+      warn "  Full Disk Access: System Settings > Privacy & Security > Full Disk Access"
+      warn "  → add your terminal, then retry. Skipping this dir — nothing copied."
+      return 0
+    fi
+    mv "$probe" "$src"
+    trap - EXIT INT TERM
+  fi
+
   log "RELOCATE  $src  ->  $dst   (copier: $copier)"
   warn "Large dirs (e.g. a 100k-track Music library) can take a long time and a lot of cloud quota."
   run mkdir -p "$dst"
   if [ "$copier" = "rsync -a" ]; then run rsync -a "$src/" "$dst/"
   else run cp -a "$src/." "$dst/"; fi
+
+  # B3: verify the copy before the destructive mv. Apply mode only (dry-run copied
+  # nothing). On mismatch, abort WITHOUT moving the original — data stays put.
+  if [ "$DRY_RUN" -eq 0 ]; then
+    verify_copy "$src" "$dst" "$copier" \
+      || die "post-copy verification FAILED for $src -> $dst.
+  The copy is incomplete in the cloud mount's view. The original was left
+  untouched and nothing was moved. Check the mount (quota, token, network),
+  then retry. Delete nothing."
+  fi
+
+  # Recovery net for the mv -> ln window: if the shell exits unexpectedly here
+  # (set -e abort, SIGINT, crash), print plainly where everything is. Armed only
+  # in apply mode — in dry-run the run-lines are no-op prints, so a Ctrl-C there
+  # must not print a spurious "INTERRUPTED mid-relocate" message.
+  if [ "$DRY_RUN" -eq 0 ]; then
+    RELOCATE_ACTIVE=1; RELOCATE_SRC="$src"; RELOCATE_ASIDE="$aside"; RELOCATE_DST="$dst"
+    trap relocate_recovery_msg EXIT INT TERM
+  fi
   run mv "$src" "$aside"
   run ln -s "$dst" "$src"
-  info "Original preserved at: $aside  (delete once you've verified the cloud copy)."
+  if [ "$DRY_RUN" -eq 0 ]; then trap - EXIT INT TERM; RELOCATE_ACTIVE=0; fi
+
+  info "Original kept at: $aside"
+  info "The script CANNOT confirm the cloud upload is durable — providers upload"
+  info "asynchronously. Treat '$aside' as your safety copy and delete it ONLY after"
+  info "you've independently confirmed the provider shows every file."
 }
 
 write_user_dirs() {
@@ -305,6 +536,8 @@ EOF
 # ---------------------------------------------------------------------------
 main() {
   resolve_cloud_root
+  normalize_cloud_root
+  check_cloud_liveness
   log "============================================================="
   log " cloud-xdg-provision  platform=$PLATFORM  style=$STYLE  mode=$([ "$DRY_RUN" -eq 1 ] && echo DRY-RUN || echo APPLY)"
   log " cloud root: $CLOUD_ROOT"
