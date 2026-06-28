@@ -647,4 +647,148 @@ fi
 #     inspection. ---
 echo "smoke: #5a root-refusal guard — SKIPPED (needs uid 0; not stubbable here)"
 
+# ===========================================================================
+# Consistency + Linux coverage (issues #6 / #8). Both force PLATFORM=linux via the
+# uname PATH-shim because the Linux-only branches are otherwise untested on this
+# macOS host. Same isolation rules; self-cleaning under sandbox.
+# ===========================================================================
+
+# --- Issue #6: write_user_dirs must AGREE with the symlink layer — a cloud-pointing
+#     XDG var is written only for a genuinely-redirected dir. downloads is the moving
+#     part: create-only (local) by default, redirected only with --redirect-downloads.
+#     Also covers local_name's Linux naming (~/Videos, not ~/Movies). ---
+echo "smoke: #6 — user-dirs.dirs agrees with the symlink layer (forced-Linux)"
+i7shim="${sandbox}/i7-shim"; mkdir -p "${i7shim}"
+cat > "${i7shim}/uname" <<'UNAMESH'
+#!/bin/sh
+case "$1" in
+  -s) echo "Linux" ;;
+  *) exec /usr/bin/uname "$@" ;;
+esac
+UNAMESH
+chmod +x "${i7shim}/uname"
+i7c="${sandbox}/i7-cloud"; mkdir -p "${i7c}"
+
+# (a)+(b): DEFAULT run — documents redirected (cloud var), downloads NOT.
+i7h="${sandbox}/i7-home"; i7cfg="${i7h}/.config"; i7cache="${i7h}/.cache"
+mkdir -p "${i7cfg}" "${i7cache}"
+set +e
+out="$(HOME="${i7h}" XDG_CONFIG_HOME="${i7cfg}" XDG_CACHE_HOME="${i7cache}" \
+  PATH="${i7shim}:${PATH}" /bin/bash "${PROV}" \
+  --cloud-root "${i7c}" --apply --allow-local-root 2>&1)"
+rc=$?
+set -e
+if [ "${rc}" -eq 0 ]; then
+  udirs="$(cat "${i7cfg}/user-dirs.dirs" 2>/dev/null || true)"
+  assert_contains "${udirs}" "XDG_DOCUMENTS_DIR=\"${i7c}/documents\"" \
+    "(a) redirected dir (documents) gets a cloud-pointing XDG var"
+  assert_not_contains "${udirs}" "XDG_DOWNLOAD_DIR" \
+    "(b) downloads gets NO cloud-pointing XDG var by default"
+  # local_name Linux naming: the Linux dir is ~/Videos, never ~/Movies.
+  if [ -L "${i7h}/Videos" ]; then
+    ok "local_name Linux branch: HOME/Videos symlink created (XDG name)"
+  else
+    fail "expected HOME/Videos symlink under forced-Linux (local_name Linux branch)"
+  fi
+  if [ -e "${i7h}/Movies" ]; then
+    fail "HOME/Movies must not exist under forced-Linux naming"
+  else
+    ok "HOME/Movies absent under forced-Linux (Apple name not used on Linux)"
+  fi
+  if [ -L "${i7h}/Downloads" ]; then
+    fail "Downloads was symlinked by default (must stay create-only)"
+  else
+    ok "Downloads left local by default (symlink layer agrees with user-dirs.dirs)"
+  fi
+  assert_contains "${out}" "skip redirect: downloads" "default run shows the downloads-skip hint"
+
+  # (c): --redirect-downloads → downloads DOES get a cloud var AND is symlinked.
+  i7h2="${sandbox}/i7-home2"; i7cfg2="${i7h2}/.config"; i7cache2="${i7h2}/.cache"
+  mkdir -p "${i7cfg2}" "${i7cache2}"
+  set +e
+  out="$(HOME="${i7h2}" XDG_CONFIG_HOME="${i7cfg2}" XDG_CACHE_HOME="${i7cache2}" \
+    PATH="${i7shim}:${PATH}" /bin/bash "${PROV}" \
+    --cloud-root "${i7c}" --apply --allow-local-root --redirect-downloads 2>&1)"
+  rc=$?
+  set -e
+  pass_if "${rc}" "--redirect-downloads run exits 0" "run failed (exit ${rc}): ${out}"
+  udirs2="$(cat "${i7cfg2}/user-dirs.dirs" 2>/dev/null || true)"
+  assert_contains "${udirs2}" "XDG_DOWNLOAD_DIR=\"${i7c}/downloads\"" \
+    "(c) --redirect-downloads gives downloads a cloud-pointing XDG var"
+  if [ -L "${i7h2}/Downloads" ]; then
+    ok "(c) --redirect-downloads actually symlinks Downloads into the cloud"
+  else
+    fail "(c) --redirect-downloads did not symlink Downloads"
+  fi
+else
+  echo "  SKIP: #6 forced-Linux user-dirs test — shimmed path unstable here (exit ${rc})"
+fi
+
+# --- Issue #8: cloud_root_is_live() Linux fstype classification. SHIM `stat` (canned
+#     %T fstype + %d device id) AND uname=Linux, then exercise the B4 gate (--apply
+#     WITHOUT --allow-local-root). Verified against the production logic: fuse* → live;
+#     known-local → refused; UNKNOWN-fuse-magic/"" → fall through to the st_dev
+#     heuristic (different device = live, same = refused). ---
+echo "smoke: #8 — cloud_root_is_live fstype classification (stat+uname shims, forced-Linux)"
+fsshim="${sandbox}/fs-shim"; mkdir -p "${fsshim}"
+cat > "${fsshim}/uname" <<'UN'
+#!/bin/sh
+case "$1" in -s) echo "Linux" ;; *) exec /usr/bin/uname "$@" ;; esac
+UN
+cat > "${fsshim}/stat" <<'ST'
+#!/bin/sh
+# Canned stat for the #8 test, driven by SHIM_* env vars.
+#   stat -f -c %T <path> -> the fstype name; stat -c %d <path> -> a device id
+#   (HOME gets SHIM_DEV_HOME, the cloud root gets SHIM_DEV_ROOT).
+case "$1" in
+  -f) printf '%s\n' "${SHIM_FSTYPE}" ;;
+  -c) p=""; for a in "$@"; do p="$a"; done
+      if [ "$p" = "$HOME" ]; then printf '%s\n' "${SHIM_DEV_HOME}"; else printf '%s\n' "${SHIM_DEV_ROOT}"; fi ;;
+  *) exec /usr/bin/stat "$@" ;;
+esac
+ST
+chmod +x "${fsshim}/uname" "${fsshim}/stat"
+fs_n=0
+run_fstype_case() {  # $1=fstype  $2=dev_root  $3=dev_home  → sets globals out, rc
+  fs_n=$((fs_n + 1))
+  fch="${sandbox}/fs-${fs_n}-home"; fcc="${sandbox}/fs-${fs_n}-cloud"
+  mkdir -p "${fch}/.cache" "${fch}/.config" "${fcc}"
+  set +e
+  out="$(HOME="${fch}" XDG_CONFIG_HOME="${fch}/.config" XDG_CACHE_HOME="${fch}/.cache" \
+    SHIM_FSTYPE="$1" SHIM_DEV_ROOT="$2" SHIM_DEV_HOME="$3" \
+    PATH="${fsshim}:${PATH}" /bin/bash "${PROV}" --cloud-root "${fcc}" --apply 2>&1)"
+  rc=$?
+  set -e
+}
+# Live FUSE types proceed past the B4 gate (no --allow-local-root needed).
+for fst in fuse fuseblk fuse.glusterfs; do
+  run_fstype_case "${fst}" 0 0
+  pass_if "${rc}" "fstype '${fst}' treated as live (apply proceeds past B4)" \
+    "fstype '${fst}' was wrongly refused (exit ${rc}): ${out}"
+  assert_not_contains "${out}" "does not look like a live cloud mount" \
+    "fstype '${fst}' not flagged as a dead mount"
+done
+# Known-local types are refused without --allow-local-root.
+for fst in ext4 xfs tmpfs; do
+  run_fstype_case "${fst}" 0 0
+  assert_nonzero "${rc}" "fstype '${fst}' refused (known local fs, B4)"
+  assert_contains "${out}" "does not look like a live cloud mount" \
+    "fstype '${fst}' refusal explains the dead-mount reason"
+done
+# UNKNOWN fuse-magic (old coreutils) and empty fstype → fall through to st_dev.
+# Different device than HOME = treated live (the documented fail-safe — don't over-refuse).
+run_fstype_case "UNKNOWN (0x65735546)" 4242 11
+pass_if "${rc}" "UNKNOWN fuse-magic + different device → st_dev fallback treats as live" \
+  "UNKNOWN-magic different-device run was refused (exit ${rc}): ${out}"
+assert_not_contains "${out}" "does not look like a live cloud mount" \
+  "UNKNOWN-magic different-device not over-refused (documented fail-safe)"
+run_fstype_case "" 4242 11
+pass_if "${rc}" "empty fstype + different device → st_dev fallback treats as live" \
+  "empty-fstype different-device run was refused (exit ${rc}): ${out}"
+# Same device under the fallback → conservative refusal.
+run_fstype_case "UNKNOWN (0x65735546)" 11 11
+assert_nonzero "${rc}" "UNKNOWN fuse-magic + SAME device → st_dev fallback refuses (conservative)"
+assert_contains "${out}" "does not look like a live cloud mount" \
+  "same-device fallback refusal explains the reason"
+
 echo "smoke: PASS"

@@ -84,12 +84,15 @@ SELF="$(basename "$0")"
 #   macName   : the dir under $HOME on macOS (Apple naming, e.g. Movies)
 #   linuxName : the dir under $HOME on Linux (XDG default naming)
 #   xdgVar    : the user-dirs.dirs variable to write (empty = none)
-#   redirect  : 1 = symlink local->cloud by default, 0 = create only
+#   redirect  : 1 = eligible to symlink local->cloud, 0 = create only
+#               (downloads is redirect=1 but EXCEPTIONALLY off by default — its
+#               extra REDIRECT_DOWNLOADS gate in redirect_one keeps it create-only
+#               until --redirect-downloads is passed. See is_redirected().)
 # ---------------------------------------------------------------------------
 OFFLOAD_SET="
 desktop|Desktop|Desktop|XDG_DESKTOP_DIR|1
 documents|Documents|Documents|XDG_DOCUMENTS_DIR|1
-downloads|Downloads|Downloads|XDG_DOWNLOAD_DIR|0
+downloads|Downloads|Downloads|XDG_DOWNLOAD_DIR|1
 music|Music|Music|XDG_MUSIC_DIR|1
 pictures|Pictures|Pictures|XDG_PICTURES_DIR|1
 videos|Movies|Videos|XDG_VIDEOS_DIR|1
@@ -378,6 +381,18 @@ local_name() {
   if [ "$PLATFORM" = "macos" ]; then printf '%s' "$1"; else printf '%s' "$2"; fi
 }
 
+# Issue #6: single source of truth for "is this OFFLOAD_SET entry ACTUALLY redirected
+# (symlinked into the cloud)?". Used by BOTH redirect_one (the symlink layer) and
+# write_user_dirs (the user-dirs.dirs layer) so the two can never disagree about
+# whether a dir lives in the cloud. Args: $1 = canonical name, $2 = the redirect
+# field. Returns 0 = redirected, 1 = not. downloads is the sole exception: even with
+# redirect=1 it stays create-only until --redirect-downloads (REDIRECT_DOWNLOADS=1).
+is_redirected() {
+  [ "$2" = "1" ] || return 1
+  if [ "$1" = "downloads" ] && [ "$REDIRECT_DOWNLOADS" -ne 1 ]; then return 1; fi
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # Field splitter (3.2-safe; no here-strings on assoc arrays)
 # ---------------------------------------------------------------------------
@@ -412,9 +427,13 @@ redirect_one() {
   lin="$(field "$line" 3)"; xdgvar="$(field "$line" 4)"
   wantredir="$(field "$line" 5)"
 
-  [ "$wantredir" = "1" ] || return 0
-  if [ "$canon" = "downloads" ] && [ "$REDIRECT_DOWNLOADS" -ne 1 ]; then
-    info "skip redirect: downloads (use --redirect-downloads to enable)"; return 0
+  # Symlink layer gate (shared with write_user_dirs via is_redirected). downloads is
+  # the only entry that can be eligible (redirect=1) yet not redirected by default —
+  # surface that with the actionable info line; any genuine create-only entry just
+  # returns silently.
+  if ! is_redirected "$canon" "$wantredir"; then
+    [ "$canon" = "downloads" ] && info "skip redirect: downloads (use --redirect-downloads to enable)"
+    return 0
   fi
 
   cn="$(cloud_name "$canon" "$mac")"
@@ -649,6 +668,12 @@ write_user_dirs() {
     printf '%s\n' "$OFFLOAD_SET" | while IFS= read -r line; do
       [ -z "$line" ] && continue
       xdgvar="$(field "$line" 4)"; [ -z "$xdgvar" ] && continue
+      # Issue #6: only point an XDG var at the cloud for a dir that is GENUINELY
+      # redirected by the symlink layer — otherwise user-dirs.dirs would claim a dir
+      # lives in the cloud while ~/<dir> is still a plain local dir. Same is_redirected
+      # gate redirect_one uses, so the two layers always agree (notably: downloads is
+      # left at its local default unless --redirect-downloads is passed).
+      is_redirected "$(field "$line" 1)" "$(field "$line" 5)" || continue
       cn="$(cloud_name "$(field "$line" 1)" "$(field "$line" 2)")"
       printf '%s="%s"\n' "$xdgvar" "$CLOUD_ROOT/$cn"
     done
@@ -666,7 +691,7 @@ Canonical mapping (FHS / XDG / macOS -> cloud folder)
   cache     XDG_CACHE_HOME    ~/.cache             -> LOCAL ONLY (never cloud)
   desktop   XDG_DESKTOP_DIR   ~/Desktop            -> $CLOUD_ROOT/$(cloud_name desktop Desktop)
   documents XDG_DOCUMENTS_DIR ~/Documents          -> $CLOUD_ROOT/$(cloud_name documents Documents)
-  downloads XDG_DOWNLOAD_DIR  ~/Downloads          -> create-only (triage)
+  downloads XDG_DOWNLOAD_DIR  ~/Downloads          -> local by default (triage); --redirect-downloads to offload
   music     XDG_MUSIC_DIR     ~/Music              -> $CLOUD_ROOT/$(cloud_name music Music)
   pictures  XDG_PICTURES_DIR  ~/Pictures           -> $CLOUD_ROOT/$(cloud_name pictures Pictures)
   videos    XDG_VIDEOS_DIR    ~/Movies (mac)       -> $CLOUD_ROOT/$(cloud_name videos Movies)
