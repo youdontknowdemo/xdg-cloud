@@ -90,8 +90,16 @@ info() { printf '  • %s\n' "$*"; }
 warn() { printf '  ! %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 run()  {
-  if [ "$DRY_RUN" -eq 1 ]; then printf '  [dry-run] %s\n' "$*"
-  else printf '  [run]     %s\n' "$*"; "$@"; fi
+  # Print the command with each argument shell-quoted (printf %q, available in
+  # bash 3.2) so a path containing spaces — e.g. the default macOS cloud root
+  # ".../Mobile Documents/..." — renders as a copy-paste-safe command line rather
+  # than ambiguous space-split words.
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  [dry-run]'; printf ' %q' "$@"; printf '\n'
+  else
+    printf '  [run]    '; printf ' %q' "$@"; printf '\n'
+    "$@"
+  fi
 }
 
 # Recovery trap for the relocate mv->ln window. If the shell exits unexpectedly
@@ -271,17 +279,13 @@ check_cloud_liveness() {
   warn "CLOUD_ROOT does not look like a live cloud mount; --apply will refuse it without --allow-local-root."
 }
 
-# style-applied cloud folder name
+# style-applied cloud folder name.  $1 = canonical (xdg/lowercase name), $2 = the
+# Apple name (the OFFLOAD_SET macName column).  mac style returns the documented
+# Apple name verbatim — NOT a naive capitalize of the canonical, because those
+# disagree for videos (Apple "Movies" vs capitalized "Videos") and a mismatch
+# would make the cloud folder and the symlink target diverge.
 cloud_name() {
-  if [ "$STYLE" = "mac" ]; then
-    # capitalize first letter (portable: works on BSD/macOS + GNU)
-    local first rest
-    first="$(printf '%s' "$1" | cut -c1 | tr '[:lower:]' '[:upper:]')"
-    rest="$(printf '%s' "$1" | cut -c2-)"
-    printf '%s%s' "$first" "$rest"
-  else
-    printf '%s' "$1"
-  fi
+  if [ "$STYLE" = "mac" ]; then printf '%s' "$2"; else printf '%s' "$1"; fi
 }
 
 # local home dir name for current platform
@@ -311,7 +315,7 @@ ensure_cloud_tree() {
   local line cn
   printf '%s\n' "$OFFLOAD_SET" | while IFS= read -r line; do
     [ -z "$line" ] && continue
-    cn="$(cloud_name "$(field "$line" 1)")"
+    cn="$(cloud_name "$(field "$line" 1)" "$(field "$line" 2)")"
     run mkdir -p "$CLOUD_ROOT/$cn"
   done
 }
@@ -328,7 +332,7 @@ redirect_one() {
     info "skip redirect: downloads (use --redirect-downloads to enable)"; return 0
   fi
 
-  cn="$(cloud_name "$canon")"
+  cn="$(cloud_name "$canon" "$mac")"
   ln="$(local_name "$canon" "$mac" "$lin")"
   target="$CLOUD_ROOT/$cn"
   localpath="$HOME/$ln"
@@ -413,9 +417,18 @@ verify_copy() {
 }
 
 relocate_dir() {
-  local src="$1" dst="$2" stamp aside copier probe
+  local src="$1" dst="$2" stamp aside copier probe n
   stamp="$(date +%Y%m%d-%H%M%S)"
+  # Guarantee a UNIQUE aside name. The stamp is second-resolution, so a
+  # same-second re-run (or a leftover stale aside) could collide — and
+  # `mv "$src" "$aside"` onto an existing directory moves src INSIDE it (nesting),
+  # which would also make the "Original kept at: $aside" message point at the
+  # wrong place. Append a counter until the name is free.
   aside="${src}.pre-offload-${stamp}"
+  n=1
+  while [ -e "$aside" ] || [ -L "$aside" ]; do
+    aside="${src}.pre-offload-${stamp}.${n}"; n=$((n + 1))
+  done
   if command -v rsync >/dev/null 2>&1; then copier="rsync -a"; else copier="cp -a"; fi
 
   # B5: refuse to migrate INTO a cloud folder that already has content. It may be
@@ -501,7 +514,7 @@ write_user_dirs() {
     printf '%s\n' "$OFFLOAD_SET" | while IFS= read -r line; do
       [ -z "$line" ] && continue
       xdgvar="$(field "$line" 4)"; [ -z "$xdgvar" ] && continue
-      cn="$(cloud_name "$(field "$line" 1)")"
+      cn="$(cloud_name "$(field "$line" 1)" "$(field "$line" 2)")"
       printf '%s="%s"\n' "$xdgvar" "$CLOUD_ROOT/$cn"
     done
   } > "$f"
@@ -516,15 +529,15 @@ Canonical mapping (FHS / XDG / macOS -> cloud folder)
   data      XDG_DATA_HOME     ~/.local/share       -> LOCAL ONLY (curate ports by hand)
   state     XDG_STATE_HOME    ~/.local/state       -> LOCAL ONLY (logs/history)
   cache     XDG_CACHE_HOME    ~/.cache             -> LOCAL ONLY (never cloud)
-  desktop   XDG_DESKTOP_DIR   ~/Desktop            -> $CLOUD_ROOT/$(cloud_name desktop)
-  documents XDG_DOCUMENTS_DIR ~/Documents          -> $CLOUD_ROOT/$(cloud_name documents)
+  desktop   XDG_DESKTOP_DIR   ~/Desktop            -> $CLOUD_ROOT/$(cloud_name desktop Desktop)
+  documents XDG_DOCUMENTS_DIR ~/Documents          -> $CLOUD_ROOT/$(cloud_name documents Documents)
   downloads XDG_DOWNLOAD_DIR  ~/Downloads          -> create-only (triage)
-  music     XDG_MUSIC_DIR     ~/Music              -> $CLOUD_ROOT/$(cloud_name music)
-  pictures  XDG_PICTURES_DIR  ~/Pictures           -> $CLOUD_ROOT/$(cloud_name pictures)
-  videos    XDG_VIDEOS_DIR    ~/Movies (mac)       -> $CLOUD_ROOT/$(cloud_name videos)
-  public    XDG_PUBLICSHARE   ~/Public             -> $CLOUD_ROOT/$(cloud_name public)
-  templates XDG_TEMPLATES_DIR ~/Templates          -> $CLOUD_ROOT/$(cloud_name templates)
-  projects  (convention)      ~/Projects           -> $CLOUD_ROOT/$(cloud_name projects)
+  music     XDG_MUSIC_DIR     ~/Music              -> $CLOUD_ROOT/$(cloud_name music Music)
+  pictures  XDG_PICTURES_DIR  ~/Pictures           -> $CLOUD_ROOT/$(cloud_name pictures Pictures)
+  videos    XDG_VIDEOS_DIR    ~/Movies (mac)       -> $CLOUD_ROOT/$(cloud_name videos Movies)
+  public    XDG_PUBLICSHARE   ~/Public             -> $CLOUD_ROOT/$(cloud_name public Public)
+  templates XDG_TEMPLATES_DIR ~/Templates          -> $CLOUD_ROOT/$(cloud_name templates Templates)
+  projects  (convention)      ~/Projects           -> $CLOUD_ROOT/$(cloud_name projects Projects)
 
 System root dirs (/ /usr /etc /var /opt /Applications /System /Library):
   machine-managed — NOT offloadable. Excluded by design.

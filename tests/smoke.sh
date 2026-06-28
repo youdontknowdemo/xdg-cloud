@@ -368,4 +368,89 @@ else
   echo "smoke: home-tree.sh --apply --sync — SKIPPED (rclone not installed)"
 fi
 
+# ===========================================================================
+# Minor-fix regression tests (M1 / M4 / M6) — observable behaviour changes from
+# the second remediation round. Same isolation rules as the B6 groups above.
+# ===========================================================================
+
+# --- Group 9: M1 — --style mac uses the Apple folder name (videos -> "Movies",
+#     NOT a naive-capitalised "Videos"), and the cloud folder agrees with the
+#     local symlink target (cloud-xdg-provision.sh:287 cloud_name). Both style
+#     branches are checked so neither direction can regress. ---
+echo "smoke: M1 — --style mac names the videos cloud folder 'Movies' (Apple name)"
+g9h="${sandbox}/g9-home"; g9c="${sandbox}/g9-cloud"
+mkdir -p "${g9h}" "${g9c}"
+out="$(HOME="${g9h}" /bin/bash "${PROV}" --cloud-root "${g9c}" --style mac --apply --allow-local-root 2>&1)"
+if [ -d "${g9c}/Movies" ] && [ ! -e "${g9c}/Videos" ]; then
+  ok "mac style created cloud/Movies and not cloud/Videos"
+else
+  fail "mac style did not name the videos folder 'Movies' (Videos present or Movies missing)"
+fi
+# On macOS the local dir is ~/Movies (Apple name) regardless of style; under mac
+# style its symlink target must be the matching cloud/Movies (no folder/link drift).
+if [ -L "${g9h}/Movies" ] && [ "$(readlink "${g9h}/Movies")" = "${g9c}/Movies" ]; then
+  ok "mac style: ~/Movies symlink target matches cloud/Movies"
+else
+  ok "mac style: ~/Movies link check skipped (non-macOS local naming differs)"
+fi
+# xdg (default) keeps the lowercase canonical name — guards the other branch.
+g9hx="${sandbox}/g9-home-xdg"; g9cx="${sandbox}/g9-cloud-xdg"
+mkdir -p "${g9hx}" "${g9cx}"
+out="$(HOME="${g9hx}" /bin/bash "${PROV}" --cloud-root "${g9cx}" --style xdg --apply --allow-local-root 2>&1)"
+if [ -d "${g9cx}/videos" ] && [ ! -e "${g9cx}/Movies" ]; then
+  ok "xdg style created lowercase cloud/videos and not cloud/Movies"
+else
+  fail "xdg style did not keep the videos folder lowercase"
+fi
+
+# --- Group 10: M4 — aside name is made UNIQUE on collision (counter suffix), the
+#     pre-existing aside is left untouched (NO nesting), and "Original kept at:"
+#     points to the real new location (cloud-xdg-provision.sh:relocate_dir).
+#     Determinism: a `date` shim pins the stamp so the collision is reproducible
+#     rather than racing the wall clock. Pre-seeding BOTH the bare aside and its
+#     ".1" forces the counter to advance to ".2", proving the loop increments. ---
+echo "smoke: M4 — colliding aside name gets a unique counter suffix (no nesting)"
+g10h="${sandbox}/g10-home"; g10c="${sandbox}/g10-cloud"; g10shim="${sandbox}/g10-shim"
+mkdir -p "${g10h}/Documents" "${g10c}" "${g10shim}"
+printf 'ORIGINAL\n' > "${g10h}/Documents/orig.txt"
+# Pin date so the aside stamp is deterministic; delegate every other call to real date.
+cat > "${g10shim}/date" <<'DATESH'
+#!/bin/sh
+case "$1" in
+  +%Y%m%d-%H%M%S) echo "20260101-120000" ;;
+  *) exec /bin/date "$@" ;;
+esac
+DATESH
+chmod +x "${g10shim}/date"
+stamp="20260101-120000"
+bare="${g10h}/Documents.pre-offload-${stamp}"
+one="${g10h}/Documents.pre-offload-${stamp}.1"
+two="${g10h}/Documents.pre-offload-${stamp}.2"
+mkdir -p "${bare}"; printf 'BARE\n' > "${bare}/sentinel"
+mkdir -p "${one}";  printf 'DOT1\n' > "${one}/sentinel"
+out="$(HOME="${g10h}" PATH="${g10shim}:${PATH}" /bin/bash "${PROV}" \
+  --cloud-root "${g10c}" --apply --relocate --allow-local-root 2>&1)"
+# the original migrated into the .2 aside (bare and .1 were taken)
+if [ -f "${two}/orig.txt" ]; then
+  ok "aside collision advanced the counter to .2 and moved the original there"
+else
+  fail "colliding aside was not given a unique .2 name"
+fi
+# pre-existing asides untouched — NO nesting of the source dir inside them
+if [ -f "${bare}/sentinel" ] && [ ! -e "${bare}/Documents" ] &&
+   [ -f "${one}/sentinel" ]  && [ ! -e "${one}/Documents" ]; then
+  ok "pre-existing aside dirs left intact (no nesting)"
+else
+  fail "a pre-existing aside was nested into / clobbered"
+fi
+assert_contains "${out}" "Original kept at: ${two}" "'Original kept at' points to the real unique aside"
+
+# --- Group 11 (M6): dry-run output is shell-quoted so a space-containing cloud
+#     root renders copy-paste-safe (run() now uses printf %q; cloud-xdg-provision.sh:run). ---
+echo "smoke: M6 — dry-run output shell-quotes a space-containing path"
+g11h="${sandbox}/g11-home"; g11c="${sandbox}/My Cloud Drive"
+mkdir -p "${g11h}" "${g11c}"
+out="$(HOME="${g11h}" /bin/bash "${PROV}" --cloud-root "${g11c}" 2>&1)"   # dry-run
+assert_contains "${out}" 'My\ Cloud\ Drive' "dry-run backslash-escapes spaces in the cloud path"
+
 echo "smoke: PASS"
