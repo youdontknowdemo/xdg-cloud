@@ -791,6 +791,68 @@ assert_nonzero "${rc}" "UNKNOWN fuse-magic + SAME device → st_dev fallback ref
 assert_contains "${out}" "does not look like a live cloud mount" \
   "same-device fallback refusal explains the reason"
 
+# --- Review M-c: verify_copy() is the post-copy gate — on a bad copy it must die
+#     BEFORE the destructive `mv`, leaving the original in place (never lost to a
+#     truncated/incomplete copy). The success path is covered; this exercises the
+#     MISMATCH->die path. A copier PATH-shim does the REAL copy then DELETES a file
+#     from the destination, so verify_copy's read-back finds a genuine diff. Both
+#     rsync (the default copier when present) and cp (the fallback) are shimmed, so
+#     whichever the script picks, the sabotage lands — no skip needed (cp always
+#     exists). Confirmed by bypass-sanity: if verify_copy is forced to return 0, this
+#     group fails (original gets moved to an aside, run exits 0). ---
+echo "smoke: M-c — verify_copy aborts on a bad copy WITHOUT moving the original"
+vch="${sandbox}/vc-home"; vcc="${sandbox}/vc-cloud"; vcshim="${sandbox}/vc-shim"
+mkdir -p "${vch}/Documents" "${vcc}" "${vch}/.cache" "${vcshim}"
+printf 'original-payload\n' > "${vch}/Documents/payload.txt"
+printf 'second-file\n'      > "${vch}/Documents/other.txt"
+vc_real_rsync="$(command -v rsync || true)"
+vc_real_cp="$(command -v cp || echo /bin/cp)"
+# rsync shim: pass the dry-run VERIFY call (-n) through untouched; for the real COPY,
+# copy then delete payload.txt from the dest so the verify read-back sees it missing.
+cat > "${vcshim}/rsync" <<'RS'
+#!/bin/sh
+for a in "$@"; do case "$a" in -n) exec "$REAL_RSYNC" "$@" ;; esac; done
+"$REAL_RSYNC" "$@"; rc=$?
+last=""; for a in "$@"; do last="$a"; done
+rm -f "${last}payload.txt" 2>/dev/null || true
+exit $rc
+RS
+# cp shim (used only if rsync is absent — verify_copy's cp path compares file count):
+# copy then delete payload.txt from the dest so the count/bytes mismatch.
+cat > "${vcshim}/cp" <<'CP'
+#!/bin/sh
+"$REAL_CP" "$@"; rc=$?
+last=""; for a in "$@"; do last="$a"; done
+rm -f "${last}payload.txt" 2>/dev/null || true
+exit $rc
+CP
+chmod +x "${vcshim}/rsync" "${vcshim}/cp"
+set +e
+out="$(HOME="${vch}" XDG_CACHE_HOME="${vch}/.cache" \
+  REAL_RSYNC="${vc_real_rsync}" REAL_CP="${vc_real_cp}" \
+  PATH="${vcshim}:${PATH}" /bin/bash "${PROV}" \
+  --cloud-root "${vcc}" --apply --relocate --allow-local-root 2>&1)"
+rc=$?
+set -e
+assert_nonzero "${rc}" "bad-copy run EXITS NON-ZERO (verify_copy aborted the relocate)"
+assert_contains "${out}" "post-copy verification FAILED" "failure names the post-copy verification gate"
+if [ -d "${vch}/Documents" ] && [ ! -L "${vch}/Documents" ] &&
+   [ -f "${vch}/Documents/payload.txt" ] && [ -f "${vch}/Documents/other.txt" ]; then
+  ok "original ~/Documents intact at its path (real dir, both files present)"
+else
+  fail "original ~/Documents was altered/moved despite the verify failure"
+fi
+if ls -d "${vch}"/Documents.pre-offload-* >/dev/null 2>&1; then
+  fail "original was moved to a *.pre-offload-* aside despite verify failing (destructive mv ran)"
+else
+  ok "no *.pre-offload-* aside created (the destructive mv never ran)"
+fi
+if ls -d "${vch}/.cache/cloud-xdg-provision.lock" >/dev/null 2>&1; then
+  fail "lock dir left behind after the aborted run"
+else
+  ok "lock released after the aborted run"
+fi
+
 # ===========================================================================
 # PR #11 remediation — INTERRUPT regression (the gap that let two BLOCKING trap
 # bugs ship): actually send a signal MID-RELOCATE and assert the process terminates
