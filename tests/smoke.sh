@@ -288,6 +288,64 @@ assert_contains "${out}" "does not look like a live cloud mount" "dry-run warns 
 #     by the relocate group above; the failure path stays a real-macOS TEST target. ---
 echo "smoke: B2 macOS TCC pre-flight — SKIPPED (failure path needs real TCC / read-only HOME)"
 
+# --- Group B6 (issue #9): macOS 'group:everyone deny delete' ACL on a special folder
+#     is DETECTED and the dir is SKIPPED with accurate native-iCloud guidance — NOT
+#     the misleading "grant Full Disk Access and retry" advice (FDA cannot override a
+#     deny ACE). Gated on real macOS + `chmod +a`: the ACL is an APFS/macOS feature
+#     and is genuinely unreproducible elsewhere, so non-macOS skips with a reason.
+#     This is the regression the old B2-SKIPPED note called a "real-macOS TEST target":
+#     `chmod +a` on a SINGLE dir reproduces it faithfully without a read-only HOME. ---
+b6_supported=0
+if [ "$(uname -s)" = "Darwin" ]; then
+  b6probe="${sandbox}/b6-aclprobe"
+  mkdir -p "${b6probe}"
+  if chmod +a "group:everyone deny delete" "${b6probe}" 2>/dev/null; then
+    b6_supported=1
+    # Strip the ACL so the EXIT-trap rm -rf can delete the probe (deny-delete would
+    # otherwise block removing the dir itself).
+    chmod -a "group:everyone deny delete" "${b6probe}" 2>/dev/null || true
+  fi
+  rm -rf "${b6probe}"
+fi
+if [ "${b6_supported}" -eq 1 ]; then
+  echo "smoke: B6 — macOS deny-delete ACL special folder is skipped with accurate guidance"
+  b6h="${sandbox}/b6-home"; b6c="${sandbox}/b6-cloud"
+  mkdir -p "${b6h}/Documents" "${b6c}"
+  printf 'notes\n' > "${b6h}/Documents/notes.txt"
+  chmod +a "group:everyone deny delete" "${b6h}/Documents"
+  set +e
+  out="$(HOME="${b6h}" /bin/bash "${PROV}" --cloud-root "${b6c}" --apply --relocate --allow-local-root 2>&1)"
+  rc=$?
+  set -e
+  # Strip the ACL NOW (output is captured) so cleanup is robust even if an assert
+  # below fails and the EXIT trap fires with the dir still ACL-protected.
+  chmod -a "group:everyone deny delete" "${b6h}/Documents" 2>/dev/null || true
+  pass_if "${rc}" "ACL-protected dir run exits 0 (skips cleanly)" \
+    "run failed (exit ${rc}) instead of skipping the ACL dir: ${out}"
+  # (a) NOT relocated: still a real dir (not a symlink), contents intact, no aside.
+  if [ -d "${b6h}/Documents" ] && [ ! -L "${b6h}/Documents" ] && [ -f "${b6h}/Documents/notes.txt" ]; then
+    ok "ACL-protected Documents left in place (real dir, not a symlink)"
+  else
+    fail "ACL-protected Documents was altered/relocated despite the deny-delete ACL"
+  fi
+  if ls -d "${b6h}"/Documents.pre-offload-* >/dev/null 2>&1; then
+    fail "an aside dir was created even though the ACL dir should be skipped"
+  else
+    ok "no *.pre-offload-* aside created (nothing was moved)"
+  fi
+  # (b) accurate guidance is printed.
+  assert_contains "${out}" "deny delete" "skip message names the deny-delete ACL"
+  assert_contains "${out}" "NOT TCC" "skip message states it is the ACL, not TCC"
+  assert_contains "${out}" "Desktop & Documents Folders" \
+    "Documents skip points to Apple's native iCloud feature"
+  # (c) the misleading "grant FDA and retry" advice is NOT shown for the ACL case
+  #     (the B2/TCC path owns that wording — it must not leak here).
+  assert_not_contains "${out}" "add your terminal, then retry" \
+    "no misleading 'grant Full Disk Access and retry' advice for the ACL case"
+else
+  echo "smoke: B6 macOS deny-delete ACL — SKIPPED (needs real macOS + chmod +a ACL support)"
+fi
+
 # --- Group 6: home-tree.sh rclone filter is the single source of truth for what may
 #     reach the cloud (review BLOCKING-3; home-tree.sh:153). A dropped deny line would
 #     leak SQLite/secrets. Inspect the generated filter directly — no rclone needed. ---
@@ -452,5 +510,451 @@ g11h="${sandbox}/g11-home"; g11c="${sandbox}/My Cloud Drive"
 mkdir -p "${g11h}" "${g11c}"
 out="$(HOME="${g11h}" /bin/bash "${PROV}" --cloud-root "${g11c}" 2>&1)"   # dry-run
 assert_contains "${out}" 'My\ Cloud\ Drive' "dry-run backslash-escapes spaces in the cloud path"
+
+# ===========================================================================
+# Robustness wins (issues #4 / #5 / #7) — same isolation rules as the groups above.
+# ===========================================================================
+
+# --- Issue #4: multiple ~/Library/CloudStorage/GoogleDrive-*/My Drive mounts must
+#     NOT be silently first-matched — resolve_cloud_root dies with a disambiguation
+#     message listing the candidates. macOS-gated: the auto-detect runs only on
+#     macOS (elsewhere resolve_cloud_root takes the generic 'CLOUD_ROOT unset' die). ---
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo "smoke: #4 — multiple Google Drive mounts are refused with a disambiguation message"
+  i4h="${sandbox}/i4-home"
+  mkdir -p "${i4h}/Library/CloudStorage/GoogleDrive-a@x.com/My Drive"
+  mkdir -p "${i4h}/Library/CloudStorage/GoogleDrive-b@y.com/My Drive"
+  set +e
+  out="$(HOME="${i4h}" /bin/bash "${PROV}" 2>&1)"   # dry-run, no --cloud-root → auto-detect
+  rc=$?
+  set -e
+  assert_nonzero "${rc}" "multi-mount auto-detect exits non-zero (refuses to guess)"
+  assert_contains "${out}" "Multiple Google Drive mounts found" "multi-mount death names the ambiguity"
+  assert_contains "${out}" "--cloud-root" "multi-mount death tells the user to pass --cloud-root"
+  assert_contains "${out}" "GoogleDrive-a@x.com/My Drive" "candidate list includes the first mount"
+  assert_contains "${out}" "GoogleDrive-b@y.com/My Drive" "candidate list includes the second mount"
+  # Single-mount sanity: exactly one candidate resolves cleanly (the count==1 path).
+  i4h1="${sandbox}/i4-home-single"
+  mkdir -p "${i4h1}/Library/CloudStorage/GoogleDrive-solo@x.com/My Drive"
+  set +e
+  out="$(HOME="${i4h1}" /bin/bash "${PROV}" 2>&1)"   # dry-run
+  rc=$?
+  set -e
+  pass_if "${rc}" "single Google Drive mount auto-detects cleanly (exit 0)" \
+    "single-mount auto-detect failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "GoogleDrive-solo@x.com/My Drive" "single mount is used as the cloud root"
+else
+  echo "smoke: #4 multiple Google Drive mounts — SKIPPED (auto-detect is macOS-only)"
+fi
+
+# --- Issue #5c: concurrency lock. A second run is refused while the lock dir
+#     exists; a normal run releases it (no stale lock left behind). XDG_CACHE_HOME
+#     is set explicitly so the lock path is deterministic regardless of the outer
+#     environment. Cross-platform (apply mode + --allow-local-root). ---
+echo "smoke: #5c — concurrency lock refuses a second run, releases on exit"
+i5h="${sandbox}/i5-home"; i5c="${sandbox}/i5-cloud"; i5cache="${i5h}/.cache"
+mkdir -p "${i5cache}" "${i5c}"
+lockdir="${i5cache}/cloud-xdg-provision.lock"
+mkdir -p "${lockdir}"   # simulate another run already holding the lock
+set +e
+out="$(HOME="${i5h}" XDG_CACHE_HOME="${i5cache}" /bin/bash "${PROV}" \
+  --cloud-root "${i5c}" --apply --allow-local-root 2>&1)"
+rc=$?
+set -e
+assert_nonzero "${rc}" "apply is refused while a lock exists"
+assert_contains "${out}" "another run is in progress" "lock refusal explains why"
+if [ -d "${lockdir}" ]; then
+  ok "pre-existing lock left intact (a refused run must not remove a lock it didn't create)"
+else
+  fail "a refused run removed a lock it did not own"
+fi
+rmdir "${lockdir}"
+# With the lock cleared, a clean run must acquire AND release it — no stale lock.
+set +e
+out="$(HOME="${i5h}" XDG_CACHE_HOME="${i5cache}" /bin/bash "${PROV}" \
+  --cloud-root "${i5c}" --apply --allow-local-root 2>&1)"
+rc=$?
+set -e
+pass_if "${rc}" "apply runs cleanly once the lock is gone (exit 0)" \
+  "apply failed after lock cleared (exit ${rc}): ${out}"
+if [ -d "${lockdir}" ]; then
+  fail "lock dir was left behind after a normal run (trap did not release it)"
+else
+  ok "lock released on exit — no stale lock remains (master cleanup trap fired)"
+fi
+
+# --- Issue #5b: write_user_dirs backs up a pre-existing user-dirs.dirs before
+#     overwriting it. That path is non-macOS only, so we force PLATFORM=linux via a
+#     `uname` PATH-shim (the script reads `uname -s` at load). --allow-local-root
+#     makes check_cloud_liveness return BEFORE the Linux GNU-stat liveness probe, so
+#     the shimmed run stays portable on this macOS host. Skips with reason if the
+#     shimmed non-macOS path proves unstable here. ---
+echo "smoke: #5b — existing user-dirs.dirs is backed up before overwrite (uname-shim forces Linux)"
+i6shim="${sandbox}/i6-shim"
+mkdir -p "${i6shim}"
+cat > "${i6shim}/uname" <<'UNAMESH'
+#!/bin/sh
+case "$1" in
+  -s) echo "Linux" ;;
+  *) exec /usr/bin/uname "$@" ;;
+esac
+UNAMESH
+chmod +x "${i6shim}/uname"
+i6h="${sandbox}/i6-home"; i6c="${sandbox}/i6-cloud"
+i6cfg="${i6h}/.config"; i6cache="${i6h}/.cache"
+mkdir -p "${i6cfg}" "${i6cache}" "${i6c}"
+printf 'XDG_DOCUMENTS_DIR="/old/hand/tuned/path"\n' > "${i6cfg}/user-dirs.dirs"
+set +e
+out="$(HOME="${i6h}" XDG_CONFIG_HOME="${i6cfg}" XDG_CACHE_HOME="${i6cache}" \
+  PATH="${i6shim}:${PATH}" /bin/bash "${PROV}" \
+  --cloud-root "${i6c}" --apply --allow-local-root 2>&1)"
+rc=$?
+set -e
+if [ "${rc}" -eq 0 ]; then
+  ok "shimmed-Linux apply run exits 0"
+  if ls -d "${i6cfg}"/user-dirs.dirs.bak-* >/dev/null 2>&1; then
+    ok "user-dirs.dirs.bak-* backup was created before overwrite"
+  else
+    fail "no user-dirs.dirs.bak-* backup was created"
+  fi
+  bakfile=""
+  for bf in "${i6cfg}"/user-dirs.dirs.bak-*; do
+    [ -e "${bf}" ] || continue
+    bakfile="${bf}"; break
+  done
+  if [ -n "${bakfile}" ] && grep -q '/old/hand/tuned/path' "${bakfile}"; then
+    ok "backup preserves the original hand-tuned content"
+  else
+    fail "backup did not preserve the original content"
+  fi
+  assert_contains "${out}" "Backed up existing user-dirs.dirs" "run reports the backup it made"
+  if grep -q "${i6c}" "${i6cfg}/user-dirs.dirs"; then
+    ok "live user-dirs.dirs was rewritten to point into the cloud root"
+  else
+    fail "user-dirs.dirs was not rewritten after backup"
+  fi
+else
+  echo "  SKIP: #5b backup — shimmed non-macOS path unstable on this host (exit ${rc})"
+fi
+
+# --- Issue #7 (dead local_name param): covered by the M1 mac/xdg folder-name group
+#     above, which exercises local_name("$mac","$lin") via the ~/Movies symlink
+#     target check. No separate assertion needed. ---
+
+# --- Issue #5a (root-refusal guard): SKIPPED — exercising the refusal needs uid 0,
+#     and `id` cannot be safely stubbed under set -euo pipefail without masking real
+#     failures. The guard is a 2-line `[ "$(id -u)" = "0" ] && die`; verified by
+#     inspection. ---
+echo "smoke: #5a root-refusal guard — SKIPPED (needs uid 0; not stubbable here)"
+
+# ===========================================================================
+# Consistency + Linux coverage (issues #6 / #8). Both force PLATFORM=linux via the
+# uname PATH-shim because the Linux-only branches are otherwise untested on this
+# macOS host. Same isolation rules; self-cleaning under sandbox.
+# ===========================================================================
+
+# --- Issue #6: write_user_dirs must AGREE with the symlink layer — a cloud-pointing
+#     XDG var is written only for a genuinely-redirected dir. downloads is the moving
+#     part: create-only (local) by default, redirected only with --redirect-downloads.
+#     Also covers local_name's Linux naming (~/Videos, not ~/Movies). ---
+echo "smoke: #6 — user-dirs.dirs agrees with the symlink layer (forced-Linux)"
+i7shim="${sandbox}/i7-shim"; mkdir -p "${i7shim}"
+cat > "${i7shim}/uname" <<'UNAMESH'
+#!/bin/sh
+case "$1" in
+  -s) echo "Linux" ;;
+  *) exec /usr/bin/uname "$@" ;;
+esac
+UNAMESH
+chmod +x "${i7shim}/uname"
+i7c="${sandbox}/i7-cloud"; mkdir -p "${i7c}"
+
+# (a)+(b): DEFAULT run — documents redirected (cloud var), downloads NOT.
+i7h="${sandbox}/i7-home"; i7cfg="${i7h}/.config"; i7cache="${i7h}/.cache"
+mkdir -p "${i7cfg}" "${i7cache}"
+set +e
+out="$(HOME="${i7h}" XDG_CONFIG_HOME="${i7cfg}" XDG_CACHE_HOME="${i7cache}" \
+  PATH="${i7shim}:${PATH}" /bin/bash "${PROV}" \
+  --cloud-root "${i7c}" --apply --allow-local-root 2>&1)"
+rc=$?
+set -e
+if [ "${rc}" -eq 0 ]; then
+  udirs="$(cat "${i7cfg}/user-dirs.dirs" 2>/dev/null || true)"
+  assert_contains "${udirs}" "XDG_DOCUMENTS_DIR=\"${i7c}/documents\"" \
+    "(a) redirected dir (documents) gets a cloud-pointing XDG var"
+  assert_not_contains "${udirs}" "XDG_DOWNLOAD_DIR" \
+    "(b) downloads gets NO cloud-pointing XDG var by default"
+  # local_name Linux naming: the Linux dir is ~/Videos, never ~/Movies.
+  if [ -L "${i7h}/Videos" ]; then
+    ok "local_name Linux branch: HOME/Videos symlink created (XDG name)"
+  else
+    fail "expected HOME/Videos symlink under forced-Linux (local_name Linux branch)"
+  fi
+  if [ -e "${i7h}/Movies" ]; then
+    fail "HOME/Movies must not exist under forced-Linux naming"
+  else
+    ok "HOME/Movies absent under forced-Linux (Apple name not used on Linux)"
+  fi
+  if [ -L "${i7h}/Downloads" ]; then
+    fail "Downloads was symlinked by default (must stay create-only)"
+  else
+    ok "Downloads left local by default (symlink layer agrees with user-dirs.dirs)"
+  fi
+  assert_contains "${out}" "skip redirect: downloads" "default run shows the downloads-skip hint"
+
+  # (c): --redirect-downloads → downloads DOES get a cloud var AND is symlinked.
+  i7h2="${sandbox}/i7-home2"; i7cfg2="${i7h2}/.config"; i7cache2="${i7h2}/.cache"
+  mkdir -p "${i7cfg2}" "${i7cache2}"
+  set +e
+  out="$(HOME="${i7h2}" XDG_CONFIG_HOME="${i7cfg2}" XDG_CACHE_HOME="${i7cache2}" \
+    PATH="${i7shim}:${PATH}" /bin/bash "${PROV}" \
+    --cloud-root "${i7c}" --apply --allow-local-root --redirect-downloads 2>&1)"
+  rc=$?
+  set -e
+  pass_if "${rc}" "--redirect-downloads run exits 0" "run failed (exit ${rc}): ${out}"
+  udirs2="$(cat "${i7cfg2}/user-dirs.dirs" 2>/dev/null || true)"
+  assert_contains "${udirs2}" "XDG_DOWNLOAD_DIR=\"${i7c}/downloads\"" \
+    "(c) --redirect-downloads gives downloads a cloud-pointing XDG var"
+  if [ -L "${i7h2}/Downloads" ]; then
+    ok "(c) --redirect-downloads actually symlinks Downloads into the cloud"
+  else
+    fail "(c) --redirect-downloads did not symlink Downloads"
+  fi
+else
+  echo "  SKIP: #6 forced-Linux user-dirs test — shimmed path unstable here (exit ${rc})"
+fi
+
+# --- Issue #8: cloud_root_is_live() Linux fstype classification. SHIM `stat` (canned
+#     %T fstype + %d device id) AND uname=Linux, then exercise the B4 gate (--apply
+#     WITHOUT --allow-local-root). Verified against the production logic: fuse* → live;
+#     known-local → refused; UNKNOWN-fuse-magic/"" → fall through to the st_dev
+#     heuristic (different device = live, same = refused). ---
+echo "smoke: #8 — cloud_root_is_live fstype classification (stat+uname shims, forced-Linux)"
+fsshim="${sandbox}/fs-shim"; mkdir -p "${fsshim}"
+cat > "${fsshim}/uname" <<'UN'
+#!/bin/sh
+case "$1" in -s) echo "Linux" ;; *) exec /usr/bin/uname "$@" ;; esac
+UN
+cat > "${fsshim}/stat" <<'ST'
+#!/bin/sh
+# Canned stat for the #8 test, driven by SHIM_* env vars.
+#   stat -f -c %T <path> -> the fstype name; stat -c %d <path> -> a device id
+#   (HOME gets SHIM_DEV_HOME, the cloud root gets SHIM_DEV_ROOT).
+case "$1" in
+  -f) printf '%s\n' "${SHIM_FSTYPE}" ;;
+  -c) p=""; for a in "$@"; do p="$a"; done
+      if [ "$p" = "$HOME" ]; then printf '%s\n' "${SHIM_DEV_HOME}"; else printf '%s\n' "${SHIM_DEV_ROOT}"; fi ;;
+  *) exec /usr/bin/stat "$@" ;;
+esac
+ST
+chmod +x "${fsshim}/uname" "${fsshim}/stat"
+fs_n=0
+run_fstype_case() {  # $1=fstype  $2=dev_root  $3=dev_home  → sets globals out, rc
+  fs_n=$((fs_n + 1))
+  fch="${sandbox}/fs-${fs_n}-home"; fcc="${sandbox}/fs-${fs_n}-cloud"
+  mkdir -p "${fch}/.cache" "${fch}/.config" "${fcc}"
+  set +e
+  out="$(HOME="${fch}" XDG_CONFIG_HOME="${fch}/.config" XDG_CACHE_HOME="${fch}/.cache" \
+    SHIM_FSTYPE="$1" SHIM_DEV_ROOT="$2" SHIM_DEV_HOME="$3" \
+    PATH="${fsshim}:${PATH}" /bin/bash "${PROV}" --cloud-root "${fcc}" --apply 2>&1)"
+  rc=$?
+  set -e
+}
+# Live FUSE types proceed past the B4 gate (no --allow-local-root needed).
+for fst in fuse fuseblk fuse.glusterfs; do
+  run_fstype_case "${fst}" 0 0
+  pass_if "${rc}" "fstype '${fst}' treated as live (apply proceeds past B4)" \
+    "fstype '${fst}' was wrongly refused (exit ${rc}): ${out}"
+  assert_not_contains "${out}" "does not look like a live cloud mount" \
+    "fstype '${fst}' not flagged as a dead mount"
+done
+# Known-local types are refused without --allow-local-root.
+for fst in ext4 xfs tmpfs; do
+  run_fstype_case "${fst}" 0 0
+  assert_nonzero "${rc}" "fstype '${fst}' refused (known local fs, B4)"
+  assert_contains "${out}" "does not look like a live cloud mount" \
+    "fstype '${fst}' refusal explains the dead-mount reason"
+done
+# UNKNOWN fuse-magic (old coreutils) and empty fstype → fall through to st_dev.
+# Different device than HOME = treated live (the documented fail-safe — don't over-refuse).
+run_fstype_case "UNKNOWN (0x65735546)" 4242 11
+pass_if "${rc}" "UNKNOWN fuse-magic + different device → st_dev fallback treats as live" \
+  "UNKNOWN-magic different-device run was refused (exit ${rc}): ${out}"
+assert_not_contains "${out}" "does not look like a live cloud mount" \
+  "UNKNOWN-magic different-device not over-refused (documented fail-safe)"
+run_fstype_case "" 4242 11
+pass_if "${rc}" "empty fstype + different device → st_dev fallback treats as live" \
+  "empty-fstype different-device run was refused (exit ${rc}): ${out}"
+# Same device under the fallback → conservative refusal.
+run_fstype_case "UNKNOWN (0x65735546)" 11 11
+assert_nonzero "${rc}" "UNKNOWN fuse-magic + SAME device → st_dev fallback refuses (conservative)"
+assert_contains "${out}" "does not look like a live cloud mount" \
+  "same-device fallback refusal explains the reason"
+
+# --- Review M-c: verify_copy() is the post-copy gate — on a bad copy it must die
+#     BEFORE the destructive `mv`, leaving the original in place (never lost to a
+#     truncated/incomplete copy). The success path is covered; this exercises the
+#     MISMATCH->die path. A copier PATH-shim does the REAL copy then DELETES a file
+#     from the destination, so verify_copy's read-back finds a genuine diff. Both
+#     rsync (the default copier when present) and cp (the fallback) are shimmed, so
+#     whichever the script picks, the sabotage lands — no skip needed (cp always
+#     exists). Confirmed by bypass-sanity: if verify_copy is forced to return 0, this
+#     group fails (original gets moved to an aside, run exits 0). ---
+echo "smoke: M-c — verify_copy aborts on a bad copy WITHOUT moving the original"
+vch="${sandbox}/vc-home"; vcc="${sandbox}/vc-cloud"; vcshim="${sandbox}/vc-shim"
+mkdir -p "${vch}/Documents" "${vcc}" "${vch}/.cache" "${vcshim}"
+printf 'original-payload\n' > "${vch}/Documents/payload.txt"
+printf 'second-file\n'      > "${vch}/Documents/other.txt"
+vc_real_rsync="$(command -v rsync || true)"
+vc_real_cp="$(command -v cp || echo /bin/cp)"
+# rsync shim: pass the dry-run VERIFY call (-n) through untouched; for the real COPY,
+# copy then delete payload.txt from the dest so the verify read-back sees it missing.
+cat > "${vcshim}/rsync" <<'RS'
+#!/bin/sh
+for a in "$@"; do case "$a" in -n) exec "$REAL_RSYNC" "$@" ;; esac; done
+"$REAL_RSYNC" "$@"; rc=$?
+last=""; for a in "$@"; do last="$a"; done
+rm -f "${last}payload.txt" 2>/dev/null || true
+exit $rc
+RS
+# cp shim (used only if rsync is absent — verify_copy's cp path compares file count):
+# copy then delete payload.txt from the dest so the count/bytes mismatch.
+cat > "${vcshim}/cp" <<'CP'
+#!/bin/sh
+"$REAL_CP" "$@"; rc=$?
+last=""; for a in "$@"; do last="$a"; done
+rm -f "${last}payload.txt" 2>/dev/null || true
+exit $rc
+CP
+chmod +x "${vcshim}/rsync" "${vcshim}/cp"
+set +e
+out="$(HOME="${vch}" XDG_CACHE_HOME="${vch}/.cache" \
+  REAL_RSYNC="${vc_real_rsync}" REAL_CP="${vc_real_cp}" \
+  PATH="${vcshim}:${PATH}" /bin/bash "${PROV}" \
+  --cloud-root "${vcc}" --apply --relocate --allow-local-root 2>&1)"
+rc=$?
+set -e
+assert_nonzero "${rc}" "bad-copy run EXITS NON-ZERO (verify_copy aborted the relocate)"
+assert_contains "${out}" "post-copy verification FAILED" "failure names the post-copy verification gate"
+if [ -d "${vch}/Documents" ] && [ ! -L "${vch}/Documents" ] &&
+   [ -f "${vch}/Documents/payload.txt" ] && [ -f "${vch}/Documents/other.txt" ]; then
+  ok "original ~/Documents intact at its path (real dir, both files present)"
+else
+  fail "original ~/Documents was altered/moved despite the verify failure"
+fi
+if ls -d "${vch}"/Documents.pre-offload-* >/dev/null 2>&1; then
+  fail "original was moved to a *.pre-offload-* aside despite verify failing (destructive mv ran)"
+else
+  ok "no *.pre-offload-* aside created (the destructive mv never ran)"
+fi
+if ls -d "${vch}/.cache/cloud-xdg-provision.lock" >/dev/null 2>&1; then
+  fail "lock dir left behind after the aborted run"
+else
+  ok "lock released after the aborted run"
+fi
+
+# ===========================================================================
+# PR #11 remediation — INTERRUPT regression (the gap that let two BLOCKING trap
+# bugs ship): actually send a signal MID-RELOCATE and assert the process terminates
+# safely. This group FAILS against the pre-fix code (subshell-scoped flags +
+# handler-never-exits → exit 0, relocate completes, no recovery message) and PASSES
+# after the fix (de-piped loop + split EXIT/INT-TERM with exit 130). Empirically
+# confirmed both directions by stashing the bin fix.
+#
+# Mechanism: an `mv` PATH-shim sleeps 5s AFTER the rename whose destination matches
+# IR_SLEEP_MATCH, widening that exact window. We background --apply --relocate on a
+# populated sandbox dir and signal it while the shim sleeps. (bash defers the trapped
+# signal until the in-flight mv returns, so the interrupt is deterministic, not
+# racing the window edge.)
+#
+# WHY SIGTERM, not SIGINT: a job started with `&` in a NON-INTERACTIVE shell (this
+# test) has SIGINT/SIGQUIT set to SIG_IGN on entry, and POSIX forbids a
+# non-interactive shell from trapping a signal that was ignored on entry — so a
+# `kill -INT` here would be silently dropped (the child can't catch it) and the run
+# would finish normally, testing nothing. SIGTERM is NOT ignored for background jobs,
+# and the production handler traps BOTH (`trap on_signal INT TERM`), so SIGTERM
+# exercises the identical code path a real foreground Ctrl-C (SIGINT) takes.
+# ===========================================================================
+ir_n=0
+interrupt_relocate() {  # $1=dest-substring to widen  $2=seconds before the signal
+  ir_n=$((ir_n + 1))
+  ir_home="${sandbox}/ir-${ir_n}-home"; ir_cloud="${sandbox}/ir-${ir_n}-cloud"
+  ir_shim="${sandbox}/ir-${ir_n}-shim"
+  mkdir -p "${ir_home}/Documents" "${ir_cloud}" "${ir_home}/.cache" "${ir_shim}"
+  printf 'important-payload\n' > "${ir_home}/Documents/payload.txt"
+  cat > "${ir_shim}/mv" <<'MVSH'
+#!/bin/sh
+# Widen one relocate window: do the real rename, then sleep if its destination
+# matches IR_SLEEP_MATCH, so a signal to the parent lands while we're inside it.
+last=""; for a in "$@"; do last="$a"; done
+/bin/mv "$@"; rc=$?
+case "$last" in *"${IR_SLEEP_MATCH}"*) sleep 5 ;; esac
+exit $rc
+MVSH
+  chmod +x "${ir_shim}/mv"
+  set +e
+  HOME="${ir_home}" XDG_CACHE_HOME="${ir_home}/.cache" IR_SLEEP_MATCH="$1" \
+    PATH="${ir_shim}:${PATH}" /bin/bash "${PROV}" \
+    --cloud-root "${ir_cloud}" --apply --relocate --allow-local-root \
+    > "${sandbox}/ir-${ir_n}-out.txt" 2>&1 &
+  ir_pid=$!
+  sleep "$2"
+  kill -TERM "${ir_pid}" 2>/dev/null   # TERM, not INT — see the WHY-SIGTERM note above
+  wait "${ir_pid}"; ir_rc=$?
+  set -e
+  ir_out="$(cat "${sandbox}/ir-${ir_n}-out.txt" 2>/dev/null || true)"
+}
+
+# --- Probe window (macOS-only — the TCC rename-probe exists only on PLATFORM=macos).
+#     Interrupt while the dir is renamed aside to *.tcc-probe.*; the master handler
+#     must revert it, leave the original intact, release the lock, and exit non-zero. ---
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo "smoke: PR#11 interrupt — signal in the TCC-probe window reverts safely (macOS)"
+  interrupt_relocate ".tcc-probe." 2
+  assert_nonzero "${ir_rc}" "probe-window signal exits NON-ZERO (not 0 — B2 regression guard)"
+  if ls -d "${ir_home}"/Documents.tcc-probe.* >/dev/null 2>&1; then
+    fail "probe was left stranded (.tcc-probe.* dir) — B1 regression (revert dead in subshell)"
+  else
+    ok "no stranded *.tcc-probe.* dir (probe was reverted by the parent-scope handler)"
+  fi
+  if [ -d "${ir_home}/Documents" ] && [ ! -L "${ir_home}/Documents" ] &&
+     [ -f "${ir_home}/Documents/payload.txt" ]; then
+    ok "original ~/Documents intact (real dir, payload preserved — relocate aborted cleanly)"
+  else
+    fail "original ~/Documents was relocated/altered despite a mid-probe interrupt"
+  fi
+  if ls -d "${ir_home}/.cache/cloud-xdg-provision.lock" >/dev/null 2>&1; then
+    fail "lock dir left behind after an interrupted run (#5c guarantee broken)"
+  else
+    ok "lock released on interrupt (no stale lock)"
+  fi
+else
+  echo "smoke: PR#11 interrupt (probe window) — SKIPPED (TCC probe is macOS-only)"
+fi
+
+# --- mv->ln window (cross-platform): interrupt after the original is renamed aside
+#     (*.pre-offload-*) but before the symlink is created. The handler must PRINT the
+#     recovery message (proving the RELOCATE_ACTIVE flag — set inside relocate_dir —
+#     is visible to the PARENT-scope handler after de-piping), keep the data in the
+#     aside, release the lock, and exit non-zero. ---
+echo "smoke: PR#11 interrupt — signal in the mv->ln window recovers safely"
+interrupt_relocate ".pre-offload-" 3
+assert_nonzero "${ir_rc}" "mv->ln-window signal exits NON-ZERO (not 0 — B2 regression guard)"
+assert_contains "${ir_out}" "INTERRUPTED mid-relocate" \
+  "recovery message printed (RELOCATE_ACTIVE flag reached the parent handler — B1 fix)"
+ir_aside_ok=0
+for a in "${ir_home}"/Documents.pre-offload-*; do
+  [ -f "${a}/payload.txt" ] && ir_aside_ok=1
+done
+if [ "${ir_aside_ok}" -eq 1 ]; then
+  ok "original data preserved in the *.pre-offload-* aside (never vanished)"
+else
+  fail "data was not safely in an aside after a mid-mv->ln interrupt"
+fi
+if ls -d "${ir_home}/.cache/cloud-xdg-provision.lock" >/dev/null 2>&1; then
+  fail "lock dir left behind after an interrupted run (#5c guarantee broken)"
+else
+  ok "lock released on interrupt (no stale lock)"
+fi
 
 echo "smoke: PASS"
