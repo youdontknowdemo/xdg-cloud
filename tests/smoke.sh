@@ -791,4 +791,108 @@ assert_nonzero "${rc}" "UNKNOWN fuse-magic + SAME device → st_dev fallback ref
 assert_contains "${out}" "does not look like a live cloud mount" \
   "same-device fallback refusal explains the reason"
 
+# ===========================================================================
+# PR #11 remediation — INTERRUPT regression (the gap that let two BLOCKING trap
+# bugs ship): actually send a signal MID-RELOCATE and assert the process terminates
+# safely. This group FAILS against the pre-fix code (subshell-scoped flags +
+# handler-never-exits → exit 0, relocate completes, no recovery message) and PASSES
+# after the fix (de-piped loop + split EXIT/INT-TERM with exit 130). Empirically
+# confirmed both directions by stashing the bin fix.
+#
+# Mechanism: an `mv` PATH-shim sleeps 5s AFTER the rename whose destination matches
+# IR_SLEEP_MATCH, widening that exact window. We background --apply --relocate on a
+# populated sandbox dir and signal it while the shim sleeps. (bash defers the trapped
+# signal until the in-flight mv returns, so the interrupt is deterministic, not
+# racing the window edge.)
+#
+# WHY SIGTERM, not SIGINT: a job started with `&` in a NON-INTERACTIVE shell (this
+# test) has SIGINT/SIGQUIT set to SIG_IGN on entry, and POSIX forbids a
+# non-interactive shell from trapping a signal that was ignored on entry — so a
+# `kill -INT` here would be silently dropped (the child can't catch it) and the run
+# would finish normally, testing nothing. SIGTERM is NOT ignored for background jobs,
+# and the production handler traps BOTH (`trap on_signal INT TERM`), so SIGTERM
+# exercises the identical code path a real foreground Ctrl-C (SIGINT) takes.
+# ===========================================================================
+ir_n=0
+interrupt_relocate() {  # $1=dest-substring to widen  $2=seconds before the signal
+  ir_n=$((ir_n + 1))
+  ir_home="${sandbox}/ir-${ir_n}-home"; ir_cloud="${sandbox}/ir-${ir_n}-cloud"
+  ir_shim="${sandbox}/ir-${ir_n}-shim"
+  mkdir -p "${ir_home}/Documents" "${ir_cloud}" "${ir_home}/.cache" "${ir_shim}"
+  printf 'important-payload\n' > "${ir_home}/Documents/payload.txt"
+  cat > "${ir_shim}/mv" <<'MVSH'
+#!/bin/sh
+# Widen one relocate window: do the real rename, then sleep if its destination
+# matches IR_SLEEP_MATCH, so a signal to the parent lands while we're inside it.
+last=""; for a in "$@"; do last="$a"; done
+/bin/mv "$@"; rc=$?
+case "$last" in *"${IR_SLEEP_MATCH}"*) sleep 5 ;; esac
+exit $rc
+MVSH
+  chmod +x "${ir_shim}/mv"
+  set +e
+  HOME="${ir_home}" XDG_CACHE_HOME="${ir_home}/.cache" IR_SLEEP_MATCH="$1" \
+    PATH="${ir_shim}:${PATH}" /bin/bash "${PROV}" \
+    --cloud-root "${ir_cloud}" --apply --relocate --allow-local-root \
+    > "${sandbox}/ir-${ir_n}-out.txt" 2>&1 &
+  ir_pid=$!
+  sleep "$2"
+  kill -TERM "${ir_pid}" 2>/dev/null   # TERM, not INT — see the WHY-SIGTERM note above
+  wait "${ir_pid}"; ir_rc=$?
+  set -e
+  ir_out="$(cat "${sandbox}/ir-${ir_n}-out.txt" 2>/dev/null || true)"
+}
+
+# --- Probe window (macOS-only — the TCC rename-probe exists only on PLATFORM=macos).
+#     Interrupt while the dir is renamed aside to *.tcc-probe.*; the master handler
+#     must revert it, leave the original intact, release the lock, and exit non-zero. ---
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo "smoke: PR#11 interrupt — signal in the TCC-probe window reverts safely (macOS)"
+  interrupt_relocate ".tcc-probe." 2
+  assert_nonzero "${ir_rc}" "probe-window signal exits NON-ZERO (not 0 — B2 regression guard)"
+  if ls -d "${ir_home}"/Documents.tcc-probe.* >/dev/null 2>&1; then
+    fail "probe was left stranded (.tcc-probe.* dir) — B1 regression (revert dead in subshell)"
+  else
+    ok "no stranded *.tcc-probe.* dir (probe was reverted by the parent-scope handler)"
+  fi
+  if [ -d "${ir_home}/Documents" ] && [ ! -L "${ir_home}/Documents" ] &&
+     [ -f "${ir_home}/Documents/payload.txt" ]; then
+    ok "original ~/Documents intact (real dir, payload preserved — relocate aborted cleanly)"
+  else
+    fail "original ~/Documents was relocated/altered despite a mid-probe interrupt"
+  fi
+  if ls -d "${ir_home}/.cache/cloud-xdg-provision.lock" >/dev/null 2>&1; then
+    fail "lock dir left behind after an interrupted run (#5c guarantee broken)"
+  else
+    ok "lock released on interrupt (no stale lock)"
+  fi
+else
+  echo "smoke: PR#11 interrupt (probe window) — SKIPPED (TCC probe is macOS-only)"
+fi
+
+# --- mv->ln window (cross-platform): interrupt after the original is renamed aside
+#     (*.pre-offload-*) but before the symlink is created. The handler must PRINT the
+#     recovery message (proving the RELOCATE_ACTIVE flag — set inside relocate_dir —
+#     is visible to the PARENT-scope handler after de-piping), keep the data in the
+#     aside, release the lock, and exit non-zero. ---
+echo "smoke: PR#11 interrupt — signal in the mv->ln window recovers safely"
+interrupt_relocate ".pre-offload-" 3
+assert_nonzero "${ir_rc}" "mv->ln-window signal exits NON-ZERO (not 0 — B2 regression guard)"
+assert_contains "${ir_out}" "INTERRUPTED mid-relocate" \
+  "recovery message printed (RELOCATE_ACTIVE flag reached the parent handler — B1 fix)"
+ir_aside_ok=0
+for a in "${ir_home}"/Documents.pre-offload-*; do
+  [ -f "${a}/payload.txt" ] && ir_aside_ok=1
+done
+if [ "${ir_aside_ok}" -eq 1 ]; then
+  ok "original data preserved in the *.pre-offload-* aside (never vanished)"
+else
+  fail "data was not safely in an aside after a mid-mv->ln interrupt"
+fi
+if ls -d "${ir_home}/.cache/cloud-xdg-provision.lock" >/dev/null 2>&1; then
+  fail "lock dir left behind after an interrupted run (#5c guarantee broken)"
+else
+  ok "lock released on interrupt (no stale lock)"
+fi
+
 echo "smoke: PASS"

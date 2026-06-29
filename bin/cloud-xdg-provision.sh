@@ -121,10 +121,10 @@ run()  {
   fi
 }
 
-# Single master cleanup handler — installed once (see install_cleanup_trap, called
-# from main() right after the lock is acquired) on EXIT INT TERM. It serves THREE
-# independent responsibilities, each gated on its own flag, so they never clobber
-# one another the way separate `trap`/`trap -` pairs would under bash 3.2:
+# Single master cleanup handler — installed in the PARENT shell (see
+# install_cleanup_trap, called from main() BEFORE the lock is acquired). It serves
+# THREE independent responsibilities, each gated on its own flag, so they never
+# clobber one another the way separate `trap`/`trap -` pairs would under bash 3.2:
 #   1. PROBE_ACTIVE  — revert an interrupted macOS TCC rename-probe (B2).
 #   2. RELOCATE_ACTIVE — print the mid-relocate recovery message (B3): if the shell
 #      exits between renaming the original aside and creating the replacement
@@ -134,15 +134,27 @@ run()  {
 #      die/error, INT/TERM) so a crash never strands a stale lock.
 # All three windows are apply-mode-only (relocate's probe/recovery code and the
 # lock are only armed when DRY_RUN=0), so a dry-run Ctrl-C prints nothing spurious.
+#
+# CRITICAL (PR #11 remediation): the flags this reads are raised inside relocate_dir,
+# which MUST run in the same shell as this handler. main()'s redirect loop is fed by
+# a here-doc (NOT a `... | while`) precisely so relocate_dir runs in the PARENT shell
+# — a pipe would run it in a subshell whose flag writes never reach here (and whose
+# traps are reset to default), silently disabling probe-revert + recovery on signal.
+#
+# IDEMPOTENT: each branch resets its own flag after acting, so the EXIT trap firing
+# again right after on_signal's `exit 130` is a harmless no-op (no double-print, no
+# double-revert).
 cleanup_handler() {
   if [ "${PROBE_ACTIVE:-0}" -eq 1 ]; then
     mv "$PROBE_PATH" "$PROBE_SRC" 2>/dev/null || true
+    PROBE_ACTIVE=0
   fi
   if [ "${RELOCATE_ACTIVE:-0}" -eq 1 ]; then
     warn "INTERRUPTED mid-relocate — your data is SAFE, here is the state:"
     warn "  original:  moved to '$RELOCATE_ASIDE' if the rename finished, else still at '$RELOCATE_SRC'"
     warn "  cloud copy: '$RELOCATE_DST'"
     warn "  the symlink '$RELOCATE_SRC' may not exist yet. Re-run to finish. Delete NOTHING until verified."
+    RELOCATE_ACTIVE=0
   fi
   if [ "${LOCK_OWNED:-0}" -eq 1 ] && [ -n "${LOCK_DIR:-}" ]; then
     rmdir "$LOCK_DIR" 2>/dev/null || true
@@ -150,7 +162,25 @@ cleanup_handler() {
   fi
 }
 
-install_cleanup_trap() { trap cleanup_handler EXIT INT TERM; }
+# Signal handler (PR #11 remediation, B2): a bare trap handler does NOT terminate the
+# script — bash runs it and then RESUMES the interrupted code, which would finish the
+# mv+ln unprotected, print a false "data SAFE" line, and exit 0 on a Ctrl-C. So on
+# INT/TERM we run the cleanup actions and then EXIT non-zero (130 = 128+SIGINT). The
+# EXIT trap fires once more on the way out, but cleanup_handler is idempotent so that
+# second pass is a no-op.
+on_signal() {
+  cleanup_handler
+  exit 130
+}
+
+# Arm EXIT (normal/error path) and INT/TERM (signal path) with their distinct
+# handlers. Installed early in main(), before acquire_lock, so a signal in the
+# acquire->arm gap can't strand the lock; the handlers are flag/LOCK_OWNED-gated, so
+# arming before any work is a safe no-op.
+install_cleanup_trap() {
+  trap cleanup_handler EXIT
+  trap on_signal INT TERM
+}
 
 # #5a: refuse to run as root. This tool creates dirs and symlinks under the
 # invoking user's $HOME; as root those entries would be root-owned (and, via sudo,
@@ -712,11 +742,13 @@ main() {
   resolve_cloud_root
   normalize_cloud_root
   check_cloud_liveness
-  # #5c — take the lock once the cheap validations have passed, then install the
-  # single master cleanup trap that owns lock release + probe revert + relocate
-  # recovery for the rest of the run (apply mode; a no-op installer in dry-run).
-  acquire_lock
+  # Arm the cleanup traps FIRST, then take the lock. Order matters (PR #11): if the
+  # lock were acquired before the trap was armed, a signal in that gap would strand
+  # the lock dir. The handlers are flag/LOCK_OWNED-gated, so arming before any work
+  # (and before the lock is owned) is a safe no-op. The trap owns lock release +
+  # probe revert + relocate recovery for the rest of the run.
   install_cleanup_trap
+  acquire_lock
   log "============================================================="
   log " cloud-xdg-provision  platform=$PLATFORM  style=$STYLE  mode=$([ "$DRY_RUN" -eq 1 ] && echo DRY-RUN || echo APPLY)"
   log " cloud root: $CLOUD_ROOT"
@@ -727,11 +759,23 @@ main() {
   ensure_cloud_tree
   log ""
   log "Redirecting local user dirs -> cloud:"
+  # CRITICAL (PR #11): feed OFFLOAD_SET via a here-doc, NOT `printf | while`. A pipe
+  # runs the loop body — and thus relocate_dir — in a SUBSHELL, where the PROBE_ACTIVE/
+  # RELOCATE_ACTIVE flags it raises never reach the parent shell that owns the cleanup
+  # traps (and where the subshell's traps are reset to default). That silently
+  # disabled probe-revert + mid-relocate recovery on SIGINT/TERM. A here-doc redirect
+  # keeps the loop AND relocate_dir in the PARENT shell, so flags and traps share
+  # scope. Parsing is identical to the old pipe: $OFFLOAD_SET still expands with its
+  # leading/trailing blank lines, which the `[ -z "$line" ] && continue` skips.
+  # (Other printf|while loops — ensure_cloud_tree, write_user_dirs — set no trap
+  # flags, so they stay piped.)
   local line
-  printf '%s\n' "$OFFLOAD_SET" | while IFS= read -r line; do
+  while IFS= read -r line; do
     [ -z "$line" ] && continue
     redirect_one "$line"
-  done
+  done <<EOF
+$OFFLOAD_SET
+EOF
   log ""
   write_user_dirs
   print_mapping
