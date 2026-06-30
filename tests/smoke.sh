@@ -1945,4 +1945,25 @@ set +e; out="$(HOME="${sandbox}/df-empty" XDG_CONFIG_HOME="${sandbox}/df-empty/.
 pass_if "${rc}" "status on a home with no repo exits 0 (read-only hint)" "status no-repo failed (exit ${rc}): ${out}"
 assert_contains "${out}" "no dotfiles bare repo" "status hints to run --dotfiles-init when no repo exists"
 
+# --- D12 (v2): multi-path --dotfiles-track — (a) several valid dotfiles tracked in ONE
+#     commit; (b) a mix of valid + a MANAGED path dies FAIL-CLOSED (commits NOTHING, neither
+#     staged). Reuses the D1 inited repo via dfrun (sandbox HOME + sandbox rc). ---
+echo "smoke: D12 — multi-path dotfiles-track: one commit for many; fail-closed on a managed path"
+printf 'm1\n' > "${df_home}/.multi1"; printf 'm2\n' > "${df_home}/.multi2"; printf 'm3\n' > "${df_home}/.multi3"
+# (a) two valid paths in a single commit.
+commits_before="$(git --git-dir="${df_home}/.dotfiles" rev-list --count HEAD 2>/dev/null || printf 0)"
+set +e; out="$(dfrun --dotfiles-track .multi1 .multi2 --apply 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "multi-path track of two valid dotfiles exits 0" "multi-track failed (exit ${rc}): ${out}"
+tracked="$(git --git-dir="${df_home}/.dotfiles" --work-tree="${df_home}" ls-files 2>/dev/null)"
+if printf '%s\n' "${tracked}" | grep -qx ".multi1" && printf '%s\n' "${tracked}" | grep -qx ".multi2"; then
+  ok "both paths were committed"; else fail "multi-path track did not commit both paths"; fi
+commits_after="$(git --git-dir="${df_home}/.dotfiles" rev-list --count HEAD 2>/dev/null || printf 0)"
+if [ "$((commits_after - commits_before))" = "1" ]; then ok "the two paths landed in exactly ONE commit"; else fail "expected 1 new commit, got $((commits_after - commits_before))"; fi
+# (b) valid + MANAGED (Documents) → fail-closed: die, commit/stage NOTHING.
+set +e; out="$(dfrun --dotfiles-track .multi3 Documents --apply 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "a mix with a managed path exits non-zero (fail-closed)"
+assert_contains "${out}" "refusing" "the managed path is named in the refusal"
+tracked="$(git --git-dir="${df_home}/.dotfiles" --work-tree="${df_home}" ls-files 2>/dev/null)"
+if printf '%s\n' "${tracked}" | grep -qx ".multi3"; then fail "FAIL-CLOSED VIOLATION: the valid path was staged despite a managed path in the set"; else ok "fail-closed: the valid path was NOT staged (all-or-nothing)"; fi
+
 echo "smoke: PASS"
