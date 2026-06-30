@@ -87,6 +87,16 @@ MODE_ARG=""        # argument for value-taking modes (--offload <dir>, --hydrate
 : "${CODE_DEST:=xdg-offload/code}"    # path inside the remote; per-container <canonical> appended
 OFFLOAD_ASIDE=0                       # 1 = move aside + re-verify before rm (opt-in, --aside)
 
+# Dotfiles bare-repo lane (slice 3, step 8) — purely LOCAL (no cloud mount/remote). A bare
+# git repo at $HOME/.dotfiles with $HOME as the work tree, plus a sourced alias file and a
+# guarded rc-source block. Fixed paths are literal; only DOTFILES_RC takes the env idiom.
+DOTFILES_DIR="$HOME/.dotfiles"                            # the bare repo (work-tree = $HOME)
+DOTFILES_ALIASES="$XDG_CONFIG_HOME/xdg-cloud/aliases.sh"  # dedicated sourced alias file
+DOTFILES_SENTINEL="# >>> xdg-cloud dotfiles >>>"          # rc-block start marker (idempotency key)
+DOTFILES_SENTINEL_END="# <<< xdg-cloud dotfiles <<<"      # rc-block end marker
+: "${DOTFILES_RC:=}"                                      # explicit rc path (--dotfiles-rc); else $SHELL-derived
+RC_TARGET=""                                              # resolved rc (set by dotfiles_resolve_rc)
+
 # State for the single master cleanup trap (cleanup_handler). bash 3.2 allows only
 # ONE handler per signal and has no trap-stacking, so the concurrency lock (#5c),
 # the macOS TCC-probe revert (B2), and the mid-relocate recovery message (B3) must
@@ -322,7 +332,13 @@ lane per run — combining a mode with the default flags is refused):
   --code-remote NAME     rclone remote for offload (default: gdrive).
   --code-dest PATH       Path inside the remote (default: xdg-offload/code).
   --aside                Offload: move local aside + re-verify before rm (extra safety).
-  (reserved, not yet implemented: --dotfiles-init, --dotfiles-track, --dotfiles-status)
+  --dotfiles-init        Create a bare ~/.dotfiles repo + install the 'dotfiles' alias
+                         (dry-run unless --apply). Idempotent; backs up your rc first.
+  --dotfiles-track <p>   Track a dotfile/dir into the bare repo (refuses cloud-xdg-managed
+                         paths). --apply to commit.
+  --dotfiles-status      Show tracked-file status + whether the alias/rc block are installed.
+  --dotfiles-rc PATH     Shell rc to edit (default: ~/.zshrc for zsh, ~/.bashrc for bash).
+                         macOS bash login shells usually want --dotfiles-rc ~/.bash_profile.
 
 Nothing is moved without --apply --relocate together.
 EOF
@@ -349,6 +365,7 @@ while [ $# -gt 0 ]; do
     --code-remote)        shift; CODE_REMOTE="${1:?--code-remote needs a name}" ;;
     --code-dest)          shift; CODE_DEST="${1:?--code-dest needs a path}" ;;
     --aside)              OFFLOAD_ASIDE=1 ;;
+    --dotfiles-rc)        shift; DOTFILES_RC="${1:?--dotfiles-rc needs a path}" ;;
     # --- read-only report modes (slice 1, implemented) ---
     --classify)           set_mode classify ;;
     --offload-status)     set_mode offload-status ;;
@@ -1255,6 +1272,164 @@ cmd_migrate_projects() {
 }
 
 # ---------------------------------------------------------------------------
+# Dotfiles bare-repo lane (slice 3, step 8) — purely LOCAL. A bare repo at
+# $HOME/.dotfiles with $HOME as the work tree, a sourced alias file, and an
+# idempotent guarded rc-source block. NO cloud mount/remote. ADOPT (clone+checkout)
+# is DEFERRED (design only — see the dotfiles-lane spec §7).
+# ---------------------------------------------------------------------------
+
+# Run git against the bare dotfiles repo with $HOME as the work tree. Body only.
+dotfiles_git() { git --git-dir="$DOTFILES_DIR" --work-tree="$HOME" "$@"; }
+
+# True (0) if $DOTFILES_DIR is OUR bare repo (idempotency / refuse-clobber discriminator).
+dotfiles_is_ours() {
+  [ -d "$DOTFILES_DIR" ] || return 1
+  [ "$(git --git-dir="$DOTFILES_DIR" rev-parse --is-bare-repository 2>/dev/null)" = "true" ]
+}
+
+# Resolve the rc to edit into the GLOBAL RC_TARGET. --dotfiles-rc wins; else by $SHELL
+# basename. Unknown/unset $SHELL => DIE requiring --dotfiles-rc (refuse-don't-guess: a
+# guessed wrong rc means the alias is written but never loaded — a silent failure).
+# MUST be called BARE (never rc="$(dotfiles_resolve_rc)"): `die` (exit 1) inside $()
+# exits only the SUBSHELL, so the $()-form would NOT halt the parent on failure.
+dotfiles_resolve_rc() {
+  if [ -n "$DOTFILES_RC" ]; then RC_TARGET="$DOTFILES_RC"; return 0; fi
+  case "$(basename "${SHELL:-}")" in
+    zsh)  RC_TARGET="$HOME/.zshrc" ;;
+    bash) RC_TARGET="$HOME/.bashrc" ;;
+    *)    die "cannot determine your shell rc from \$SHELL='${SHELL:-}'. Re-run with
+  --dotfiles-rc PATH (e.g. macOS bash login shells often want --dotfiles-rc ~/.bash_profile)." ;;
+  esac
+}
+
+# Add a guarded `source` block for the alias file to RC_TARGET, ONCE. Idempotency key =
+# the sentinel comment (grep -qF, fixed-string). Backs the rc up FIRST (#5b uniquifier:
+# timestamp + counter, -e OR -L to catch a dangling-symlink backup path). Append-only —
+# never rewrites existing rc content. The source line is written SINGLE-QUOTED so
+# ${XDG_CONFIG_HOME:-$HOME/.config} expands at rc-source time (per-machine); no backticks.
+dotfiles_install_rc_source() {
+  local bak stamp n
+  if [ -f "$RC_TARGET" ] && grep -qF "$DOTFILES_SENTINEL" "$RC_TARGET" 2>/dev/null; then
+    info "rc already contains the xdg-cloud dotfiles block ($RC_TARGET) — leaving it."
+    return 0
+  fi
+  if [ -e "$RC_TARGET" ] || [ -L "$RC_TARGET" ]; then
+    stamp="$(date +%Y%m%d-%H%M%S)"; bak="${RC_TARGET}.bak-${stamp}"; n=1
+    while [ -e "$bak" ] || [ -L "$bak" ]; do bak="${RC_TARGET}.bak-${stamp}.${n}"; n=$((n + 1)); done
+    cp "$RC_TARGET" "$bak"; info "Backed up $RC_TARGET -> $bak"
+  fi
+  mkdir -p "$(dirname "$RC_TARGET")"
+  {
+    printf '%s\n' "$DOTFILES_SENTINEL"
+    # shellcheck disable=SC2016   # INTENTIONAL: keep ${XDG_CONFIG_HOME:-...} literal so it
+    # expands in the USER's shell at rc-source time (per-machine), NOT at write time.
+    printf '%s\n' '[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/xdg-cloud/aliases.sh" ] && . "${XDG_CONFIG_HOME:-$HOME/.config}/xdg-cloud/aliases.sh"'
+    printf '%s\n' "$DOTFILES_SENTINEL_END"
+  } >> "$RC_TARGET"
+  info "Added the xdg-cloud dotfiles source block to $RC_TARGET"
+}
+
+# --dotfiles-init: create the bare repo + alias file + rc source block. Idempotent.
+cmd_dotfiles_init() {
+  begin_mutating_mode                      # guard_not_root + trap + (apply-only) lock
+  if [ -e "$DOTFILES_DIR" ] || [ -L "$DOTFILES_DIR" ]; then
+    dotfiles_is_ours || die "$DOTFILES_DIR exists but is not our bare git repo — refusing to clobber it."
+    info "bare repo already present at $DOTFILES_DIR — ensuring config + alias only."
+  fi
+  dotfiles_resolve_rc                       # sets RC_TARGET or dies (in THIS shell)
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "[dry-run] git init --bare $DOTFILES_DIR        (skipped if already present)"
+    info "[dry-run] dotfiles config --local status.showUntrackedFiles no"
+    info "[dry-run] write alias file: $DOTFILES_ALIASES"
+    info "[dry-run] add guarded source block to: $RC_TARGET   (only if sentinel absent; rc backed up first)"
+    return 0
+  fi
+  dotfiles_is_ours || run git init --bare "$DOTFILES_DIR"
+  dotfiles_git config --local status.showUntrackedFiles no
+  # alias file — $HOME stays LITERAL (escaped \$HOME under a double-quoted printf format,
+  # single-quoted alias value); NO backticks (parse/source-time execution footgun).
+  mkdir -p "$(dirname "$DOTFILES_ALIASES")"
+  {
+    printf '%s\n' "# Generated by $SELF — bare-repo dotfiles alias. Sourced from your shell rc."
+    printf '%s\n' "alias dotfiles='git --git-dir=\$HOME/.dotfiles --work-tree=\$HOME'"
+  } > "$DOTFILES_ALIASES"
+  info "Wrote alias file: $DOTFILES_ALIASES"
+  dotfiles_install_rc_source                # idempotent + #5b backup
+  info "Done. Open a new shell (or '. $RC_TARGET') then: dotfiles status"
+}
+
+# Refuse tracking a path that collides with a cloud-xdg-managed lane or recurses into the
+# bare repo. Name-based on the top-level $HOME component (no CLOUD_ROOT needed).
+dotfiles_guard_path() {
+  local arg="$1" abs rel top k nm
+  case "$arg" in /*) abs="$arg" ;; *) abs="$HOME/$arg" ;; esac
+  case "$abs" in "$HOME"/*) : ;; *) die "refusing '$arg' — outside \$HOME (the dotfiles work-tree)." ;; esac
+  rel="${abs#"$HOME"/}"; top="${rel%%/*}"
+  [ "$top" = ".dotfiles" ] && die "refusing \$HOME/.dotfiles (the bare repo itself — recursion)."
+  # shellcheck disable=SC2086   # intentional word-split of the space-separated key list
+  for k in $CLOUDXDG_KEYS; do
+    nm="$(local_name "$(field "$(registry_row "$k")" 2)" "$(field "$(registry_row "$k")" 3)")"
+    [ "$top" = "$nm" ] && die "refusing '$top' — it is a cloud-xdg redirect target (user-data lane)."
+  done
+  # shellcheck disable=SC2086
+  for k in $CODE_KEYS; do
+    nm="$(local_name "$(field "$(code_row "$k")" 2)" "$(field "$(code_row "$k")" 3)")"
+    [ "$top" = "$nm" ] && die "refusing '$top' — it is a CODE/offload container (manage with --offload)."
+  done
+  # shellcheck disable=SC2086
+  for k in $LOCAL_KEYS; do
+    nm="$(local_name "$(field "$(code_row "$k")" 2)" "$(field "$(code_row "$k")" 3)")"
+    [ "$top" = "$nm" ] && die "refusing '$top' — it is a machine-local dir (never tracked)."
+  done
+  # Fall-through = allowed. Explicit success: the last loop's `[ ] && die` leaves a
+  # non-zero status when nothing matched, which under set -e would abort the caller.
+  return 0
+}
+
+# --dotfiles-track <path>: stage + commit one path into the bare repo (v1: single path).
+cmd_dotfiles_track() {                       # $1 = path (MODE_ARG)
+  begin_mutating_mode
+  dotfiles_is_ours || die "no dotfiles bare repo at $DOTFILES_DIR — run --dotfiles-init first."
+  dotfiles_guard_path "$1"                    # dies on overlap/recursion
+  # Resolve to an ABSOLUTE pathspec so `git add` works regardless of the invoking CWD
+  # (a relative "$1" would otherwise be resolved against CWD, not the $HOME work-tree).
+  local tadd
+  case "$1" in /*) tadd="$1" ;; *) tadd="$HOME/$1" ;; esac
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "[dry-run] dotfiles add $1"; info "[dry-run] dotfiles commit -m 'track: $1'"; return 0
+  fi
+  run git --git-dir="$DOTFILES_DIR" --work-tree="$HOME" add "$tadd"
+  dotfiles_git commit -m "track: $1"
+  info "Tracked: $1"
+}
+
+# --dotfiles-status: read-only. NO begin_mutating_mode, ZERO mutation.
+cmd_dotfiles_status() {
+  if ! dotfiles_is_ours; then info "no dotfiles bare repo at $DOTFILES_DIR (run --dotfiles-init)."; return 0; fi
+  log "Tracked dotfiles (git status -s):"
+  dotfiles_git status -s
+  if [ -f "$DOTFILES_ALIASES" ]; then info "alias file: present ($DOTFILES_ALIASES)"
+  else info "alias file: MISSING ($DOTFILES_ALIASES) — run --dotfiles-init"; fi
+  # rc sentinel: best-effort, read-only, never die. Check --dotfiles-rc if given, else
+  # the two default rc files (avoids reporting the same file twice when --dotfiles-rc
+  # equals a default).
+  local rc found=0
+  if [ -n "$DOTFILES_RC" ]; then
+    if [ -f "$DOTFILES_RC" ] && grep -qF "$DOTFILES_SENTINEL" "$DOTFILES_RC" 2>/dev/null; then
+      info "rc source block: present in $DOTFILES_RC"; found=1
+    fi
+  else
+    for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+      if [ -f "$rc" ] && grep -qF "$DOTFILES_SENTINEL" "$rc" 2>/dev/null; then
+        info "rc source block: present in $rc"; found=1
+      fi
+    done
+  fi
+  if [ "$found" -eq 0 ]; then info "rc source block: not found (run --dotfiles-init, or --dotfiles-rc PATH)"; fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 main() {
@@ -1326,8 +1501,9 @@ dispatch_mode() {
     offload)          cmd_offload   "$MODE_ARG" ;;
     hydrate)          cmd_hydrate   "$MODE_ARG" ;;
     migrate-projects) cmd_migrate_projects ;;
-    dotfiles-init|dotfiles-track|dotfiles-status)
-        die "mode '--$MODE' is reserved but not implemented in this build (dotfiles = a later slice)." ;;
+    dotfiles-init)    cmd_dotfiles_init ;;
+    dotfiles-track)   cmd_dotfiles_track "$MODE_ARG" ;;
+    dotfiles-status)  cmd_dotfiles_status ;;
     *)                die "internal: unknown mode '$MODE'" ;;
   esac
 }

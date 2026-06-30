@@ -1433,29 +1433,25 @@ else
   exit 1
 fi
 
-# --- C4: reserved mutating lanes are recognized but REFUSE with a non-zero exit
-#     and a 'reserved/not implemented' message — and mutate nothing. Value-taking
-#     modes (--dotfiles-track) get a sandbox-path arg so arg-parsing passes and
-#     the refusal happens at dispatch (the behavior under test).
-#     NOTE (slice 2): --offload/--hydrate/--migrate-projects are now LIVE (offload
-#     round-trip), so only the dotfiles modes remain reserved here. ---
-echo "smoke: C4 — reserved (dotfiles) modes refuse (non-zero) and mutate nothing"
+# --- C4 (removed in slice 3): there are no longer any reserved-inert modes —
+#     offload/hydrate/migrate-projects went live in slice 2 and dotfiles-init/-track/
+#     -status go live in this slice. The old "reserved modes refuse" assertion no
+#     longer has a subject; an UNKNOWN flag is still rejected by the arg-parse `*)`
+#     arm, which the C4b check below covers. ---
+echo "smoke: C4b — an unknown option is rejected (non-zero) and mutates nothing"
 r_home="${sandbox}/rsv-home"; mkdir -p "${r_home}"
 r_before="$(cd "${r_home}" && find . | sort)"
-for spec in "--dotfiles-init" "--dotfiles-track ${r_home}/x" "--dotfiles-status"; do
-  set +e
-  # shellcheck disable=SC2086   # intentional word-split: spec is "flag [arg]"
-  out="$(HOME="${r_home}" /bin/bash "${PROV}" ${spec} 2>&1)"
-  rc=$?
-  set -e
-  assert_nonzero "${rc}" "reserved mode '${spec%% *}' exits non-zero"
-  assert_contains "${out}" "reserved but not implemented" "reserved mode '${spec%% *}' says it is not implemented"
-done
+set +e
+out="$(HOME="${r_home}" /bin/bash "${PROV}" --no-such-flag 2>&1)"
+rc=$?
+set -e
+assert_nonzero "${rc}" "unknown option exits non-zero"
+assert_contains "${out}" "unknown option" "unknown option is reported"
 r_after="$(cd "${r_home}" && find . | sort)"
 if [ "${r_before}" = "${r_after}" ]; then
-  ok "reserved modes mutated nothing (sandbox HOME tree identical before/after)"
+  ok "unknown option mutated nothing (sandbox HOME tree identical before/after)"
 else
-  printf 'FAIL: a reserved mode mutated the home tree\n' >&2
+  printf 'FAIL: unknown option mutated the home tree\n' >&2
   diff <(printf '%s\n' "${r_before}") <(printf '%s\n' "${r_after}") >&2 || true
   exit 1
 fi
@@ -1786,5 +1782,70 @@ if command -v rclone >/dev/null 2>&1; then
 else
   echo "smoke: C12/C13 (--aside round-trip + nested-parent probe) — SKIPPED (rclone not installed)"
 fi
+
+# --- D1 (slice 3): dotfiles --dotfiles-init — bare repo + alias file (LITERAL $HOME) +
+#     guarded rc block, then idempotent re-init. SANDBOX HOME + a SANDBOX rc path
+#     (--dotfiles-rc) so the real ~/.zshrc/.bashrc/.dotfiles are NEVER touched.
+#     Git identity is forced via env so the sandbox commit never depends on user config. ---
+echo "smoke: D1 — dotfiles-init creates bare repo + literal-\$HOME alias + idempotent rc block"
+df_home="${sandbox}/df-home"; df_rc="${df_home}/.zshrc"
+mkdir -p "${df_home}/.config"
+printf '# original rc\nexport KEEP=1\n' > "${df_rc}"
+dfrun() { HOME="${df_home}" XDG_CONFIG_HOME="${df_home}/.config" XDG_CACHE_HOME="${df_home}/.cache" \
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+  /bin/bash "${PROV}" --dotfiles-rc "${df_rc}" "$@"; }
+set +e; out="$(dfrun --dotfiles-init --apply 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "dotfiles-init --apply exits 0" "dotfiles-init failed (exit ${rc}): ${out}"
+if [ "$(git --git-dir="${df_home}/.dotfiles" rev-parse --is-bare-repository 2>/dev/null)" = "true" ]; then
+  ok "bare repo created at ~/.dotfiles"; else fail "bare repo not created"; fi
+df_alias="${df_home}/.config/xdg-cloud/aliases.sh"
+# shellcheck disable=SC2016   # INTENTIONAL literal: assert the alias kept $HOME unexpanded
+if [ -f "${df_alias}" ] && grep -qF 'git --git-dir=$HOME/.dotfiles --work-tree=$HOME' "${df_alias}"; then
+  ok "alias file written with LITERAL \$HOME (not expanded at write time)"
+else fail "alias file missing or \$HOME was expanded"; fi
+assert_contains "$(cat "${df_rc}")" "export KEEP=1" "original rc content preserved (append-only)"
+assert_contains "$(cat "${df_rc}")" ">>> xdg-cloud dotfiles >>>" "rc source block appended"
+set +e; dfrun --dotfiles-init --apply >/dev/null 2>&1; rc=$?; set -e
+pass_if "${rc}" "re-init exits 0" "re-init failed (exit ${rc})"
+n_sent="$(grep -cF '>>> xdg-cloud dotfiles >>>' "${df_rc}")"
+if [ "${n_sent}" = "1" ]; then ok "re-init left exactly ONE rc block (idempotent, no dup append)"; else fail "re-init duplicated the rc block (count=${n_sent})"; fi
+n_bak=0; for b in "${df_rc}".bak-*; do [ -e "${b}" ] && n_bak=$((n_bak + 1)); done
+if [ "${n_bak}" = "1" ]; then ok "re-init made no second backup (idempotent)"; else fail "re-init made ${n_bak} backups (expected 1)"; fi
+
+# --- D2 (slice 3): unknown $SHELL with no --dotfiles-rc → DIE requiring --dotfiles-rc
+#     (refuse-don't-guess; the die must halt in the PARENT shell). ---
+echo "smoke: D2 — unknown \$SHELL refuses (requires --dotfiles-rc), does not guess"
+u_home="${sandbox}/df-unknown"; mkdir -p "${u_home}/.config"
+set +e
+out="$(HOME="${u_home}" XDG_CONFIG_HOME="${u_home}/.config" XDG_CACHE_HOME="${u_home}/.cache" \
+  SHELL=/usr/bin/fish /bin/bash "${PROV}" --dotfiles-init --apply 2>&1)"
+rc=$?
+set -e
+assert_nonzero "${rc}" "unknown \$SHELL exits non-zero (parent die, not a swallowed subshell exit)"
+assert_contains "${out}" "--dotfiles-rc" "unknown-shell refusal tells the user to pass --dotfiles-rc"
+if [ -e "${u_home}/.dotfiles" ]; then fail "init created a bare repo despite the rc refusal"; else ok "no bare repo created when rc resolution failed"; fi
+
+# --- D3 (slice 3): --dotfiles-track stages a real dotfile but REFUSES cloud-xdg-managed
+#     paths (redirect target / CODE container) and the bare repo itself (recursion). ---
+echo "smoke: D3 — dotfiles-track tracks a dotfile and refuses managed/recursive paths"
+printf 'alias hi=echo\n' > "${df_home}/.myrc"
+set +e; out="$(dfrun --dotfiles-track .myrc --apply 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "track a normal dotfile exits 0" "track failed (exit ${rc}): ${out}"
+if git --git-dir="${df_home}/.dotfiles" --work-tree="${df_home}" ls-files 2>/dev/null | grep -qx ".myrc"; then
+  ok "the dotfile was committed into the bare repo"; else fail "the dotfile was not tracked"; fi
+for bad in Documents repos .dotfiles; do
+  set +e; out="$(dfrun --dotfiles-track "${bad}" --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "track refuses '${bad}' (non-zero exit)"
+  assert_contains "${out}" "refusing" "track '${bad}' explains the refusal"
+done
+
+# --- D4 (slice 3): --dotfiles-status is read-only and exits 0. ---
+echo "smoke: D4 — dotfiles-status is read-only (exit 0, no mutation)"
+s_before="$(cd "${df_home}" && find . | sort)"
+set +e; out="$(dfrun --dotfiles-status 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "dotfiles-status exits 0" "dotfiles-status failed (exit ${rc}): ${out}"
+assert_contains "${out}" "Tracked dotfiles" "status prints its read-only header"
+s_after="$(cd "${df_home}" && find . | sort)"
+if [ "${s_before}" = "${s_after}" ]; then ok "dotfiles-status mutated nothing"; else fail "dotfiles-status mutated the home tree"; fi
 
 echo "smoke: PASS"
