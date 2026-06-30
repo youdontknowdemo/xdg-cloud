@@ -1435,12 +1435,14 @@ fi
 
 # --- C4: reserved mutating lanes are recognized but REFUSE with a non-zero exit
 #     and a 'reserved/not implemented' message — and mutate nothing. Value-taking
-#     modes (--offload/--hydrate) get a sandbox-path arg so arg-parsing passes and
-#     the refusal happens at dispatch (the behavior under test). ---
-echo "smoke: C4 — reserved mutating modes refuse (non-zero) and mutate nothing"
+#     modes (--dotfiles-track) get a sandbox-path arg so arg-parsing passes and
+#     the refusal happens at dispatch (the behavior under test).
+#     NOTE (slice 2): --offload/--hydrate/--migrate-projects are now LIVE (offload
+#     round-trip), so only the dotfiles modes remain reserved here. ---
+echo "smoke: C4 — reserved (dotfiles) modes refuse (non-zero) and mutate nothing"
 r_home="${sandbox}/rsv-home"; mkdir -p "${r_home}"
 r_before="$(cd "${r_home}" && find . | sort)"
-for spec in "--offload ${r_home}/x" "--hydrate ${r_home}/x" "--dotfiles-init" "--migrate-projects"; do
+for spec in "--dotfiles-init" "--dotfiles-track ${r_home}/x" "--dotfiles-status"; do
   set +e
   # shellcheck disable=SC2086   # intentional word-split: spec is "flag [arg]"
   out="$(HOME="${r_home}" /bin/bash "${PROV}" ${spec} 2>&1)"
@@ -1472,5 +1474,81 @@ pass_if "${rc}" "default no-mode dry-run exits 0" "default no-mode run failed (e
 assert_contains "${out}" "platform=" "no-mode run reaches main() and prints the provision banner"
 assert_contains "${out}" "mode=DRY-RUN" "no-mode run is the default dry-run provision lane"
 assert_not_contains "${out}" "Home-dir classification" "no-mode run did NOT enter a report mode"
+
+# --- C6 (slice 2): offload round-trip happy path + fail-closed drop guard. CRITICAL
+#     DATA-LOSS coverage — uses a SANDBOX HOME + an IN-SANDBOX container + an
+#     in-sandbox type=local rclone remote, NEVER the real $HOME. The local DROP
+#     deletes the sandbox container only. Skipped if rclone is genuinely absent. ---
+if command -v rclone >/dev/null 2>&1; then
+  echo "smoke: C6 — offload round-trip (push+verify+drop, status, hydrate) + dirty-repo fail-closed"
+  oh="${sandbox}/off-home"; oremote="${sandbox}/off-remote"; ostate="${oh}/state"
+  oconf="${sandbox}/off-rclone.conf"
+  mkdir -p "${oh}/repos/proj-a" "${oremote}"
+  printf '[loc]\ntype = local\n' > "${oconf}"
+  # A clean, fully-pushed git repo: commit + a bare origin + upstream tracking, so
+  # all of G2 (clean) / G3 (pushed) / G4 (no stash) pass and the drop is reachable.
+  ( cd "${oh}/repos/proj-a" && git init -q \
+      && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init \
+      && printf 'hi\n' > f.txt && git add f.txt \
+      && git -c user.email=t@t -c user.name=t commit -q -m add ) >/dev/null 2>&1
+  git init -q --bare "${sandbox}/proj-a.git"
+  ( cd "${oh}/repos/proj-a" && git remote add origin "${sandbox}/proj-a.git" \
+      && git push -q -u origin HEAD ) >/dev/null 2>&1
+  # GIT_CEILING_DIRECTORIES stops git's upward work-tree discovery at the sandbox so
+  # offload_repos_in does NOT mistake the surrounding xdg-cloud repo for the container
+  # (the sandbox lives inside this repo's tree — a test artifact, not a real ~/repos).
+  orun() { RCLONE_CONFIG="${oconf}" HOME="${oh}" XDG_STATE_HOME="${ostate}" \
+    GIT_CEILING_DIRECTORIES="${oh}" \
+    /bin/bash "${PROV}" --code-remote loc --code-dest "${oremote}" "$@"; }
+  # offload --apply: push, read-back verify, then DROP the local container.
+  set +e; out="$(orun --offload repos --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "offload --apply exits 0 (clean+pushed repo)" "offload --apply failed (exit ${rc}): ${out}"
+  if [ ! -e "${oh}/repos" ]; then ok "local container dropped after verified offload"; else fail "local repos NOT dropped after offload"; fi
+  if [ -f "${ostate}/xdg-cloud/offloaded/repos" ]; then ok "offload state file written"; else fail "offload state file missing"; fi
+  set +e; out="$(orun --offload-status 2>&1)"; set -e
+  assert_contains "${out}" "offloaded ->" "offload-status reports the dir as offloaded"
+  # hydrate --apply: restore from the remote.
+  set +e; out="$(orun --hydrate repos --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "hydrate --apply exits 0" "hydrate --apply failed (exit ${rc}): ${out}"
+  if [ -f "${oh}/repos/proj-a/f.txt" ]; then ok "hydrate restored the container contents"; else fail "hydrate did not restore the repo"; fi
+  # Fail-closed: a dirty repo BLOCKS offload and drops NOTHING.
+  printf 'dirty\n' > "${oh}/repos/proj-a/uncommitted.txt"
+  set +e; out="$(orun --offload repos --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "dirty repo blocks offload (fail-closed, non-zero exit)"
+  assert_contains "${out}" "blocking repos" "offload refusal names the blocking repos"
+  if [ -d "${oh}/repos/proj-a" ]; then ok "blocked offload dropped NOTHING (container intact)"; else fail "DATA LOSS: blocked offload removed the container"; fi
+else
+  echo "smoke: C6 offload round-trip — SKIPPED (rclone not installed)"
+fi
+
+# --- C7 (slice 2): resolve_code_target refuses a machine-local target BEFORE any
+#     rclone/mutation (the venv data-loss guard). No rclone needed — the refusal is
+#     in resolve_code_target, which runs before require_code_rclone. ---
+echo "smoke: C7 — offload refuses a machine-local (non-CODE) target"
+v_home="${sandbox}/venv-home"; mkdir -p "${v_home}/pyenv"
+set +e
+out="$(HOME="${v_home}" /bin/bash "${PROV}" --offload pyenv --apply 2>&1)"
+rc=$?
+set -e
+assert_nonzero "${rc}" "offloading a machine-local dir exits non-zero"
+assert_contains "${out}" "machine-local" "machine-local target refusal explains why (venv guard)"
+
+# --- C8 (slice 2): --migrate-projects un-symlinks a cloud-pointed ~/Projects into a
+#     real local dir, NON-DESTRUCTIVELY (cloud copy + aside link retained, rm nothing).
+#     Sandbox HOME + in-sandbox cloud root; rsync, no rclone. ---
+echo "smoke: C8 — migrate-projects restores ~/Projects to a real local dir (non-destructive)"
+m_home="${sandbox}/mig-home"; m_cloud="${sandbox}/mig-cloud"
+mkdir -p "${m_home}" "${m_cloud}/projects"
+printf 'proj\n' > "${m_cloud}/projects/note.txt"
+ln -s "${m_cloud}/projects" "${m_home}/Projects"
+set +e
+out="$(HOME="${m_home}" /bin/bash "${PROV}" --cloud-root "${m_cloud}" --migrate-projects --apply 2>&1)"
+rc=$?
+set -e
+pass_if "${rc}" "migrate-projects --apply exits 0" "migrate-projects failed (exit ${rc}): ${out}"
+if [ -d "${m_home}/Projects" ] && [ ! -L "${m_home}/Projects" ]; then ok "Projects is now a real local dir (not a symlink)"; else fail "Projects is not a real local dir after migrate"; fi
+if [ -f "${m_home}/Projects/note.txt" ]; then ok "cloud content copied into the new local Projects dir"; else fail "migrate did not copy the cloud content"; fi
+if [ -f "${m_cloud}/projects/note.txt" ]; then ok "cloud copy RETAINED (non-destructive)"; else fail "DATA LOSS: migrate removed the cloud copy"; fi
+if ls -d "${m_home}"/Projects.cloud-symlink.* >/dev/null 2>&1; then ok "old symlink retained aside (non-destructive)"; else fail "migrate did not retain the aside symlink"; fi
 
 echo "smoke: PASS"
