@@ -1551,4 +1551,240 @@ if [ -f "${m_home}/Projects/note.txt" ]; then ok "cloud content copied into the 
 if [ -f "${m_cloud}/projects/note.txt" ]; then ok "cloud copy RETAINED (non-destructive)"; else fail "DATA LOSS: migrate removed the cloud copy"; fi
 if ls -d "${m_home}"/Projects.cloud-symlink.* >/dev/null 2>&1; then ok "old symlink retained aside (non-destructive)"; else fail "migrate did not retain the aside symlink"; fi
 
+# ===========================================================================
+# Group C9-C16 (slice 2): comprehensive offload-on-demand hardening — the
+# CRITICAL data-loss surface. Two-layer strategy (test plan, Task #12):
+#   * REAL rclone against a type=local remote for happy/round-trip paths (C6
+#     above; C12/C13 below) — only available when rclone is installed.
+#   * A PATH-shim `rclone` for deterministic FAILURE INJECTION on the gate
+#     (C9/C10/C11/C14/C16) — runs on ANY host, rclone present or not.
+# EVERY mutating case uses a sandbox HOME + an in-sandbox container + an
+# in-sandbox remote. GIT_CEILING_DIRECTORIES stops git's work-tree discovery
+# at the sandbox HOME so offload_repos_in does not climb into the real
+# xdg-cloud repo that physically contains tests/sandbox (a test artifact) —
+# EXCEPT C13, which deliberately omits the ceiling to probe the walk-up. ---
+# ===========================================================================
+
+# mk_rclone_shim DIR — write a static executable `rclone` stand-in into DIR. Its
+#   `check` behavior is chosen at RUN time by the $SHIM_CHECK env var the calling
+#   script inherits: pass (default, exit 0), fail (always non-zero), or aside-fail
+#   (fail ONLY the *.pre-offload-* aside re-verify, pass the pre-drop read-back).
+#   `listremotes` advertises "loc:" so require_code_rclone passes; `copy` mirrors
+#   src->dest faithfully. (Static body via a quoted heredoc — shim CODE, not this
+#   harness's expansions.)
+mk_rclone_shim() {
+  mkdir -p "$1"
+  cat > "$1/rclone" <<'SHIM'
+#!/bin/sh
+# dest args arrive as the rclone remote spec "loc:<abs path>"; strip the remote
+# prefix so writes land at the real in-sandbox path (a type=local remote maps the
+# remote name to the filesystem), NOT a literal "loc:..." dir under the CWD.
+case "$1" in
+  listremotes) echo "loc:"; exit 0 ;;
+  copy) d="${4#loc:}"; mkdir -p "$d"; cp -a "$3/." "$d/" 2>/dev/null; exit 0 ;;
+  check)
+    case "${SHIM_CHECK:-pass}" in
+      fail)       exit 1 ;;
+      aside-fail) case "$4" in *.pre-offload-*) exit 1 ;; *) exit 0 ;; esac ;;
+      *)          exit 0 ;;
+    esac ;;
+  *) exit 0 ;;
+esac
+SHIM
+  chmod +x "$1/rclone"
+}
+
+# mk_pushed_repo REPODIR BAREDIR — a clean, fully-pushed git work tree at REPODIR
+# with an upstream-tracking branch (so G2 clean / G3 pushed / G4 no-stash all pass).
+mk_pushed_repo() {
+  mkdir -p "$1"
+  ( cd "$1" && git init -q \
+      && printf 'hi\n' > f.txt && git add f.txt \
+      && git -c user.email=t@t -c user.name=t commit -q -m init ) >/dev/null 2>&1
+  git init -q --bare "$2"
+  ( cd "$1" && git remote add origin "$2" && git push -q -u origin HEAD ) >/dev/null 2>&1
+}
+
+# --- C9: GATE-REFUSAL-BEFORE-RM (core data-loss guard). For each blocker —
+#     (a) dirty tree, (b) branch with no upstream, (c) a stash — `--apply
+#     --offload` must die non-zero and leave the container BYTE-INTACT (full
+#     find|sort snapshot before==after). Uses a shim rclone so it runs on any
+#     host; the guards block before any copy is attempted anyway. ---
+echo "smoke: C9 — offload gate refuses (dirty / unpushed / stash) and drops NOTHING"
+c9shim="${sandbox}/c9-shim"; mk_rclone_shim "${c9shim}"
+c9run() { PATH="${c9shim}:${PATH}" RCLONE_CONFIG=/dev/null HOME="$1" \
+  XDG_STATE_HOME="$1/state" GIT_CEILING_DIRECTORIES="$1" \
+  /bin/bash "${PROV}" --code-remote loc --code-dest "$1/remote" --offload repos --apply; }
+# (a) dirty: a clean+pushed repo with an extra untracked file.
+c9a="${sandbox}/c9a"; mk_pushed_repo "${c9a}/repos/proj" "${sandbox}/c9a.git"
+printf 'dirty\n' > "${c9a}/repos/proj/untracked.txt"
+b9="$(cd "${c9a}/repos" && find . | sort)"
+set +e; out="$(c9run "${c9a}" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "dirty repo blocks offload"
+assert_contains "${out}" "blocking repos" "dirty-repo refusal names the blocking repos"
+if [ "${b9}" = "$(cd "${c9a}/repos" && find . | sort)" ]; then ok "dirty-repo refusal left the container byte-intact"; else fail "DATA LOSS: container changed after a blocked offload (dirty)"; fi
+# (b) no upstream: committed but never pushed (no origin).
+c9b="${sandbox}/c9b"; mkdir -p "${c9b}/repos/proj"
+( cd "${c9b}/repos/proj" && git init -q && printf 'x\n' > f.txt && git add f.txt \
+    && git -c user.email=t@t -c user.name=t commit -q -m init ) >/dev/null 2>&1
+b9b="$(cd "${c9b}/repos" && find . | sort)"
+set +e; out="$(c9run "${c9b}" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "repo with no upstream blocks offload"
+assert_contains "${out}" "no upstream" "unpushed-branch refusal explains the missing upstream"
+if [ "${b9b}" = "$(cd "${c9b}/repos" && find . | sort)" ]; then ok "no-upstream refusal left the container byte-intact"; else fail "DATA LOSS: container changed after a blocked offload (no upstream)"; fi
+# (c) stash present (tree otherwise clean+pushed).
+c9c="${sandbox}/c9c"; mk_pushed_repo "${c9c}/repos/proj" "${sandbox}/c9c.git"
+( cd "${c9c}/repos/proj" && printf 'change\n' >> f.txt \
+    && git -c user.email=t@t -c user.name=t stash -q ) >/dev/null 2>&1
+b9c="$(cd "${c9c}/repos" && find . | sort)"
+set +e; out="$(c9run "${c9c}" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "a present stash blocks offload"
+assert_contains "${out}" "stash" "stash refusal names stashes as the blocker"
+if [ "${b9c}" = "$(cd "${c9c}/repos" && find . | sort)" ]; then ok "stash refusal left the container byte-intact"; else fail "DATA LOSS: container changed after a blocked offload (stash)"; fi
+
+# --- C10: READ-BACK FAILURE injection. The shim's `copy` SUCCEEDS but `check`
+#     returns non-zero — proving the local rm is gated on the INDEPENDENT
+#     read-back (G5), not on the copy exit code. Container must stay intact. ---
+echo "smoke: C10 — read-back verify failure aborts the drop (rm gated on read-back, not copy rc)"
+c10shim="${sandbox}/c10-shim"; mk_rclone_shim "${c10shim}"
+c10h="${sandbox}/c10h"; mk_pushed_repo "${c10h}/repos/proj" "${sandbox}/c10.git"
+b10="$(cd "${c10h}/repos" && find . | sort)"
+set +e
+out="$(PATH="${c10shim}:${PATH}" SHIM_CHECK=fail RCLONE_CONFIG=/dev/null HOME="${c10h}" \
+  XDG_STATE_HOME="${c10h}/state" GIT_CEILING_DIRECTORIES="${c10h}" \
+  /bin/bash "${PROV}" --code-remote loc --code-dest "${c10h}/remote" --offload repos --apply 2>&1)"
+rc=$?
+set -e
+assert_nonzero "${rc}" "read-back failure makes offload exit non-zero"
+assert_contains "${out}" "Nothing dropped" "read-back failure says nothing was dropped"
+if [ "${b10}" = "$(cd "${c10h}/repos" && find . | sort)" ]; then ok "container byte-intact after read-back failure (no rm on unverified upload)"; else fail "DATA LOSS: container dropped despite read-back failure"; fi
+
+# --- C11: --aside path, re-verify failure KEEPS the aside. With --aside the
+#     container is moved aside, then re-verified vs the remote; the shim fails
+#     ONLY that aside re-verify. The aside (and its contents) must be RETAINED. ---
+echo "smoke: C11 — --aside re-verify failure keeps the moved-aside copy (no data lost)"
+c11shim="${sandbox}/c11-shim"; mk_rclone_shim "${c11shim}"
+c11h="${sandbox}/c11h"; mk_pushed_repo "${c11h}/repos/proj" "${sandbox}/c11.git"
+set +e
+out="$(PATH="${c11shim}:${PATH}" SHIM_CHECK=aside-fail RCLONE_CONFIG=/dev/null HOME="${c11h}" \
+  XDG_STATE_HOME="${c11h}/state" GIT_CEILING_DIRECTORIES="${c11h}" \
+  /bin/bash "${PROV}" --code-remote loc --code-dest "${c11h}/remote" --offload repos --apply --aside 2>&1)"
+rc=$?
+set -e
+assert_nonzero "${rc}" "--aside re-verify failure exits non-zero"
+aside_dir=""
+for d in "${c11h}"/repos.pre-offload-*; do [ -d "$d" ] && { aside_dir="$d"; break; }; done
+if [ -n "${aside_dir}" ]; then ok "the moved-aside copy was KEPT on re-verify failure"; else fail "DATA LOSS: --aside copy removed despite failed re-verify"; fi
+if [ -n "${aside_dir}" ] && [ -f "${aside_dir}/proj/f.txt" ]; then ok "aside retains the original container contents"; else fail "aside is missing the original contents"; fi
+
+# --- C14: Y1 (auditor) — blocker-NAMING lives in cmd_offload's DRY-RUN plan, and
+#     --offload-status stays byte-identical to slice 1 (no blocker lines). ---
+echo "smoke: C14 — dry-run offload plan NAMES a blocking repo; --offload-status stays blocker-free"
+c14shim="${sandbox}/c14-shim"; mk_rclone_shim "${c14shim}"
+c14h="${sandbox}/c14h"; mk_pushed_repo "${c14h}/repos/proj" "${sandbox}/c14.git"
+printf 'dirty\n' > "${c14h}/repos/proj/untracked.txt"
+c14run() { PATH="${c14shim}:${PATH}" RCLONE_CONFIG=/dev/null HOME="${c14h}" \
+  XDG_STATE_HOME="${c14h}/state" GIT_CEILING_DIRECTORIES="${c14h}" \
+  /bin/bash "${PROV}" --code-remote loc --code-dest "${c14h}/remote" "$@"; }
+set +e; out="$(c14run --offload repos 2>&1)"; rc=$?; set -e   # dry-run (no --apply)
+pass_if "${rc}" "dry-run offload plan exits 0 even with a blocking repo" "dry-run offload plan failed (exit ${rc}): ${out}"
+assert_contains "${out}" "WOULD BLOCK" "dry-run plan flags the blocking repo"
+assert_contains "${out}" "proj" "dry-run plan NAMES the blocking repo (proj)"
+set +e; out="$(c14run --offload-status 2>&1)"; set -e
+assert_contains "${out}" "code   repos" "--offload-status still lists the code dir"
+assert_not_contains "${out}" "WOULD BLOCK" "--offload-status does NOT name blockers (that lives in the offload plan)"
+assert_not_contains "${out}" "no upstream" "--offload-status stays byte-identical to slice 1 (no git blocker lines)"
+
+# --- C15: resolve_code_target refuses NON-CODE targets beyond machine-local — an
+#     XDG key (documents) and an arbitrary path are both rejected BEFORE any
+#     rclone/mutation (only CODE_KEYS are offload-eligible). No rclone needed. ---
+echo "smoke: C15 — offload refuses an XDG key and an arbitrary path (only CODE dirs are eligible)"
+c15h="${sandbox}/c15h"; mkdir -p "${c15h}/Documents"
+set +e; out="$(HOME="${c15h}" /bin/bash "${PROV}" --offload documents --apply 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "offloading an XDG dir (documents) exits non-zero"
+assert_contains "${out}" "not a known CODE dir" "XDG target refusal explains only CODE dirs are eligible"
+set +e; out="$(HOME="${c15h}" /bin/bash "${PROV}" --offload /tmp/whatever --apply 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "offloading an arbitrary path exits non-zero"
+assert_contains "${out}" "not a known CODE dir" "arbitrary-path target is refused"
+
+# --- C16: hydrate refusals (shim rclone). (a) no state file => refuse; (b) a
+#     non-empty local container => refuse to clobber. Neither must mutate. ---
+echo "smoke: C16 — hydrate refuses when not offloaded, and refuses to clobber a non-empty local dir"
+c16shim="${sandbox}/c16-shim"; mk_rclone_shim "${c16shim}"
+c16h="${sandbox}/c16h"; mkdir -p "${c16h}/repos"
+c16run() { PATH="${c16shim}:${PATH}" RCLONE_CONFIG=/dev/null HOME="${c16h}" \
+  XDG_STATE_HOME="${c16h}/state" GIT_CEILING_DIRECTORIES="${c16h}" \
+  /bin/bash "${PROV}" --code-remote loc --code-dest "${c16h}/remote" "$@"; }
+set +e; out="$(c16run --hydrate repos --apply 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "hydrate of a not-offloaded dir exits non-zero"
+assert_contains "${out}" "not recorded as offloaded" "hydrate refusal explains there is no offload record"
+# Now fabricate a state record AND a non-empty local container => clobber refusal.
+mkdir -p "${c16h}/state/xdg-cloud/offloaded"
+printf 'remote=loc:%s/repos\n' "${c16h}/remote" > "${c16h}/state/xdg-cloud/offloaded/repos"
+printf 'keep\n' > "${c16h}/repos/precious.txt"
+set +e; out="$(c16run --hydrate repos --apply 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "hydrate over a non-empty local dir exits non-zero"
+assert_contains "${out}" "refusing to overwrite" "hydrate refuses to clobber existing local content"
+if [ -f "${c16h}/repos/precious.txt" ]; then ok "existing local content left untouched by the refused hydrate"; else fail "DATA LOSS: refused hydrate removed local content"; fi
+
+# --- C12 + C13: REAL rclone (type=local remote) — the --aside SUCCESS round-trip
+#     and the NESTED-PARENT-REPO recoverability probe. Skipped if rclone absent. ---
+if command -v rclone >/dev/null 2>&1; then
+  rconf="${sandbox}/c12-rclone.conf"; printf '[loc]\ntype = local\n' > "${rconf}"
+
+  # C12: --aside happy path — container moved aside, re-verified, then REMOVED;
+  # local freed; hydrate restores byte-identical content.
+  echo "smoke: C12 — --aside success round-trip (aside removed after verify; hydrate restores)"
+  c12h="${sandbox}/c12h"; mk_pushed_repo "${c12h}/repos/proj" "${sandbox}/c12.git"
+  printf 'PAYLOAD-12\n' > "${c12h}/repos/proj/data.txt"
+  ( cd "${c12h}/repos/proj" && git add data.txt \
+      && git -c user.email=t@t -c user.name=t commit -q -m data \
+      && git push -q origin HEAD ) >/dev/null 2>&1
+  c12run() { RCLONE_CONFIG="${rconf}" HOME="${c12h}" XDG_STATE_HOME="${c12h}/state" \
+    GIT_CEILING_DIRECTORIES="${c12h}" \
+    /bin/bash "${PROV}" --code-remote loc --code-dest "${c12h}/remote" "$@"; }
+  set +e; out="$(c12run --offload repos --apply --aside 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "--aside offload exits 0" "--aside offload failed (exit ${rc}): ${out}"
+  if [ ! -e "${c12h}/repos" ]; then ok "--aside offload freed the local container"; else fail "--aside offload did not free local"; fi
+  if ls -d "${c12h}"/repos.pre-offload-* >/dev/null 2>&1; then fail "--aside left an aside behind after a SUCCESSFUL verify"; else ok "--aside removed the aside after a verified upload"; fi
+  set +e; out="$(c12run --hydrate repos --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "hydrate after --aside offload exits 0" "hydrate failed (exit ${rc}): ${out}"
+  if [ "$(cat "${c12h}/repos/proj/data.txt" 2>/dev/null)" = "PAYLOAD-12" ]; then ok "hydrate restored byte-identical content"; else fail "hydrate did not restore the exact content"; fi
+
+  # C13: NESTED-PARENT-REPO probe (auditor Y2). The CODE container ~/repos has NO
+  # own .git but sits inside a PARENT git work tree (the sandbox HOME). NO
+  # GIT_CEILING here, so offload_repos_in's `git rev-parse` walks UP to the parent.
+  # SAFETY PROPERTY under test: whatever offload decides, data stays RECOVERABLE —
+  # only the container subtree is pushed (never the parent's files) and hydrate
+  # restores it byte-identical. (Finding: benign/recoverable — see metadata.handoff.)
+  echo "smoke: C13 — nested parent-repo: offload stays recoverable + never pushes parent content"
+  c13h="${sandbox}/c13h"; mkdir -p "${c13h}/repos/proj"
+  printf 'CONTAINER-13\n' > "${c13h}/repos/proj/inner.txt"
+  printf 'PARENT-ONLY\n'  > "${c13h}/parent-only.txt"
+  ( cd "${c13h}" && git init -q \
+      && git -c user.email=t@t -c user.name=t add -A \
+      && git -c user.email=t@t -c user.name=t commit -q -m init ) >/dev/null 2>&1
+  git init -q --bare "${sandbox}/c13.git"
+  ( cd "${c13h}" && git remote add origin "${sandbox}/c13.git" && git push -q -u origin HEAD ) >/dev/null 2>&1
+  c13run() { RCLONE_CONFIG="${rconf}" HOME="${c13h}" XDG_STATE_HOME="${c13h}/state" \
+    /bin/bash "${PROV}" --code-remote loc --code-dest "${c13h}/remote" "$@"; }
+  set +e; out="$(c13run --offload repos --apply 2>&1)"; rc=$?; set -e
+  # Either outcome is acceptable as long as data is recoverable; assert recoverability.
+  if [ "${rc}" -eq 0 ] && [ ! -e "${c13h}/repos" ]; then
+    ok "nested case: offload proceeded and freed local (guards saw the clean+pushed parent)"
+    # CRITICAL: only the container subtree reached the remote — never the parent's file.
+    if [ -f "${c13h}/remote/repos/proj/inner.txt" ]; then ok "remote holds the container subtree (faithful)"; else fail "remote is MISSING the container content"; fi
+    if [ -e "${c13h}/remote/repos/parent-only.txt" ]; then fail "WRONG CONTENT: parent-only file leaked into the offload remote"; else ok "parent's own files did NOT leak into the offload (no wrong content)"; fi
+    set +e; out="$(c13run --hydrate repos --apply 2>&1)"; rc=$?; set -e
+    pass_if "${rc}" "nested case: hydrate exits 0" "hydrate failed in nested case (exit ${rc}): ${out}"
+    if [ "$(cat "${c13h}/repos/proj/inner.txt" 2>/dev/null)" = "CONTAINER-13" ]; then ok "nested case: hydrate restored byte-identical container content (RECOVERABLE)"; else fail "DATA LOSS: nested-case hydrate did not restore the container"; fi
+  else
+    # The other safe outcome: offload refused; container must be intact.
+    assert_nonzero "${rc}" "nested case: offload refused"
+    if [ -d "${c13h}/repos/proj" ]; then ok "nested case: refusal left the container intact (RECOVERABLE)"; else fail "DATA LOSS: nested-case refusal still removed the container"; fi
+  fi
+else
+  echo "smoke: C12/C13 (--aside round-trip + nested-parent probe) — SKIPPED (rclone not installed)"
+fi
+
 echo "smoke: PASS"
