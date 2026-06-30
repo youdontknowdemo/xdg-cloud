@@ -1027,16 +1027,31 @@ require_code_rclone() {
 # Echo the git work tree(s) for a CODE container. If the container is itself a git repo,
 # it is the sole unit; else its immediate subdirs (depth 1) that are git work trees.
 # bash 3.2: an unmatched glob stays literal, guarded by [ -d ].
+#
+# GIT_CEILING hardening (PR #23 / smoke C13): the rev-parse calls below ask "is THIS dir its
+# own git work tree?" — they must NOT inherit a PARENT git repo if the container happens to be
+# nested inside one. GIT_CEILING_DIRECTORIES stops git's upward search before it ascends ABOVE
+# the listed (absolute) dir. The ceiling MUST be the PARENT of the dir being probed: git
+# ignores a ceiling equal to the `-C` working directory ("will not exclude the current working
+# directory"), so a ceiling of the probed dir itself is a NO-OP (verified on git 2.54.0). Thus
+# the container probe uses dirname(base); each depth-1 subdir probe uses base (= dirname of
+# base/<sub>). For a container NOT nested in any repo (the common ~/repos case), this is
+# identical to the unscoped probe — no regression.
 offload_repos_in() {
-  local base="$1" d
-  if git -C "$base" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  local base="$1" d parent
+  parent="$(dirname "$base")"
+  if GIT_CEILING_DIRECTORIES="$parent" git -C "$base" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     printf '%s\n' "$base"; return 0
   fi
   for d in "$base"/*/; do
     [ -d "$d" ] || continue
     d="${d%/}"
-    git -C "$d" rev-parse --is-inside-work-tree >/dev/null 2>&1 && printf '%s\n' "$d"
+    GIT_CEILING_DIRECTORIES="$base" git -C "$d" rev-parse --is-inside-work-tree >/dev/null 2>&1 && printf '%s\n' "$d"
   done
+  # Explicit success: the loop's last `git … && printf` leaves a non-zero status when the
+  # final subdir is not a repo, which under set -e would abort `repos="$(offload_repos_in …)"`
+  # in the caller. The function's contract is its OUTPUT (the repo list), not its exit code.
+  return 0
 }
 
 # G2: clean working tree (no staged/unstaged/untracked).

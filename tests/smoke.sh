@@ -1747,13 +1747,16 @@ if command -v rclone >/dev/null 2>&1; then
   pass_if "${rc}" "hydrate after --aside offload exits 0" "hydrate failed (exit ${rc}): ${out}"
   if [ "$(cat "${c12h}/repos/proj/data.txt" 2>/dev/null)" = "PAYLOAD-12" ]; then ok "hydrate restored byte-identical content"; else fail "hydrate did not restore the exact content"; fi
 
-  # C13: NESTED-PARENT-REPO probe (auditor Y2). The CODE container ~/repos has NO
-  # own .git but sits inside a PARENT git work tree (the sandbox HOME). NO
-  # GIT_CEILING here, so offload_repos_in's `git rev-parse` walks UP to the parent.
-  # SAFETY PROPERTY under test: whatever offload decides, data stays RECOVERABLE —
-  # only the container subtree is pushed (never the parent's files) and hydrate
-  # restores it byte-identical. (Finding: benign/recoverable — see metadata.handoff.)
-  echo "smoke: C13 — nested parent-repo: offload stays recoverable + never pushes parent content"
+  # C13: NESTED-PARENT-REPO probe (auditor Y2), now asserting the HARDENED behavior
+  # (v2 GIT_CEILING fix). The CODE container ~/repos has NO own .git but sits inside a
+  # PARENT git work tree (the sandbox HOME). c13run deliberately does NOT set a harness
+  # GIT_CEILING, so this proves the SCRIPT self-confines discovery: offload_repos_in scopes
+  # its rev-parse with GIT_CEILING=dirname(probed dir), so it finds NO repo in the container
+  # (instead of inheriting the parent repo). Expected: the 'no git repos found' warning fires,
+  # offload still proceeds (no repos => no blockers), pushes ONLY the container subtree, and
+  # hydrate restores it byte-identical. The parent's own file is outside the container and
+  # never enters the push.
+  echo "smoke: C13 — nested parent-repo: discovery confined to the container (hardened)"
   c13h="${sandbox}/c13h"; mkdir -p "${c13h}/repos/proj"
   printf 'CONTAINER-13\n' > "${c13h}/repos/proj/inner.txt"
   printf 'PARENT-ONLY\n'  > "${c13h}/parent-only.txt"
@@ -1765,20 +1768,15 @@ if command -v rclone >/dev/null 2>&1; then
   c13run() { RCLONE_CONFIG="${rconf}" HOME="${c13h}" XDG_STATE_HOME="${c13h}/state" \
     /bin/bash "${PROV}" --code-remote loc --code-dest "${c13h}/remote" "$@"; }
   set +e; out="$(c13run --offload repos --apply 2>&1)"; rc=$?; set -e
-  # Either outcome is acceptable as long as data is recoverable; assert recoverability.
-  if [ "${rc}" -eq 0 ] && [ ! -e "${c13h}/repos" ]; then
-    ok "nested case: offload proceeded and freed local (guards saw the clean+pushed parent)"
-    # CRITICAL: only the container subtree reached the remote — never the parent's file.
-    if [ -f "${c13h}/remote/repos/proj/inner.txt" ]; then ok "remote holds the container subtree (faithful)"; else fail "remote is MISSING the container content"; fi
-    if [ -e "${c13h}/remote/repos/parent-only.txt" ]; then fail "WRONG CONTENT: parent-only file leaked into the offload remote"; else ok "parent's own files did NOT leak into the offload (no wrong content)"; fi
-    set +e; out="$(c13run --hydrate repos --apply 2>&1)"; rc=$?; set -e
-    pass_if "${rc}" "nested case: hydrate exits 0" "hydrate failed in nested case (exit ${rc}): ${out}"
-    if [ "$(cat "${c13h}/repos/proj/inner.txt" 2>/dev/null)" = "CONTAINER-13" ]; then ok "nested case: hydrate restored byte-identical container content (RECOVERABLE)"; else fail "DATA LOSS: nested-case hydrate did not restore the container"; fi
-  else
-    # The other safe outcome: offload refused; container must be intact.
-    assert_nonzero "${rc}" "nested case: offload refused"
-    if [ -d "${c13h}/repos/proj" ]; then ok "nested case: refusal left the container intact (RECOVERABLE)"; else fail "DATA LOSS: nested-case refusal still removed the container"; fi
-  fi
+  # CONFINEMENT PROOF: discovery found no repo in the container (did NOT inherit the parent).
+  assert_contains "${out}" "no git repos found" "discovery confined to the container (parent repo not inherited)"
+  pass_if "${rc}" "hardened nested offload exits 0 (no repos => no blockers, proceeds)" "nested offload failed (exit ${rc}): ${out}"
+  if [ ! -e "${c13h}/repos" ]; then ok "container freed locally after the verified push"; else fail "container not freed"; fi
+  if [ -f "${c13h}/remote/repos/proj/inner.txt" ]; then ok "remote holds the container subtree (faithful)"; else fail "remote is MISSING the container content"; fi
+  if [ -e "${c13h}/remote/repos/parent-only.txt" ]; then fail "WRONG CONTENT: parent-only file leaked into the offload remote"; else ok "parent's own files did NOT leak into the offload"; fi
+  set +e; out="$(c13run --hydrate repos --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "nested case: hydrate exits 0" "hydrate failed in nested case (exit ${rc}): ${out}"
+  if [ "$(cat "${c13h}/repos/proj/inner.txt" 2>/dev/null)" = "CONTAINER-13" ]; then ok "hydrate restored byte-identical container content (RECOVERABLE)"; else fail "DATA LOSS: nested-case hydrate did not restore the container"; fi
 else
   echo "smoke: C12/C13 (--aside round-trip + nested-parent probe) — SKIPPED (rclone not installed)"
 fi
