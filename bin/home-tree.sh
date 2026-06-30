@@ -14,6 +14,26 @@
 #
 set -euo pipefail
 
+# --- locate & source the shared library (bash 3.2; symlink- and CWD-safe) ---
+__self_src="${BASH_SOURCE[0]}"
+while [ -h "$__self_src" ]; do
+  __self_dir="$(cd -P "$(dirname "$__self_src")" >/dev/null 2>&1 && pwd)"
+  __self_src="$(readlink "$__self_src")"
+  case "$__self_src" in
+    /*) : ;;                                   # absolute target — use as-is
+    *)  __self_src="$__self_dir/$__self_src" ;; # relative — resolve vs link dir
+  esac
+done
+__self_dir="$(cd -P "$(dirname "$__self_src")" >/dev/null 2>&1 && pwd)"
+XDG_COMMON_LIB="$__self_dir/lib/xdg-common.sh"
+if [ ! -r "$XDG_COMMON_LIB" ]; then
+  printf 'error: required library not found or unreadable: %s\n' "$XDG_COMMON_LIB" >&2
+  exit 1
+fi
+# shellcheck source=bin/lib/xdg-common.sh
+. "$XDG_COMMON_LIB"
+xdg_init_base_defaults   # populate XDG_{CONFIG,DATA,STATE,CACHE}_HOME from env/defaults
+
 # ---------------------------------------------------------------------------
 # Config — override any of these via environment before running.
 # ---------------------------------------------------------------------------
@@ -22,14 +42,22 @@ set -euo pipefail
 : "${HOME_TREE_ROOT:=$HOME}"          # where the human-facing folders live
 : "${ARCHIVE_SUBDIR:=Backup/_archive}" # where overwritten/deleted files are parked
 
-# XDG live paths — resolved from env if set, else spec defaults. LOCAL only.
-: "${XDG_CONFIG_HOME:=$HOME/.config}"
-: "${XDG_DATA_HOME:=$HOME/.local/share}"
-: "${XDG_STATE_HOME:=$HOME/.local/state}"
-: "${XDG_CACHE_HOME:=$HOME/.cache}"
+# XDG live paths (LOCAL only) are populated by xdg_init_base_defaults() from the
+# shared lib, called above.
 
-# Human-facing folders that ARE allowed to travel to the cloud.
-SAFE_DIRS=(Documents Pictures Music Videos Projects Notes)
+# Human-facing folders that ARE allowed to travel to the cloud. Derived from the
+# canonical registry's linuxName (field 3) for each HOMETREE_KEYS entry, in
+# home-tree's own order — yielding "Documents Pictures Music Videos Projects Notes",
+# identical to the previous literal array. The COUPLING INVARIANT to the rclone
+# filter below is documented in the lib next to HOMETREE_KEYS (architecture §6):
+# each linuxName here MUST match an allow-path in write_filter or backups silently
+# drop that folder. The filter heredoc stays the single source of truth and is
+# NOT derived from the registry.
+SAFE_DIRS=()
+# shellcheck disable=SC2086   # intentional word-split of the space-separated HOMETREE_KEYS
+for __k in $HOMETREE_KEYS; do
+  SAFE_DIRS+=("$(field "$(registry_row "$__k")" 3)")
+done
 
 # Folders/files that must NEVER travel to the cloud (the denylist lives in the
 # generated rclone filter; this array is only for the local-creation summary).
@@ -43,14 +71,11 @@ MAX_DELETE=25                          # refuse a sync that would delete > N fil
 
 # ---------------------------------------------------------------------------
 # Plumbing
+#   SELF and log/info/warn/die come from the shared lib (bin/lib/xdg-common.sh).
+#   run() STAYS here (per-script): home-tree renders commands with `printf %s`
+#   (unquoted, space-joined) — deliberately NOT cloud-xdg's `printf %q` per-arg.
 # ---------------------------------------------------------------------------
-SELF="$(basename "$0")"
 FILTER_FILE="${TMPDIR:-/tmp}/home-tree.rclone-filter"
-
-log()  { printf '%s\n' "$*"; }
-info() { printf '  • %s\n' "$*"; }
-warn() { printf '  ! %s\n' "$*" >&2; }
-die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 run() {
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -101,20 +126,9 @@ while [ $# -gt 0 ]; do
 done
 
 # ---------------------------------------------------------------------------
-# Platform detection
+# Platform detection — detect_platform() comes from the shared lib; main() calls
+# it (sets the global PLATFORM) exactly as before.
 # ---------------------------------------------------------------------------
-detect_platform() {
-  case "$(uname -s)" in
-    Darwin) PLATFORM=macos ;;
-    Linux)
-      if [ -n "${TERMUX_VERSION:-}" ] || [ -d /data/data/com.termux ]; then
-        PLATFORM=termux
-      else
-        PLATFORM=linux
-      fi ;;
-    *) PLATFORM=unknown ;;
-  esac
-}
 
 # Find the Google Drive for Desktop FUSE mount on macOS (informational only —
 # we still route backups through rclone for consistent, lock-safe behavior).

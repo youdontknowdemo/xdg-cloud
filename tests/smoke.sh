@@ -957,4 +957,136 @@ else
   ok "lock released on interrupt (no stale lock)"
 fi
 
+# ===========================================================================
+# Shared-library mechanism (#2 / #3 dedup refactor) — standing guards for the
+# bin/lib/xdg-common.sh sourcing machinery that the groups above don't touch.
+# The PRE-vs-POST golden equivalence proof is a one-shot TEST-phase artifact;
+# THESE lock the new failure/edge modes against future drift. Same isolation
+# rules: everything lives under ${sandbox} and is removed by the EXIT trap.
+# The real bin/lib/xdg-common.sh is NEVER renamed/removed — we operate only on
+# sandbox COPIES / SYMLINKS of the scripts.
+# ===========================================================================
+
+# --- Group L1: missing-lib contract (architecture §4.2). Each script must, when
+#     its bin/lib/xdg-common.sh is absent/unreadable, print the exact
+#     "required library not found or unreadable" error to stderr and exit 1
+#     (BEFORE sourcing — die() isn't available yet, so the message is inlined). ---
+echo "smoke: L1 — missing shared library is reported and aborts with exit 1"
+for scr in cloud-xdg-provision.sh home-tree.sh; do
+  l1dir="${sandbox}/l1-${scr}"
+  mkdir -p "${l1dir}"
+  cp "${repo}/bin/${scr}" "${l1dir}/${scr}"   # copy WITHOUT a lib/ subdir alongside it
+  set +e
+  out="$(/bin/bash "${l1dir}/${scr}" --help 2>&1)"
+  rc=$?
+  set -e
+  if [ "${rc}" -eq 1 ]; then
+    ok "${scr}: missing-lib run exits 1 (exact contract, not just non-zero)"
+  else
+    fail "${scr}: missing-lib run exited ${rc}, expected 1"
+  fi
+  assert_contains "${out}" "required library not found or unreadable" \
+    "${scr}: missing-lib error names the unreadable library"
+  # The aborted-path must report the absolute lib path it looked for, under the copy's dir.
+  assert_contains "${out}" "${l1dir}/lib/xdg-common.sh" \
+    "${scr}: missing-lib error reports the resolved lib path it expected"
+done
+# Unreadable (present but chmod 000) is the OTHER half of the `[ ! -r ]` guard.
+# Gated on non-root: root bypasses read perms, which would mask the guard.
+if [ "$(id -u)" != "0" ]; then
+  echo "smoke: L1b — present-but-unreadable shared library is also reported (chmod 000)"
+  l1bdir="${sandbox}/l1b"
+  mkdir -p "${l1bdir}/lib"
+  cp "${repo}/bin/cloud-xdg-provision.sh" "${l1bdir}/cloud-xdg-provision.sh"
+  cp "${repo}/bin/lib/xdg-common.sh" "${l1bdir}/lib/xdg-common.sh"
+  chmod 000 "${l1bdir}/lib/xdg-common.sh"
+  set +e
+  out="$(/bin/bash "${l1bdir}/cloud-xdg-provision.sh" --help 2>&1)"
+  rc=$?
+  set -e
+  chmod 644 "${l1bdir}/lib/xdg-common.sh"   # restore so the EXIT-trap rm can recurse in
+  if [ "${rc}" -eq 1 ]; then
+    ok "unreadable-lib run exits 1"
+  else
+    fail "unreadable-lib run exited ${rc}, expected 1"
+  fi
+  assert_contains "${out}" "required library not found or unreadable" \
+    "unreadable-lib error names the unreadable library"
+else
+  echo "smoke: L1b unreadable-lib — SKIPPED (running as root; -r bypassed)"
+fi
+
+# --- Group L2: symlink self-location (architecture §4.2 resolve loop). When the
+#     script is invoked through a SYMLINK from an unrelated CWD, the resolve loop
+#     must follow the link chain to the REAL script dir and source the lib relative
+#     to THAT dir — not relative to the symlink's own dir. The link dirs below
+#     deliberately contain NO lib/ subdir, so a resolve loop that failed to chase
+#     the symlink (or used the link's dir) would not find the lib and the banner
+#     would never print. A two-hop chain exercises the `while [ -h ]` loop body
+#     more than once. bash 3.2-safe (ln -s, readlink without -f, cd -P). ---
+echo "smoke: L2 — script invoked via a symlink chain from another CWD still finds its lib"
+l2link1="${sandbox}/l2-a"; l2link2="${sandbox}/l2-b"; l2cwd="${sandbox}/l2-cwd"
+l2home="${sandbox}/l2-home"; l2cloud="${sandbox}/l2-cloud"
+mkdir -p "${l2link1}" "${l2link2}" "${l2cwd}" "${l2home}" "${l2cloud}"
+# hop 1: l2-a/cloud-xdg-provision.sh -> real bin script;
+# hop 2: l2-b/cloud-xdg-provision.sh -> l2-a/cloud-xdg-provision.sh (the loop must chase both).
+ln -s "${repo}/bin/cloud-xdg-provision.sh" "${l2link1}/cloud-xdg-provision.sh"
+ln -s "${l2link1}/cloud-xdg-provision.sh"  "${l2link2}/cloud-xdg-provision.sh"
+set +e
+out="$( cd "${l2cwd}" && HOME="${l2home}" /bin/bash "${l2link2}/cloud-xdg-provision.sh" \
+  --cloud-root "${l2cloud}" 2>&1 )"
+rc=$?
+set -e
+pass_if "${rc}" "symlinked dry-run exits 0 (lib resolved via the link chain)" \
+  "symlinked run failed (exit ${rc}) — resolve loop did not find the lib: ${out}"
+assert_contains "${out}" "platform=" \
+  "symlinked run reached main() and printed its banner (lib functions loaded)"
+assert_contains "${out}" "mode=DRY-RUN" "symlinked run banner reports DRY-RUN mode"
+
+# --- Group L3: registry-derivation standing guard (architecture §5, §6). Source
+#     the library and assert (a) xdg_offload_set() reproduces cloud-xdg's 9-row
+#     OFFLOAD_SET in EXACT order, and (b) home-tree's SAFE_DIRS — derived from
+#     HOMETREE_KEYS + the linuxName column (field 3) — equals the historical
+#     literal "Documents Pictures Music Videos Projects Notes" in that order.
+#     This locks the §6 linuxName<->rclone-filter coupling and the divergent
+#     per-script ordering (cloud-xdg: Music before Pictures; home-tree: Pictures
+#     before Music) against silent registry drift. Run under /bin/bash (3.2). ---
+echo "smoke: L3 — registry derivation reproduces OFFLOAD_SET (9 rows, order) + SAFE_DIRS"
+lib="${repo}/bin/lib/xdg-common.sh"
+expected_offload="$(printf '%s\n' \
+  'desktop|Desktop|Desktop|XDG_DESKTOP_DIR|1' \
+  'documents|Documents|Documents|XDG_DOCUMENTS_DIR|1' \
+  'downloads|Downloads|Downloads|XDG_DOWNLOAD_DIR|1' \
+  'music|Music|Music|XDG_MUSIC_DIR|1' \
+  'pictures|Pictures|Pictures|XDG_PICTURES_DIR|1' \
+  'videos|Movies|Videos|XDG_VIDEOS_DIR|1' \
+  'public|Public|Public|XDG_PUBLICSHARE_DIR|1' \
+  'templates|Templates|Templates|XDG_TEMPLATES_DIR|1' \
+  'projects|Projects|Projects||1')"
+set +e
+actual_offload="$(/bin/bash -c '. "$1"; xdg_offload_set' _ "${lib}")"
+rc=$?
+set -e
+pass_if "${rc}" "sourcing the lib + xdg_offload_set runs cleanly" \
+  "xdg_offload_set failed to run (exit ${rc})"
+if [ "${actual_offload}" = "${expected_offload}" ]; then
+  ok "xdg_offload_set reproduces the 9-row OFFLOAD_SET in cloud-xdg order"
+else
+  printf 'FAIL: xdg_offload_set drifted from the historical OFFLOAD_SET\n' >&2
+  printf '--- expected ---\n%s\n--- actual ---\n%s\n' "${expected_offload}" "${actual_offload}" >&2
+  exit 1
+fi
+# home-tree SAFE_DIRS derivation (mirrors home-tree.sh: linuxName per HOMETREE_KEYS).
+set +e
+actual_safe="$(/bin/bash -c '. "$1"; r=""; for k in $HOMETREE_KEYS; do r="$r $(field "$(registry_row "$k")" 3)"; done; printf "%s" "${r# }"' _ "${lib}")"
+rc=$?
+set -e
+pass_if "${rc}" "deriving SAFE_DIRS from HOMETREE_KEYS runs cleanly" \
+  "SAFE_DIRS derivation failed (exit ${rc})"
+if [ "${actual_safe}" = "Documents Pictures Music Videos Projects Notes" ]; then
+  ok "SAFE_DIRS derives to the historical set+order (Pictures before Music; Notes present)"
+else
+  fail "SAFE_DIRS drifted: got '${actual_safe}' (locks §6 filter coupling — investigate before changing)"
+fi
+
 echo "smoke: PASS"

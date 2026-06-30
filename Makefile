@@ -9,7 +9,7 @@ VERSION := $(shell cat VERSION)
 
 ## lint: shellcheck all shell sources; honors .shellcheckrc; non-zero on any finding.
 lint:
-	shellcheck bin/*.sh hooks/pre-commit tests/*.sh
+	shellcheck bin/*.sh bin/lib/*.sh hooks/pre-commit tests/*.sh
 
 ## test: run smoke + idempotency checks in a sandbox (never touches real $$HOME).
 test:
