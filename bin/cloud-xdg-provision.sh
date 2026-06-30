@@ -296,9 +296,13 @@ resolve_cloud_root() {
     # candidates (dirs that actually contain "My Drive"); use the one only if it is
     # unambiguous, otherwise refuse and make the user disambiguate with --cloud-root.
     # bash 3.2: count via a loop + accumulate a newline-listed string (no arrays).
-    local d count first candidates
-    count=0; first=""; candidates=""
+    local d count first candidates gd_dir_seen
+    count=0; first=""; candidates=""; gd_dir_seen=0
     for d in "$HOME"/Library/CloudStorage/GoogleDrive-*; do
+      # An unmatched glob stays literal (no nullglob in bash 3.2), so [ -d "$d" ]
+      # is false when nothing matched. A real GoogleDrive-* dir WITHOUT a "My Drive"
+      # inside is a half-set-up Drive: note it so the iCloud fallback below can warn.
+      [ -d "$d" ] && gd_dir_seen=1
       [ -d "$d/My Drive" ] || continue          # also skips the literal glob when nothing matches
       count=$((count + 1))
       if [ -z "$first" ]; then first="$d/My Drive"; fi
@@ -318,6 +322,12 @@ ${candidates}  Pass --cloud-root PATH to choose one explicitly."
       # so an auto-detected iCloud root passes B4 without --allow-local-root.
       local icloud_root="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
       if [ -d "$icloud_root" ]; then
+        # A GoogleDrive-* folder exists but has no "My Drive" inside (half-set-up
+        # Drive). Pre-#20 this case died; now it silently fell to iCloud. Make the
+        # fallback visible so the user isn't surprised by the chosen root.
+        if [ "$gd_dir_seen" -eq 1 ]; then
+          warn "Found a Google Drive folder but no 'My Drive' inside; falling back to iCloud Drive. Pass --cloud-root to override."
+        fi
         CLOUD_ROOT="$icloud_root"
         return 0
       fi

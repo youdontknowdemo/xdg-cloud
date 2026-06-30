@@ -592,6 +592,21 @@ if [ "$(uname -s)" = "Darwin" ]; then
   assert_nonzero "${rc}" "no-provider auto-detect exits non-zero"
   assert_contains "${out}" "No Google Drive or iCloud Drive found" "die names both Google Drive and iCloud"
   assert_contains "${out}" "--cloud-root" "no-provider die tells the user to pass --cloud-root"
+
+  # 20d: half-set-up Google Drive (GoogleDrive-* dir but NO My Drive) + iCloud →
+  # iCloud fallback still fires, but with a visible warning naming the situation.
+  echo "smoke: #20d — partial Google Drive (no My Drive) + iCloud falls back to iCloud WITH a warning"
+  i20d="${sandbox}/i20-home-partial"
+  mkdir -p "${i20d}/Library/CloudStorage/GoogleDrive-me@x.com"   # NOTE: no /My Drive subdir
+  mkdir -p "${i20d}/${icloud_rel}"
+  set +e
+  out="$(HOME="${i20d}" /bin/bash "${PROV}" 2>&1)"   # dry-run
+  rc=$?
+  set -e
+  pass_if "${rc}" "partial-GD + iCloud run resolves cleanly (exit 0)" \
+    "partial-GD fallback failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "com~apple~CloudDocs" "iCloud Drive is chosen despite the partial Google Drive folder"
+  assert_contains "${out}" "no 'My Drive' inside" "the partial-Google-Drive fallback is warned, not silent"
 else
   echo "smoke: #20 iCloud Drive fallback auto-detect — SKIPPED (auto-detect is macOS-only)"
 fi
