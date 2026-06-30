@@ -1108,14 +1108,14 @@ assert_contains "${out}" "platform=" \
 assert_contains "${out}" "mode=DRY-RUN" "symlinked run banner reports DRY-RUN mode"
 
 # --- Group L3: registry-derivation standing guard (architecture §5, §6). Source
-#     the library and assert (a) xdg_offload_set() reproduces cloud-xdg's 9-row
+#     the library and assert (a) xdg_offload_set() reproduces cloud-xdg's 8-row
 #     OFFLOAD_SET in EXACT order, and (b) home-tree's SAFE_DIRS — derived from
 #     HOMETREE_KEYS + the linuxName column (field 3) — equals the historical
 #     literal "Documents Pictures Music Videos Projects Notes" in that order.
 #     This locks the §6 linuxName<->rclone-filter coupling and the divergent
 #     per-script ordering (cloud-xdg: Music before Pictures; home-tree: Pictures
 #     before Music) against silent registry drift. Run under /bin/bash (3.2). ---
-echo "smoke: L3 — registry derivation reproduces OFFLOAD_SET (9 rows, order) + SAFE_DIRS"
+echo "smoke: L3 — registry derivation reproduces OFFLOAD_SET (8 rows, order) + SAFE_DIRS"
 lib="${repo}/bin/lib/xdg-common.sh"
 expected_offload="$(printf '%s\n' \
   'desktop|Desktop|Desktop|XDG_DESKTOP_DIR|1' \
@@ -1125,8 +1125,7 @@ expected_offload="$(printf '%s\n' \
   'pictures|Pictures|Pictures|XDG_PICTURES_DIR|1' \
   'videos|Movies|Videos|XDG_VIDEOS_DIR|1' \
   'public|Public|Public|XDG_PUBLICSHARE_DIR|1' \
-  'templates|Templates|Templates|XDG_TEMPLATES_DIR|1' \
-  'projects|Projects|Projects||1')"
+  'templates|Templates|Templates|XDG_TEMPLATES_DIR|1')"
 set +e
 actual_offload="$(/bin/bash -c '. "$1"; xdg_offload_set' _ "${lib}")"
 rc=$?
@@ -1134,7 +1133,7 @@ set -e
 pass_if "${rc}" "sourcing the lib + xdg_offload_set runs cleanly" \
   "xdg_offload_set failed to run (exit ${rc})"
 if [ "${actual_offload}" = "${expected_offload}" ]; then
-  ok "xdg_offload_set reproduces the 9-row OFFLOAD_SET in cloud-xdg order"
+  ok "xdg_offload_set reproduces the 8-row OFFLOAD_SET in cloud-xdg order"
 else
   printf 'FAIL: xdg_offload_set drifted from the historical OFFLOAD_SET\n' >&2
   printf '--- expected ---\n%s\n--- actual ---\n%s\n' "${expected_offload}" "${actual_offload}" >&2
@@ -1287,5 +1286,191 @@ LSSH
 else
   echo "  SKIP: #15 (M-g) — ACL deny-delete gate is macOS-only (uname=$(uname -s))"
 fi
+
+# ===========================================================================
+# Group C (slice 1): home-dir CLASSIFICATION foundation — the classification
+# registry/derivation, helper correctness, the read-only --classify /
+# --offload-status modes (ZERO mutation), the reserved-but-inert mutating lanes,
+# and a default-flow regression. Mirrors the L3 derivation-golden style. Sourced
+# under /bin/bash to exercise the macOS bash 3.2 path; mode runs use a sandbox
+# HOME so nothing touches the real home. This is a NON-destructive slice — no
+# offload/dotfiles mutation exists yet, so there are deliberately NO offload
+# round-trip cases here (those land with the offload slice). `lib` is defined in
+# the L3 block above; PROV/sandbox/cloud_root are the file-wide globals. ---
+# ===========================================================================
+
+# --- C1: HOME_CLASS_REGISTRY derivation — CODE_KEYS/LOCAL_KEYS reproduce the
+#     expected rows in EXACT order (the classification analogue of the L3
+#     OFFLOAD_SET golden). Locks the taxonomy + membership against silent drift. ---
+echo "smoke: C1 — classification registry derives CODE_KEYS/LOCAL_KEYS (rows + order)"
+expected_code="$(printf '%s\n' \
+  'repos|repos|repos|code|1' \
+  'androidstudio|AndroidStudioProjects|AndroidStudioProjects|code|1' \
+  'projects|Projects|Projects|code|1')"
+expected_local="$(printf '%s\n' \
+  'pyenv|pyenv|pyenv|local|0' \
+  'applications|Applications|Applications|local|0' \
+  'syslog|log|log|local|0' \
+  'qemu|QEMU|QEMU|local|0')"
+set +e
+actual_code="$(/bin/bash -c '. "$1"; for k in $CODE_KEYS; do code_row "$k"; done' _ "${lib}")"
+rc=$?
+set -e
+pass_if "${rc}" "sourcing the lib + iterating CODE_KEYS runs cleanly" \
+  "CODE_KEYS derivation failed to run (exit ${rc})"
+if [ "${actual_code}" = "${expected_code}" ]; then
+  ok "CODE_KEYS reproduces the code rows (repos, androidstudio, projects) in order"
+else
+  printf 'FAIL: CODE_KEYS drifted from the expected code set\n--- expected ---\n%s\n--- actual ---\n%s\n' \
+    "${expected_code}" "${actual_code}" >&2
+  exit 1
+fi
+actual_local="$(/bin/bash -c '. "$1"; for k in $LOCAL_KEYS; do code_row "$k"; done' _ "${lib}")"
+if [ "${actual_local}" = "${expected_local}" ]; then
+  ok "LOCAL_KEYS reproduces the machine-local rows (pyenv, applications, syslog, qemu) in order"
+else
+  printf 'FAIL: LOCAL_KEYS drifted from the expected local set\n--- expected ---\n%s\n--- actual ---\n%s\n' \
+    "${expected_local}" "${actual_local}" >&2
+  exit 1
+fi
+
+# --- C2: classification helpers resolve the right class per lane. home_class()
+#     must check HOME_CLASS_REGISTRY FIRST so the overloaded 'projects' key (in
+#     both registries) resolves to code, fall through to xdg for a pure XDG row,
+#     and report unknown otherwise. ---
+echo "smoke: C2 — home_class/is_code_dir/is_machine_local/code_row resolve correct classes"
+set +e
+helpers_out="$(/bin/bash -c '
+  set -euo pipefail
+  . "$1"
+  printf "repos=%s\n"     "$(home_class repos)"
+  printf "pyenv=%s\n"     "$(home_class pyenv)"
+  printf "documents=%s\n" "$(home_class documents)"
+  printf "bogus=%s\n"     "$(home_class definitely_not_a_key)"
+  if is_code_dir repos;      then printf "is_code_dir_repos=yes\n";      fi
+  if is_machine_local pyenv; then printf "is_machine_local_pyenv=yes\n"; fi
+  if is_code_dir pyenv;      then printf "is_code_dir_pyenv=yes\n"; else printf "is_code_dir_pyenv=no\n"; fi
+  code_row repos
+' _ "${lib}")"
+rc=$?
+set -e
+pass_if "${rc}" "classification helpers run cleanly under set -euo pipefail when sourced" \
+  "classification helpers aborted (exit ${rc}): ${helpers_out}"
+assert_contains "${helpers_out}" "repos=code"      "home_class(repos)=code"
+assert_contains "${helpers_out}" "pyenv=local"     "home_class(pyenv)=local"
+assert_contains "${helpers_out}" "documents=xdg"   "home_class(documents)=xdg (XDG row, not in HOME_CLASS_REGISTRY)"
+assert_contains "${helpers_out}" "bogus=unknown"   "home_class(unknown key)=unknown"
+assert_contains "${helpers_out}" "is_code_dir_repos=yes"      "is_code_dir(repos) is true"
+assert_contains "${helpers_out}" "is_machine_local_pyenv=yes" "is_machine_local(pyenv) is true"
+assert_contains "${helpers_out}" "is_code_dir_pyenv=no"       "is_code_dir(pyenv) is false (local is not code)"
+assert_contains "${helpers_out}" "repos|repos|repos|code|1"   "code_row(repos) returns the full registry row"
+
+# --- C2b: rclone_remote_exists() must FAIL CLOSED (non-zero) for a missing
+#     remote and must NOT abort its caller under set -e — it gates the later
+#     offload lane via `if`. RCLONE_CONFIG points at an empty sandbox file so the
+#     result is host-independent whether or not rclone is installed. ---
+echo "smoke: C2b — rclone_remote_exists fails closed for a missing remote (no set -e abort)"
+rcfg="${sandbox}/empty-rclone.conf"; : > "${rcfg}"
+set +e
+rre_out="$(RCLONE_CONFIG="${rcfg}" /bin/bash -c '
+  set -euo pipefail
+  . "$1"
+  if rclone_remote_exists no_such_remote_xyz; then printf "result=present\n"; else printf "result=absent\n"; fi
+  printf "survived=yes\n"
+' _ "${lib}")"
+rc=$?
+set -e
+pass_if "${rc}" "rclone_remote_exists returned without aborting the set -e caller" \
+  "rclone_remote_exists aborted its caller (exit ${rc}): ${rre_out}"
+assert_contains "${rre_out}" "result=absent" "missing remote reports absent (fails closed)"
+assert_contains "${rre_out}" "survived=yes"  "caller continued past the predicate (no set -e abort)"
+
+# --- C3: read-only modes exit 0, print the expected class lines, and mutate
+#     NOTHING. Zero-mutation is proven by a full before/after tree snapshot of a
+#     sandbox HOME (find | sort). The names asserted are platform-stable because
+#     macName==linuxName for every classification row. XDG_STATE_HOME is sandboxed
+#     so --offload-status reads the sandbox state dir, not the real one. ---
+echo "smoke: C3 — --classify is read-only and reports each lane's class"
+c_home="${sandbox}/cls-home"; mkdir -p "${c_home}"
+c_before="$(cd "${c_home}" && find . | sort)"
+set +e
+out="$(HOME="${c_home}" XDG_STATE_HOME="${c_home}/state" /bin/bash "${PROV}" --classify 2>&1)"
+rc=$?
+set -e
+pass_if "${rc}" "--classify exits 0" "--classify failed (exit ${rc}): ${out}"
+assert_contains "${out}" "Home-dir classification" "--classify prints its read-only header"
+assert_contains "${out}" "code   repos"    "--classify labels repos as code"
+assert_contains "${out}" "code   Projects" "--classify labels Projects as code (P2 reclassification)"
+assert_contains "${out}" "local  pyenv"    "--classify labels pyenv as machine-local"
+assert_contains "${out}" "xdg    Documents" "--classify labels Documents as xdg"
+c_after="$(cd "${c_home}" && find . | sort)"
+if [ "${c_before}" = "${c_after}" ]; then
+  ok "--classify mutated nothing (sandbox HOME tree identical before/after)"
+else
+  printf 'FAIL: --classify mutated the home tree\n' >&2
+  diff <(printf '%s\n' "${c_before}") <(printf '%s\n' "${c_after}") >&2 || true
+  exit 1
+fi
+
+echo "smoke: C3b — --offload-status is read-only and reports code dirs as local with no state file"
+o_home="${sandbox}/ofs-home"; mkdir -p "${o_home}"
+o_before="$(cd "${o_home}" && find . | sort)"
+set +e
+out="$(HOME="${o_home}" XDG_STATE_HOME="${o_home}/state" /bin/bash "${PROV}" --offload-status 2>&1)"
+rc=$?
+set -e
+pass_if "${rc}" "--offload-status exits 0" "--offload-status failed (exit ${rc}): ${out}"
+assert_contains "${out}" "Code-dir offload status" "--offload-status prints its read-only header"
+assert_contains "${out}" "code   repos" "--offload-status lists repos (a code dir)"
+assert_contains "${out}" "local" "--offload-status reports code dirs as local when no state file exists"
+assert_not_contains "${out}" "offloaded ->" "no state file => nothing is reported as offloaded"
+o_after="$(cd "${o_home}" && find . | sort)"
+if [ "${o_before}" = "${o_after}" ]; then
+  ok "--offload-status mutated nothing (sandbox HOME tree identical before/after)"
+else
+  printf 'FAIL: --offload-status mutated the home tree\n' >&2
+  diff <(printf '%s\n' "${o_before}") <(printf '%s\n' "${o_after}") >&2 || true
+  exit 1
+fi
+
+# --- C4: reserved mutating lanes are recognized but REFUSE with a non-zero exit
+#     and a 'reserved/not implemented' message — and mutate nothing. Value-taking
+#     modes (--offload/--hydrate) get a sandbox-path arg so arg-parsing passes and
+#     the refusal happens at dispatch (the behavior under test). ---
+echo "smoke: C4 — reserved mutating modes refuse (non-zero) and mutate nothing"
+r_home="${sandbox}/rsv-home"; mkdir -p "${r_home}"
+r_before="$(cd "${r_home}" && find . | sort)"
+for spec in "--offload ${r_home}/x" "--hydrate ${r_home}/x" "--dotfiles-init" "--migrate-projects"; do
+  set +e
+  # shellcheck disable=SC2086   # intentional word-split: spec is "flag [arg]"
+  out="$(HOME="${r_home}" /bin/bash "${PROV}" ${spec} 2>&1)"
+  rc=$?
+  set -e
+  assert_nonzero "${rc}" "reserved mode '${spec%% *}' exits non-zero"
+  assert_contains "${out}" "reserved but not implemented" "reserved mode '${spec%% *}' says it is not implemented"
+done
+r_after="$(cd "${r_home}" && find . | sort)"
+if [ "${r_before}" = "${r_after}" ]; then
+  ok "reserved modes mutated nothing (sandbox HOME tree identical before/after)"
+else
+  printf 'FAIL: a reserved mode mutated the home tree\n' >&2
+  diff <(printf '%s\n' "${r_before}") <(printf '%s\n' "${r_after}") >&2 || true
+  exit 1
+fi
+
+# --- C5: regression — with NO mode flag, MODE stays empty and dispatch routes to
+#     main() (the default provision lane), unchanged. The provision banner is the
+#     observable proof it reached main(); the report/reserved handlers never
+#     print it (they have no banner). ---
+echo "smoke: C5 — default (no mode) still routes to main() and prints the provision banner"
+d_home="${sandbox}/def-home"; mkdir -p "${d_home}"
+set +e
+out="$(HOME="${d_home}" /bin/bash "${PROV}" --cloud-root "${cloud_root}" 2>&1)"
+rc=$?
+set -e
+pass_if "${rc}" "default no-mode dry-run exits 0" "default no-mode run failed (exit ${rc}): ${out}"
+assert_contains "${out}" "platform=" "no-mode run reaches main() and prints the provision banner"
+assert_contains "${out}" "mode=DRY-RUN" "no-mode run is the default dry-run provision lane"
+assert_not_contains "${out}" "Home-dir classification" "no-mode run did NOT enter a report mode"
 
 echo "smoke: PASS"

@@ -86,11 +86,19 @@ templates|Templates|Templates|XDG_TEMPLATES_DIR|1
 projects|Projects|Projects||1
 notes|Notes|Notes||1
 "
+# Note on the 'projects' row above: it is CODE-classified for cloud-xdg (P2, see
+# HOME_CLASS_REGISTRY below) and is NOT in CLOUDXDG_KEYS, so it no longer enters
+# OFFLOAD_SET / the symlink lane. The row REMAINS because home-tree.sh (frozen) still
+# lists 'projects' in HOMETREE_KEYS and derives SAFE_DIRS from this row's linuxName
+# (field 3); the section-6 rclone-filter '+ /Projects/**' coupling depends on it.
+# (This comment lives OUTSIDE the registry string on purpose: a '#' line inside the
+# double-quoted value would be string DATA, and backticks there would run as command
+# substitution at source time — violating the declarations-only source-safety rule.)
 
 # Each tool manages a DIFFERENT subset in a DIFFERENT order — deliberate
 # divergence (not duplication). cloud-xdg keeps Music before Pictures;
 # home-tree keeps Pictures before Music. Each iterates its OWN ordered list.
-CLOUDXDG_KEYS="desktop documents downloads music pictures videos public templates projects"
+CLOUDXDG_KEYS="desktop documents downloads music pictures videos public templates"
 #
 # ⚠️ COUPLING INVARIANT (architecture §6): the registry `linuxName` (field 3)
 # for every HOMETREE_KEYS entry MUST stay equal to the matching allow-path name
@@ -124,4 +132,65 @@ xdg_offload_set() {
   local k
   # shellcheck disable=SC2086   # intentional word-split of the space-separated key list
   for k in $CLOUDXDG_KEYS; do registry_row "$k"; done
+}
+
+# ---------------------------------------------------------------------------
+# Home-dir classification registry (slice 1) — classes OUTSIDE the XDG-symlink lane.
+#   code  : git-managed dirs eligible for rclone offload-on-demand (offloadable=1)
+#   local : machine-local dirs that must NEVER offload or symlink (offloadable=0)
+#   Schema:  canonical|macName|linuxName|class|offloadable
+# SEPARATE from XDG_DIR_REGISTRY by design so xdg_offload_set() + smoke L3 stay
+# byte-identical (except the deliberate P2 removal of `projects` from CLOUDXDG_KEYS).
+# `projects` is listed here as code AND remains an XDG_DIR_REGISTRY row (home-tree needs
+# that row — see the projects row above). home_class() resolves the overlap to `code`.
+# ---------------------------------------------------------------------------
+HOME_CLASS_REGISTRY="
+repos|repos|repos|code|1
+androidstudio|AndroidStudioProjects|AndroidStudioProjects|code|1
+projects|Projects|Projects|code|1
+pyenv|pyenv|pyenv|local|0
+applications|Applications|Applications|local|0
+syslog|log|log|local|0
+qemu|QEMU|QEMU|local|0
+"
+
+# Membership + order per new lane (explicit, like CLOUDXDG_KEYS — not registry-scanned).
+# shellcheck disable=SC2034   # CODE_KEYS/LOCAL_KEYS are read by cloud-xdg-provision.sh, not here
+CODE_KEYS="repos androidstudio projects"
+# shellcheck disable=SC2034   # see above
+LOCAL_KEYS="pyenv applications syslog qemu"
+
+# Echo the HOME_CLASS_REGISTRY row for a canonical key (or nothing). First match wins.
+# Exact structural mirror of registry_row() — proven safe to call inside $( … ).
+code_row() {
+  printf '%s\n' "$HOME_CLASS_REGISTRY" | while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    case "$line" in
+      "$1|"*) printf '%s\n' "$line"; break ;;
+    esac
+  done
+}
+
+# Class for ANY canonical key: code|local from HOME_CLASS_REGISTRY (checked FIRST so
+# `projects` resolves to code), else xdg if it is an XDG_DIR_REGISTRY row, else unknown.
+home_class() {
+  local cr xr
+  cr="$(code_row "$1")"
+  if [ -n "$cr" ]; then field "$cr" 4; return 0; fi
+  xr="$(registry_row "$1")"
+  if [ -n "$xr" ]; then printf '%s' "xdg"; return 0; fi
+  printf '%s' "unknown"
+}
+
+# Predicates (for use in `if`; SC2310 is disabled repo-wide in .shellcheckrc).
+is_machine_local() { [ "$(home_class "$1")" = "local" ]; }
+is_code_dir()      { [ "$(home_class "$1")" = "code" ]; }
+
+# Parameterized rclone-remote precondition (offload lane, later slice). Each script
+# wraps it with its own config var + message — do NOT byte-copy home-tree's
+# require_rclone (divergent message; dedup rule). True (0) iff rclone present AND a
+# remote named "$1" is configured. Body runs only when CALLED (not at source time).
+rclone_remote_exists() {
+  command -v rclone >/dev/null 2>&1 || return 1
+  rclone listremotes 2>/dev/null | grep -qx "$1:"
 }

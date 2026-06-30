@@ -21,8 +21,9 @@
 #   2. XDG *base* dirs (config/data/state/cache) stay LOCAL. They are
 #      machine-specific, high-churn, or lock-sensitive (SQLite). Live config
 #      belongs in git, not blob cloud.
-#   3. Only XDG *user* dirs + a projects area offload cleanly. That is the
-#      genuine cross-OS portable set.
+#   3. Only XDG *user* dirs are auto-symlinked into the cloud here — the genuine
+#      cross-OS portable set. (A projects area is CODE-class, not symlinked; it is
+#      offloaded on demand in a later slice, not via this lane.)
 #
 # Compatible with stock macOS bash 3.2 (no associative arrays / mapfile).
 #
@@ -72,6 +73,15 @@ DO_RELOCATE=0      # move existing populated dirs into the cloud, then symlink
 REDIRECT_DOWNLOADS=0  # downloads is triage/ephemeral; off by default
 ALLOW_LOCAL_ROOT=0 # 1 = skip the cloud-mount liveness check (B4 override)
 FAST_VERIFY=0      # 1 = size/mtime post-copy verify instead of checksum (B3)
+
+# Mode dispatch (slice 1). Empty MODE = the default provision/symlink lane (main,
+# unchanged). A non-empty MODE selects a subcommand handled by dispatch_mode at the
+# very bottom of the file. Exactly one lane runs per invocation (set_mode enforces it).
+MODE=""            # "" = provision lane (main). Else a subcommand mode.
+# MODE_ARG is captured for the reserved value-taking modes; it is read only once
+# those modes are implemented (later slice), hence the SC2034 disables at the
+# assignment sites below.
+MODE_ARG=""        # argument for value-taking modes (reserved --offload <dir>, etc.)
 
 # State for the single master cleanup trap (cleanup_handler). bash 3.2 allows only
 # ONE handler per signal and has no trap-stacking, so the concurrency lock (#5c),
@@ -255,14 +265,28 @@ Usage: $SELF [options]
                          will NOT catch a silent FUSE async-upload failure.
   -h, --help             This help.
 
+Modes (default with no mode flag = the provision/symlink lane above; exactly one
+lane per run — combining a mode with the default flags is refused):
+  --classify             Report the class of every known ~/ entry (read-only).
+  --offload-status       Report which code dirs are offloaded vs local (read-only).
+  (reserved, not yet implemented in this build: --migrate-projects, --offload,
+   --hydrate, --dotfiles-init, --dotfiles-track, --dotfiles-status)
+
 Nothing is moved without --apply --relocate together.
 EOF
+}
+
+# Select a subcommand mode; refuse two lanes in one invocation.
+set_mode() {
+  [ -z "$MODE" ] || die "choose ONE mode per run (already set: --$MODE, then --$1)."
+  MODE="$1"
 }
 
 # ---------------------------------------------------------------------------
 # Args
 # ---------------------------------------------------------------------------
 while [ $# -gt 0 ]; do
+  # shellcheck disable=SC2034   # MODE_ARG (set by reserved value-taking modes) is read by a later slice
   case "$1" in
     --apply)              DRY_RUN=0 ;;
     --relocate)           DO_RELOCATE=1 ;;
@@ -271,6 +295,16 @@ while [ $# -gt 0 ]; do
     --fast-verify)        FAST_VERIFY=1 ;;
     --style)              shift; STYLE="${1:?--style needs xdg|mac}" ;;
     --cloud-root)         shift; CLOUD_ROOT="${1:?--cloud-root needs a path}" ;;
+    # --- read-only report modes (slice 1, implemented) ---
+    --classify)           set_mode classify ;;
+    --offload-status)     set_mode offload-status ;;
+    # --- reserved mutating lanes (later slices — recognized here, inert at dispatch) ---
+    --migrate-projects)   set_mode migrate-projects ;;
+    --offload)            set_mode offload;  shift; MODE_ARG="${1:?--offload needs a dir}" ;;
+    --hydrate)            set_mode hydrate;  shift; MODE_ARG="${1:?--hydrate needs a dir}" ;;
+    --dotfiles-init)      set_mode dotfiles-init ;;
+    --dotfiles-track)     set_mode dotfiles-track; shift; MODE_ARG="${1:?--dotfiles-track needs a path}" ;;
+    --dotfiles-status)    set_mode dotfiles-status ;;
     -h|--help)            usage; exit 0 ;;
     *)                    die "unknown option: $1 (try --help)" ;;
   esac
@@ -795,11 +829,92 @@ Canonical mapping (FHS / XDG / macOS -> cloud folder)
   videos    XDG_VIDEOS_DIR    ~/Movies (mac)       -> $CLOUD_ROOT/$(cloud_name videos Movies)
   public    XDG_PUBLICSHARE   ~/Public             -> $CLOUD_ROOT/$(cloud_name public Public)
   templates XDG_TEMPLATES_DIR ~/Templates          -> $CLOUD_ROOT/$(cloud_name templates Templates)
-  projects  (convention)      ~/Projects           -> $CLOUD_ROOT/$(cloud_name projects Projects)
 
 System root dirs (/ /usr /etc /var /opt /Applications /System /Library):
   machine-managed — NOT offloadable. Excluded by design.
 EOF
+}
+
+# ---------------------------------------------------------------------------
+# Read-only report modes (slice 1) — ZERO mutation: no mkdir/ln/rm, no run(),
+# no cloud-root resolution, no lock. They only inspect and print.
+# ---------------------------------------------------------------------------
+
+# Print one classification line for a canonical's registry-style row.
+#   $1 = class label (xdg|code|local), $2 = a 'canonical|mac|lin|…' row.
+# Inspects $HOME/<localName> and reports symlink target / local dir / absent.
+classify_one() {
+  local class row mac lin name target state
+  class="$1"; row="$2"
+  [ -n "$row" ] || return 0                 # unknown key — nothing to print
+  mac="$(field "$row" 2)"
+  lin="$(field "$row" 3)"
+  name="$(local_name "$mac" "$lin")"
+  target="$HOME/$name"
+  if [ -L "$target" ]; then
+    state="symlink -> $(readlink "$target")"   # readlink (no -f) on a known symlink
+  elif [ -d "$target" ]; then
+    state="local dir"
+  else
+    state="absent"
+  fi
+  printf '%-6s %-22s %s\n' "$class" "$name" "$state"
+  # A code dir that is currently a cloud symlink is the P2 case the (reserved)
+  # --migrate-projects mode will later restore to a real local dir.
+  if [ "$class" = "code" ] && [ -L "$target" ]; then
+    printf '%-6s %-22s %s\n' "" "" "(cloud-symlinked; --migrate-projects is reserved, not yet implemented)"
+  fi
+}
+
+# --classify: classify every known top-level ~/ entry. Read-only.
+cmd_classify() {
+  local k
+  log "Home-dir classification (read-only — no changes made):"
+  # shellcheck disable=SC2086   # intentional word-split of the space-separated key lists
+  for k in $CLOUDXDG_KEYS; do classify_one xdg   "$(registry_row "$k")"; done
+  # shellcheck disable=SC2086
+  for k in $CODE_KEYS;     do classify_one code  "$(code_row "$k")"; done
+  # shellcheck disable=SC2086
+  for k in $LOCAL_KEYS;    do classify_one local "$(code_row "$k")"; done
+  cat <<'EOF'
+
+Notes:
+  * Dotfiles (~/.config, ~/.local, ~/.cache, …) are handled by the reserved
+    dotfiles mode; they are deliberately not classified here.
+  * Entries under ~/ not listed above are unclassified.
+EOF
+}
+
+# --offload-status: for each code dir, report offloaded-vs-local. Read-only.
+#   The offload lane (later slice) WRITES state files under
+#   $XDG_STATE_HOME/xdg-cloud/offloaded/<canonical>; slice 1 only READS them, so
+#   with no such file every code dir reports `local` (validating the read path).
+cmd_offload_status() {
+  local k state_dir name target sf remote gitout githint
+  state_dir="$XDG_STATE_HOME/xdg-cloud/offloaded"
+  log "Code-dir offload status (read-only — no changes made):"
+  # shellcheck disable=SC2086   # intentional word-split of the space-separated key list
+  for k in $CODE_KEYS; do
+    name="$(local_name "$(field "$(code_row "$k")" 2)" "$(field "$(code_row "$k")" 3)")"
+    target="$HOME/$name"
+    sf="$state_dir/$k"
+    if [ -f "$sf" ]; then
+      # state file present -> offloaded. Parse the remote line (same 3.2 idiom as
+      # elsewhere); tolerate a malformed/empty file.
+      remote="$(grep '^remote=' "$sf" 2>/dev/null | cut -d= -f2- || true)"
+      printf '%-6s %-22s %s\n' "code" "$name" "offloaded -> ${remote:-<unknown remote>}"
+    else
+      # local: add a read-only git cleanliness hint when it's a git work tree.
+      githint=""
+      if [ -d "$target" ] && git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        gitout="$(git -C "$target" status --porcelain 2>/dev/null || true)"
+        if [ -n "$gitout" ]; then githint=" (git: dirty)"; else githint=" (git: clean)"; fi
+      elif [ ! -e "$target" ]; then
+        githint=" (absent)"
+      fi
+      printf '%-6s %-22s %s\n' "code" "$name" "local${githint}"
+    fi
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -861,4 +976,20 @@ Notes
 EOF
 }
 
-main
+# ---------------------------------------------------------------------------
+# Dispatch — default (no mode flag) runs the provision lane (main); a mode flag
+# runs its handler. detect_platform already ran at top level above; read-only
+# modes need no cloud-root/lock (main resolves those itself). Reserved mutating
+# lanes are recognized but refuse until their slice lands.
+# ---------------------------------------------------------------------------
+dispatch_mode() {
+  case "$MODE" in
+    classify)         cmd_classify ;;
+    offload-status)   cmd_offload_status ;;
+    migrate-projects|offload|hydrate|dotfiles-init|dotfiles-track|dotfiles-status)
+        die "mode '--$MODE' is reserved but not implemented in this build (slice 1 = classification + read-only reporting)." ;;
+    *)                die "internal: unknown mode '$MODE'" ;;
+  esac
+}
+
+if [ -n "$MODE" ]; then dispatch_mode; else main; fi
