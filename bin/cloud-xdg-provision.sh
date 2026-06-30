@@ -78,10 +78,14 @@ FAST_VERIFY=0      # 1 = size/mtime post-copy verify instead of checksum (B3)
 # unchanged). A non-empty MODE selects a subcommand handled by dispatch_mode at the
 # very bottom of the file. Exactly one lane runs per invocation (set_mode enforces it).
 MODE=""            # "" = provision lane (main). Else a subcommand mode.
-# MODE_ARG is captured for the reserved value-taking modes; it is read only once
-# those modes are implemented (later slice), hence the SC2034 disables at the
-# assignment sites below.
-MODE_ARG=""        # argument for value-taking modes (reserved --offload <dir>, etc.)
+MODE_ARG=""        # argument for value-taking modes (--offload <dir>, --hydrate <dir>)
+
+# Code offload-on-demand (slice 2) — the rclone REMOTE lane (NOT the cloud mount;
+# only a real remote frees local space). CODE-class dirs use this lane and NEVER
+# enter OFFLOAD_SET / the symlink-into-mount lane.
+: "${CODE_REMOTE:=gdrive}"            # rclone remote name (create via 'rclone config')
+: "${CODE_DEST:=xdg-offload/code}"    # path inside the remote; per-container <canonical> appended
+OFFLOAD_ASIDE=0                       # 1 = move aside + re-verify before rm (opt-in, --aside)
 
 # State for the single master cleanup trap (cleanup_handler). bash 3.2 allows only
 # ONE handler per signal and has no trap-stacking, so the concurrency lock (#5c),
@@ -93,6 +97,25 @@ RELOCATE_ACTIVE=0
 RELOCATE_SRC=""
 RELOCATE_ASIDE=""
 RELOCATE_DST=""
+
+# Offload drop-window state (slice 2). Set ACTIVE around the local rm so an interrupt
+# leaves a clear recovery message. Unlike relocate, the cloud copy is already
+# read-back-verified AND (for git content) the remote is a second net, so recovery =
+# re-run --offload (idempotent) or --hydrate. Straight-line drop in the PARENT shell,
+# so the flag the handler reads is always in scope (no pipe/subshell — R2 ADR rule).
+OFFLOAD_ACTIVE=0
+OFFLOAD_SRC=""
+OFFLOAD_REMOTE=""
+
+# Projects un-symlink migration window (slice 2, cmd_migrate_projects). Non-destructive
+# (rm NOTHING — the cloud copy and the moved-aside link are always retained), but it has
+# a mv+rsync window, so it gets the same single-handler discipline as relocate: an
+# interrupt between moving the symlink aside and finishing the local copy leaves a
+# recoverable, clearly-reported state.
+MIGRATE_ACTIVE=0
+MIGRATE_SRC=""
+MIGRATE_ASIDE=""
+MIGRATE_CLOUD=""
 
 # macOS TCC rename-probe state (B2): set ACTIVE before the rename so an interrupt in
 # the sub-millisecond window is always reverted by the master handler.
@@ -143,18 +166,25 @@ run()  {
 }
 
 # Single master cleanup handler — installed in the PARENT shell (see
-# install_cleanup_trap, called from main() BEFORE the lock is acquired). It serves
-# THREE independent responsibilities, each gated on its own flag, so they never
-# clobber one another the way separate `trap`/`trap -` pairs would under bash 3.2:
+# install_cleanup_trap, called from main()/begin_mutating_mode BEFORE the lock is
+# acquired). It serves FIVE independent responsibilities, each gated on its own flag,
+# so they never clobber one another the way separate `trap`/`trap -` pairs would
+# under bash 3.2:
 #   1. PROBE_ACTIVE  — revert an interrupted macOS TCC rename-probe (B2).
 #   2. RELOCATE_ACTIVE — print the mid-relocate recovery message (B3): if the shell
 #      exits between renaming the original aside and creating the replacement
 #      symlink, the tree is in a recoverable-but-confusing half-state; show plainly
 #      where the data is so the user never panics or deletes the wrong thing.
-#   3. LOCK_OWNED — release the concurrency lock (#5c) on EVERY exit path (success,
+#   3. OFFLOAD_ACTIVE — print the mid-offload-drop recovery message (slice 2): the
+#      cloud copy is already read-back-verified, so recovery = re-run --offload or
+#      --hydrate; the local container may be partially removed.
+#   4. MIGRATE_ACTIVE — print the mid-Projects-migration recovery message (slice 2):
+#      the cloud copy is untouched and the original symlink is moved aside, so the
+#      half-finished local copy is fully recoverable.
+#   5. LOCK_OWNED — release the concurrency lock (#5c) on EVERY exit path (success,
 #      die/error, INT/TERM) so a crash never strands a stale lock.
-# All three windows are apply-mode-only (relocate's probe/recovery code and the
-# lock are only armed when DRY_RUN=0), so a dry-run Ctrl-C prints nothing spurious.
+# All these windows are apply-mode-only (the probe/recovery code and the lock are
+# only armed when DRY_RUN=0), so a dry-run Ctrl-C prints nothing spurious.
 #
 # CRITICAL (PR #11 remediation): the flags this reads are raised inside relocate_dir,
 # which MUST run in the same shell as this handler. main()'s redirect loop is fed by
@@ -176,6 +206,21 @@ cleanup_handler() {
     warn "  cloud copy: '$RELOCATE_DST'"
     warn "  the symlink '$RELOCATE_SRC' may not exist yet. Re-run to finish. Delete NOTHING until verified."
     RELOCATE_ACTIVE=0
+  fi
+  if [ "${OFFLOAD_ACTIVE:-0}" -eq 1 ]; then
+    warn "INTERRUPTED mid-offload-drop — your data is SAFE:"
+    warn "  cloud copy (read-back-verified): '$OFFLOAD_REMOTE'"
+    warn "  local '$OFFLOAD_SRC' may be partially removed. Re-run --offload to finish,"
+    warn "  or --hydrate to restore it. Delete NOTHING by hand until verified."
+    OFFLOAD_ACTIVE=0
+  fi
+  if [ "${MIGRATE_ACTIVE:-0}" -eq 1 ]; then
+    warn "INTERRUPTED mid-Projects-migration — your data is SAFE:"
+    warn "  cloud copy (untouched): '$MIGRATE_CLOUD'"
+    warn "  original symlink moved aside to '$MIGRATE_ASIDE' (restore it to undo)."
+    warn "  local '$MIGRATE_SRC' may be a partial copy. Re-run --migrate-projects to finish."
+    warn "  Delete NOTHING by hand until verified."
+    MIGRATE_ACTIVE=0
   fi
   if [ "${LOCK_OWNED:-0}" -eq 1 ] && [ -n "${LOCK_DIR:-}" ]; then
     rmdir "$LOCK_DIR" 2>/dev/null || true
@@ -269,8 +314,15 @@ Modes (default with no mode flag = the provision/symlink lane above; exactly one
 lane per run — combining a mode with the default flags is refused):
   --classify             Report the class of every known ~/ entry (read-only).
   --offload-status       Report which code dirs are offloaded vs local (read-only).
-  (reserved, not yet implemented in this build: --migrate-projects, --offload,
-   --hydrate, --dotfiles-init, --dotfiles-track, --dotfiles-status)
+  --offload <dir>        Push a CODE dir to the rclone remote, verify, then free local
+                         space (dry-run unless --apply). git = source of truth.
+  --hydrate <dir>        Restore a previously offloaded CODE dir from the remote.
+  --migrate-projects     Restore a previously cloud-symlinked ~/Projects to a real
+                         local dir (non-destructive; dry-run unless --apply).
+  --code-remote NAME     rclone remote for offload (default: gdrive).
+  --code-dest PATH       Path inside the remote (default: xdg-offload/code).
+  --aside                Offload: move local aside + re-verify before rm (extra safety).
+  (reserved, not yet implemented: --dotfiles-init, --dotfiles-track, --dotfiles-status)
 
 Nothing is moved without --apply --relocate together.
 EOF
@@ -286,7 +338,6 @@ set_mode() {
 # Args
 # ---------------------------------------------------------------------------
 while [ $# -gt 0 ]; do
-  # shellcheck disable=SC2034   # MODE_ARG (set by reserved value-taking modes) is read by a later slice
   case "$1" in
     --apply)              DRY_RUN=0 ;;
     --relocate)           DO_RELOCATE=1 ;;
@@ -295,6 +346,9 @@ while [ $# -gt 0 ]; do
     --fast-verify)        FAST_VERIFY=1 ;;
     --style)              shift; STYLE="${1:?--style needs xdg|mac}" ;;
     --cloud-root)         shift; CLOUD_ROOT="${1:?--cloud-root needs a path}" ;;
+    --code-remote)        shift; CODE_REMOTE="${1:?--code-remote needs a name}" ;;
+    --code-dest)          shift; CODE_DEST="${1:?--code-dest needs a path}" ;;
+    --aside)              OFFLOAD_ASIDE=1 ;;
     # --- read-only report modes (slice 1, implemented) ---
     --classify)           set_mode classify ;;
     --offload-status)     set_mode offload-status ;;
@@ -862,7 +916,7 @@ classify_one() {
   # A code dir that is currently a cloud symlink is the P2 case the (reserved)
   # --migrate-projects mode will later restore to a real local dir.
   if [ "$class" = "code" ] && [ -L "$target" ]; then
-    printf '%-6s %-22s %s\n' "" "" "(cloud-symlinked; --migrate-projects is reserved, not yet implemented)"
+    printf '%-6s %-22s %s\n' "" "" "(cloud-symlinked; restore to a local dir with --migrate-projects)"
   fi
 }
 
@@ -915,6 +969,289 @@ cmd_offload_status() {
       printf '%-6s %-22s %s\n' "code" "$name" "local${githint}"
     fi
   done
+}
+
+# ---------------------------------------------------------------------------
+# Offload-on-demand (slice 2) — the rclone REMOTE lane. Push a CODE container to a
+# remote, read-back-verify it, then free local space. git is the source of truth, so
+# the local drop is gated on per-repo git guards + an INDEPENDENT read-back. CRITICAL
+# data-loss surface: the rm is reachable ONLY after every guard AND the read-back pass.
+# ---------------------------------------------------------------------------
+
+# Arm the shared safety machinery for a mutating subcommand mode (offload/hydrate/
+# migrate). guard_not_root always; trap before lock (PR#11 order); acquire_lock is
+# apply-only (dry-run no-op), so dry-run previews need no lock.
+begin_mutating_mode() { guard_not_root; install_cleanup_trap; acquire_lock; }
+
+# Resolve MODE_ARG (a canonical CODE key OR its platform local name) to (canonical,
+# container path). REFUSE anything not CODE-class — the venv/machine-local data-loss
+# guard: offloading a venv or an abs-path dir would re-hydrate broken.
+resolve_code_target() {        # sets caller-scoped: canonical, container
+  local arg="$1" k nm
+  canonical=""; container=""
+  # shellcheck disable=SC2086   # intentional word-split of the space-separated key list
+  for k in $CODE_KEYS; do
+    nm="$(local_name "$(field "$(code_row "$k")" 2)" "$(field "$(code_row "$k")" 3)")"
+    if [ "$arg" = "$k" ] || [ "$arg" = "$nm" ]; then canonical="$k"; container="$HOME/$nm"; return 0; fi
+  done
+  is_machine_local "$arg" && die "$arg is machine-local (never offloads — venvs/abs-paths break)."
+  die "$arg is not a known CODE dir (offload-eligible: $CODE_KEYS). Refusing."
+}
+
+# cloud-xdg's rclone precondition. Wraps the lib's parameterized rclone_remote_exists()
+# with cloud-xdg's CODE_REMOTE + its own message (home-tree keeps its own require_rclone;
+# do NOT byte-copy — message + config var diverge, per the dedup rule).
+require_code_rclone() {
+  rclone_remote_exists "$CODE_REMOTE" && return 0
+  die "rclone remote '$CODE_REMOTE:' not available. Install rclone + 'rclone config' to create
+  it, or pass --code-remote NAME. Code offload uses an rclone REMOTE (only a remote frees space)."
+}
+
+# Echo the git work tree(s) for a CODE container. If the container is itself a git repo,
+# it is the sole unit; else its immediate subdirs (depth 1) that are git work trees.
+# bash 3.2: an unmatched glob stays literal, guarded by [ -d ].
+offload_repos_in() {
+  local base="$1" d
+  if git -C "$base" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    printf '%s\n' "$base"; return 0
+  fi
+  for d in "$base"/*/; do
+    [ -d "$d" ] || continue
+    d="${d%/}"
+    git -C "$d" rev-parse --is-inside-work-tree >/dev/null 2>&1 && printf '%s\n' "$d"
+  done
+}
+
+# G2: clean working tree (no staged/unstaged/untracked).
+g2_clean()    { [ -z "$(git -C "$1" status --porcelain 2>/dev/null)" ]; }
+# G4: no stashes (a clean tree can still hide them; stashes are never pushed).
+g4_no_stash() { [ -z "$(git -C "$1" stash list 2>/dev/null)" ]; }
+
+# G3: emit a human line per branch that BLOCKS offload (no upstream, or ahead of it).
+# Empty output => every local branch is fully pushed. bash 3.2: for-each-ref + while read;
+# @{u} resolved with an rc check so a missing upstream is a REFUSAL line, never a set -e
+# abort. Pipe->subshell is fine here (read-only; we consume the echoed lines, not a flag).
+g3_unpushed() {
+  local d="$1" up n
+  git -C "$d" for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null \
+  | while IFS= read -r b; do
+      up="$(git -C "$d" rev-parse --abbrev-ref "${b}@{u}" 2>/dev/null || true)"
+      if [ -z "$up" ]; then printf '    branch %s has no upstream\n' "$b"; continue; fi
+      n="$(git -C "$d" rev-list --count "${b}@{u}..${b}" 2>/dev/null || printf '?')"
+      [ "$n" = "0" ] || printf '    branch %s is ahead of %s by %s commit(s)\n' "$b" "$up" "$n"
+    done
+}
+
+# Aggregate G2/G3/G4 for one repo. Echo blocker lines; empty => safe (after G5 verify).
+# (G1 is implied: offload_repos_in only yields git work trees.)
+repo_offload_blockers() {
+  local d="$1" out=""
+  g2_clean    "$d" || out="${out}    uncommitted or untracked changes (git status not clean)
+"
+  out="${out}$(g3_unpushed "$d")"
+  g4_no_stash "$d" || out="${out}
+    stashes present (git stash list non-empty)"
+  printf '%s' "$out"
+}
+
+# Warn if the container holds content outside any discovered git repo — that content has
+# only the (verified) cloud copy as a net, no git fallback. Recommend --aside.
+warn_loose_content() {
+  local base="$1" e
+  git -C "$base" rev-parse --is-inside-work-tree >/dev/null 2>&1 && return 0  # whole dir is one repo
+  for e in "$base"/* "$base"/.[!.]*; do
+    [ -e "$e" ] || continue
+    if [ -d "$e" ] && git -C "$e" rev-parse --is-inside-work-tree >/dev/null 2>&1; then continue; fi
+    warn "$base holds content outside any git repo — only the (verified) cloud copy"
+    warn "  will back it up. Consider --aside for a local safety copy first."
+    return 0
+  done
+}
+
+# Detect large regenerable build dirs in the push (v1 copies them faithfully — an rclone
+# exclude-filter is DEFERRED to v2). Warn loudly so the user understands the upload SIZE.
+warn_regenerable() {
+  local base="$1" hit
+  hit="$(find "$base" \( -name node_modules -o -name .gradle -o -name build -o -name __pycache__ \) \
+          -type d -prune -print 2>/dev/null | head -n 20)"
+  [ -z "$hit" ] && return 0
+  warn "large regenerable dirs are INCLUDED in this push (v1 copies them faithfully — no filter yet):"
+  printf '%s\n' "$hit" | sed 's/^/    /' >&2
+  warn "  This inflates upload size/quota, but offload STILL frees the local space. A v2 rclone"
+  warn "  exclude-filter will skip these. Use --aside if you want a local safety copy first."
+}
+
+# Write the per-container offload record. key=value lines (parseable via grep+cut — matches
+# cmd_offload_status's `remote=` reader). Built with printf, NO backticks anywhere (team
+# footgun: backticks inside a quoted/heredoc string can execute at parse time).
+write_offload_state() {
+  local key="$1" remote="$2" src="$3" sf stamp
+  sf="$XDG_STATE_HOME/xdg-cloud/offloaded/$key"
+  stamp="$(date +%Y-%m-%dT%H:%M:%S)"
+  mkdir -p "$XDG_STATE_HOME/xdg-cloud/offloaded"
+  { printf 'remote=%s\n' "$remote"
+    printf 'source=%s\n' "$src"
+    printf 'offloaded_at=%s\n' "$stamp"; } > "$sf"
+}
+
+# --offload <dir>: push a CODE container to the remote, read-back-verify, then free local.
+cmd_offload() {                # $1 = MODE_ARG (canonical or local name)
+  begin_mutating_mode
+  local canonical container dest repos repo b any_block blockers
+  resolve_code_target "$1"     # sets canonical, container (refuses non-CODE)
+  require_code_rclone
+  [ -d "$container" ] || die "$container does not exist (nothing to offload)."
+  dest="$CODE_REMOTE:$CODE_DEST/$canonical"
+
+  warn_regenerable "$container"
+  warn_loose_content "$container"
+
+  repos="$(offload_repos_in "$container")"
+  [ -n "$repos" ] || warn "no git repos found under $container — only the verified cloud copy backs it up."
+
+  # Per-repo fail-closed guard scan. Collect blockers; name them (here-doc, parent shell).
+  any_block=0; blockers=""
+  while IFS= read -r repo; do
+    [ -z "$repo" ] && continue
+    b="$(repo_offload_blockers "$repo")"
+    [ -n "$b" ] && { any_block=1; blockers="${blockers}  BLOCK: ${repo}
+${b}
+"; }
+  done <<EOF
+$repos
+EOF
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "Offload plan for $container -> $dest (dry-run — touches nothing):"
+    while IFS= read -r repo; do
+      [ -z "$repo" ] && continue
+      b="$(repo_offload_blockers "$repo")"
+      if [ -n "$b" ]; then printf '  WOULD BLOCK: %s\n%s\n' "$repo" "$b"
+      else printf '  would offload: %s\n' "$repo"; fi
+    done <<EOF
+$repos
+EOF
+    if [ "$any_block" -eq 1 ]; then
+      warn "one or more repos block offload (commit/push/clear stashes), then re-run."
+    else
+      info "would rclone copy $container -> $dest"
+      info "would free local $container (re-run with --apply to act)"
+    fi
+    return 0
+  fi
+
+  # --- apply mode (mutating) ---
+  [ "$any_block" -eq 0 ] || die "refusing to offload $container — blocking repos:
+${blockers}Fix them (commit/push/clear stashes), then re-run."
+
+  run rclone copy --immutable "$container" "$dest" --progress
+  # G5 GATE: an INDEPENDENT read-back (not the copy rc) proves DURABLE upload before any rm.
+  rclone check --download --one-way "$container" "$dest" \
+    || die "post-copy read-back verify FAILED for $container -> $dest. Nothing dropped. Retry."
+  write_offload_state "$canonical" "$dest" "$container"
+
+  # DATA-LOSS GUARD (SC2115): never rm a degenerate path.
+  case "$container" in
+    ""|"/"|"$HOME") die "internal: refusing rm of unsafe path '$container'" ;;
+  esac
+  [ -n "$(ls -A "$container" 2>/dev/null)" ] || { warn "$container already empty; nothing to drop."; return 0; }
+
+  # The drop window: straight-line in the PARENT shell so OFFLOAD_ACTIVE reaches the
+  # master cleanup_handler (no pipe/subshell — R2 ADR rule).
+  OFFLOAD_ACTIVE=1; OFFLOAD_SRC="$container"; OFFLOAD_REMOTE="$dest"
+  if [ "$OFFLOAD_ASIDE" -eq 1 ]; then
+    local stamp aside n
+    stamp="$(date +%Y%m%d-%H%M%S)"; aside="${container}.pre-offload-${stamp}"
+    n=1; while [ -e "$aside" ] || [ -L "$aside" ]; do aside="${container}.pre-offload-${stamp}.${n}"; n=$((n + 1)); done
+    mv "$container" "$aside"
+    rclone check --download --one-way "$aside" "$dest" \
+      || die "re-verify of aside vs remote FAILED — kept '$aside', dropped nothing else."
+    rm -rf "$aside"
+  else
+    rm -rf "$container"
+  fi
+  OFFLOAD_ACTIVE=0
+  info "Offloaded $container -> $dest. Restore with: $SELF --hydrate $canonical --apply"
+}
+
+# --hydrate <dir>: restore a previously offloaded CODE container from the remote.
+cmd_hydrate() {                # $1 = MODE_ARG (canonical or local name)
+  begin_mutating_mode
+  local canonical container sf sentinel remote
+  resolve_code_target "$1"     # refuses non-CODE
+  require_code_rclone
+  sf="$XDG_STATE_HOME/xdg-cloud/offloaded/$canonical"
+  [ -f "$sf" ] || die "$container is not recorded as offloaded (no $sf)."
+  sentinel="$sf.hydrating"
+  [ -f "$sentinel" ] && warn "a previous hydrate of $canonical was interrupted; re-running."
+  remote="$(grep '^remote=' "$sf" 2>/dev/null | cut -d= -f2- || true)"
+  [ -n "$remote" ] || die "state file $sf has no remote= line; refusing."
+  # refuse to clobber an existing non-empty local dir:
+  if [ -e "$container" ] && [ -n "$(ls -A "$container" 2>/dev/null)" ]; then
+    die "$container exists and is non-empty; refusing to overwrite. Move it aside first."
+  fi
+  [ "$DRY_RUN" -eq 0 ] || { info "[dry-run] would hydrate $container from $remote"; return 0; }
+  : > "$sentinel"                                   # mark BEFORE pull (self-detect a crash)
+  run rclone copy --checksum "$remote" "$container" --progress
+  rclone check --download --one-way "$remote" "$container" \
+    || die "post-pull verify FAILED — left sentinel '$sentinel'; re-run --hydrate."
+  rm -f "$sentinel"; rm -f "$sf"                    # clear ONLY on verified success
+  info "Hydrated $container from $remote."
+  info "Alt for fully-pushed repos: 'git clone <remote-url>' is the canonical, self-verifying restore."
+}
+
+# --migrate-projects: restore a previously cloud-symlinked ~/Projects to a real local
+# dir (slice-1 §3 algorithm). NON-DESTRUCTIVE: the cloud copy and the moved-aside symlink
+# are ALWAYS retained — this command removes NOTHING. Dry-run default; --apply to act.
+cmd_migrate_projects() {
+  begin_mutating_mode
+  resolve_cloud_root
+  normalize_cloud_root
+  local localpath target copier stamp aside n
+  localpath="$HOME/Projects"   # local_name(Projects,Projects) = Projects on both OSes
+  # (a) absent
+  if [ ! -e "$localpath" ] && [ ! -L "$localpath" ]; then
+    info "no $localpath to migrate."; return 0
+  fi
+  # (b) already a real local dir
+  if [ -d "$localpath" ] && [ ! -L "$localpath" ]; then
+    info "$localpath is already a local dir."; return 0
+  fi
+  # (c) a symlink — the P2 case
+  if [ -L "$localpath" ]; then
+    target="$(readlink "$localpath")"
+    if [ ! -d "$target" ]; then
+      warn "$localpath -> '$target' is dangling; leaving it untouched."; return 0
+    fi
+    case "$target" in
+      "$CLOUD_ROOT"/*|"$HOME"/Library/CloudStorage/*|"$HOME"/Library/Mobile\ Documents/*) : ;;
+      *) warn "$localpath -> '$target' is not under the cloud mount; leaving it untouched."; return 0 ;;
+    esac
+    if command -v rsync >/dev/null 2>&1; then copier="rsync -a"; else copier="cp -a"; fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "[dry-run] would move the $localpath symlink aside, mkdir a real local dir there,"
+      info "[dry-run]   copy '$target' -> $localpath ($copier), verify, and RETAIN the cloud copy + aside link."
+      return 0
+    fi
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    aside="${localpath}.cloud-symlink.${stamp}"
+    n=1; while [ -e "$aside" ] || [ -L "$aside" ]; do aside="${localpath}.cloud-symlink.${stamp}.${n}"; n=$((n + 1)); done
+    # Mutating window: flag BEFORE the mv so an interrupt leaves a recoverable state.
+    MIGRATE_ACTIVE=1; MIGRATE_SRC="$localpath"; MIGRATE_ASIDE="$aside"; MIGRATE_CLOUD="$target"
+    run mv "$localpath" "$aside"          # moves the LINK, not the data
+    run mkdir "$localpath"                # fresh real local dir
+    if [ "$copier" = "rsync -a" ]; then run rsync -a "$target/" "$localpath/"
+    else run cp -a "$target/." "$localpath/"; fi
+    verify_copy "$target" "$localpath" "$copier" \
+      || die "post-copy verify FAILED for $target -> $localpath.
+  Kept the aside symlink '$aside' and the cloud copy '$target' — removed NOTHING. Retry."
+    MIGRATE_ACTIVE=0
+    info "$localpath is now a real local dir (copied from the cloud)."
+    info "RETAINED: cloud copy at '$target' and the old symlink at '$aside'."
+    info "Delete '$aside' ONLY after you've confirmed $localpath is correct."
+    return 0
+  fi
+  warn "$localpath is neither a directory nor a symlink; leaving it untouched."
 }
 
 # ---------------------------------------------------------------------------
@@ -986,8 +1323,11 @@ dispatch_mode() {
   case "$MODE" in
     classify)         cmd_classify ;;
     offload-status)   cmd_offload_status ;;
-    migrate-projects|offload|hydrate|dotfiles-init|dotfiles-track|dotfiles-status)
-        die "mode '--$MODE' is reserved but not implemented in this build (slice 1 = classification + read-only reporting)." ;;
+    offload)          cmd_offload   "$MODE_ARG" ;;
+    hydrate)          cmd_hydrate   "$MODE_ARG" ;;
+    migrate-projects) cmd_migrate_projects ;;
+    dotfiles-init|dotfiles-track|dotfiles-status)
+        die "mode '--$MODE' is reserved but not implemented in this build (dotfiles = a later slice)." ;;
     *)                die "internal: unknown mode '$MODE'" ;;
   esac
 }
