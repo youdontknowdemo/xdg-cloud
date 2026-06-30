@@ -68,7 +68,7 @@ make install
 
 | Platform | `cloud-xdg-provision.sh` | `home-tree.sh` |
 |----------|--------------------------|----------------|
-| **macOS** | Auto-detects `~/Library/CloudStorage/GoogleDrive-*/My Drive` as the cloud root. `rsync` preferred for `--relocate` (falls back to `cp -a`). | Detects the Drive mount for info only; backups always go through `rclone` for lock-safe behavior. `rclone` required for `--sync`/`--bisync`. |
+| **macOS** | Auto-detects `~/Library/CloudStorage/GoogleDrive-*/My Drive` as the cloud root, falling back to iCloud Drive (`~/Library/Mobile Documents/com~apple~CloudDocs`) when no Google Drive mount is present. `rsync` preferred for `--relocate` (falls back to `cp -a`). | Detects the Drive mount for info only; backups always go through `rclone` for lock-safe behavior. `rclone` required for `--sync`/`--bisync`. |
 | **Linux** | **`--cloud-root` / `CLOUD_ROOT` is mandatory** (no auto-detect) — point it at your rclone / google-drive-ocamlfuse / insync mount. Writes `$XDG_CONFIG_HOME/user-dirs.dirs`. | `rclone` required for backups. |
 | **Termux/Android** | Same as Linux — `CLOUD_ROOT` mandatory. `pkg install rclone make`. | `pkg install rclone make`. |
 
