@@ -547,6 +547,55 @@ else
   echo "smoke: #4 multiple Google Drive mounts — SKIPPED (auto-detect is macOS-only)"
 fi
 
+# --- Issue #20: iCloud Drive auto-detect as a FALLBACK. When NO Google Drive
+#     mount exists, resolve_cloud_root() falls back to iCloud Drive at
+#     ~/Library/Mobile Documents/com~apple~CloudDocs. Google Drive stays primary:
+#     when both are present, GD still wins (iCloud is reached only in the count==0
+#     branch). macOS-gated, matching the #4 harness — the auto-detect is macOS-only. ---
+if [ "$(uname -s)" = "Darwin" ]; then
+  icloud_rel="Library/Mobile Documents/com~apple~CloudDocs"
+
+  # 20a: iCloud present, NO Google Drive → fall back to iCloud, exit 0, banner shows it.
+  echo "smoke: #20a — iCloud Drive is auto-detected when no Google Drive mount exists"
+  i20h="${sandbox}/i20-home-icloud"
+  mkdir -p "${i20h}/${icloud_rel}"
+  set +e
+  out="$(HOME="${i20h}" /bin/bash "${PROV}" 2>&1)"   # dry-run, no --cloud-root → auto-detect
+  rc=$?
+  set -e
+  pass_if "${rc}" "iCloud-only auto-detect resolves cleanly (exit 0)" \
+    "iCloud fallback auto-detect failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "com~apple~CloudDocs" "iCloud Drive path is used as the cloud root"
+
+  # 20b: BOTH iCloud and a single Google Drive present → Google Drive still wins.
+  echo "smoke: #20b — Google Drive stays primary when both Google Drive and iCloud exist"
+  i20b="${sandbox}/i20-home-both"
+  mkdir -p "${i20b}/Library/CloudStorage/GoogleDrive-me@x.com/My Drive"
+  mkdir -p "${i20b}/${icloud_rel}"
+  set +e
+  out="$(HOME="${i20b}" /bin/bash "${PROV}" 2>&1)"   # dry-run
+  rc=$?
+  set -e
+  pass_if "${rc}" "both-present run auto-detects cleanly (exit 0)" \
+    "both-present auto-detect failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "GoogleDrive-me@x.com/My Drive" "Google Drive wins when both are present"
+  assert_not_contains "${out}" "com~apple~CloudDocs" "iCloud is NOT chosen while a Google Drive mount exists"
+
+  # 20c: neither present → updated die naming BOTH options, non-zero exit.
+  echo "smoke: #20c — neither Google Drive nor iCloud present dies naming both options"
+  i20c="${sandbox}/i20-home-neither"
+  mkdir -p "${i20c}/Library"   # a HOME with neither provider dir
+  set +e
+  out="$(HOME="${i20c}" /bin/bash "${PROV}" 2>&1)"   # dry-run
+  rc=$?
+  set -e
+  assert_nonzero "${rc}" "no-provider auto-detect exits non-zero"
+  assert_contains "${out}" "No Google Drive or iCloud Drive found" "die names both Google Drive and iCloud"
+  assert_contains "${out}" "--cloud-root" "no-provider die tells the user to pass --cloud-root"
+else
+  echo "smoke: #20 iCloud Drive fallback auto-detect — SKIPPED (auto-detect is macOS-only)"
+fi
+
 # --- Issue #5c: concurrency lock. A second run is refused while the lock dir
 #     exists; a normal run releases it (no stale lock left behind). XDG_CACHE_HOME
 #     is set explicitly so the lock path is deterministic regardless of the outer

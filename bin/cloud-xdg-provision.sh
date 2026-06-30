@@ -52,7 +52,9 @@ xdg_init_base_defaults   # populate XDG_{CONFIG,DATA,STATE,CACHE}_HOME from env/
 # Config — override via environment.
 # ---------------------------------------------------------------------------
 # CLOUD_ROOT = the cloud-resident user-data home (the "~" inside your drive).
-#   macOS: auto-detected as "~/Library/CloudStorage/GoogleDrive-*/My Drive" if unset.
+#   macOS: auto-detected as "~/Library/CloudStorage/GoogleDrive-*/My Drive" if unset,
+#          falling back to iCloud Drive ("~/Library/Mobile Documents/com~apple~CloudDocs")
+#          when no Google Drive mount is present.
 #   Linux/Termux: you MUST set CLOUD_ROOT to wherever the drive is mounted
 #                 (rclone mount, google-drive-ocamlfuse, insync, etc.).
 : "${CLOUD_ROOT:=}"
@@ -303,12 +305,23 @@ resolve_cloud_root() {
       candidates="${candidates}    $d/My Drive
 "
     done
-    if [ "$count" -eq 0 ]; then
-      die "No Google Drive mount found. Pass --cloud-root PATH."
-    fi
     if [ "$count" -gt 1 ]; then
       die "Multiple Google Drive mounts found — refusing to guess which one you mean:
 ${candidates}  Pass --cloud-root PATH to choose one explicitly."
+    fi
+    if [ "$count" -eq 0 ]; then
+      # Issue #20: no Google Drive mount — fall back to iCloud Drive. This is a
+      # FALLBACK only; whenever a Google Drive mount exists (count>=1 above) it
+      # wins and we never reach here, so behaviour with GD present is unchanged.
+      # The literal below MUST match the iCloud prefix that cloud_root_is_live()
+      # recognises at the B4 liveness check ("$HOME"/Library/Mobile Documents/*),
+      # so an auto-detected iCloud root passes B4 without --allow-local-root.
+      local icloud_root="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
+      if [ -d "$icloud_root" ]; then
+        CLOUD_ROOT="$icloud_root"
+        return 0
+      fi
+      die "No Google Drive or iCloud Drive found. Pass --cloud-root PATH."
     fi
     CLOUD_ROOT="$first"
     return 0
