@@ -1089,4 +1089,139 @@ else
   fail "SAFE_DIRS drifted: got '${actual_safe}' (locks §6 filter coupling — investigate before changing)"
 fi
 
+# --- #12 (M-d): acquire_lock must distinguish a genuine concurrent lock from an
+#     UNWRITABLE $XDG_CACHE_HOME. The old code reported BOTH as "another run is in
+#     progress". Here the cache dir EXISTS but is read-only, so the lock mkdir fails
+#     for a non-lock reason → the new accurate message must appear and the misleading
+#     "another run" message must NOT. Gated on this host actually enforcing read-only
+#     dir perms for the owner (skipped under root / a permissive FS). ---
+echo "smoke: #12 (M-d) — unwritable cache reported distinctly, not as 'another run in progress'"
+mdh="${sandbox}/md-home"; mdc="${sandbox}/md-cloud"; mdcache="${mdh}/.cache"
+mkdir -p "${mdcache}" "${mdc}"
+mdprobe="${sandbox}/md-permprobe"; mkdir -p "${mdprobe}"; chmod 0500 "${mdprobe}"
+if mkdir "${mdprobe}/cannot" 2>/dev/null; then
+  rmdir "${mdprobe}/cannot" 2>/dev/null || true
+  chmod 0700 "${mdprobe}" 2>/dev/null || true
+  echo "  SKIP: #12 — this host does not enforce read-only dir perms for the owner (root/permissive FS)"
+else
+  chmod 0500 "${mdcache}"   # cache exists but is read-only → lock mkdir fails (not a pre-existing lock)
+  set +e
+  out="$(HOME="${mdh}" XDG_CACHE_HOME="${mdcache}" /bin/bash "${PROV}" \
+    --cloud-root "${mdc}" --apply --allow-local-root 2>&1)"
+  rc=$?
+  set -e
+  chmod 0700 "${mdcache}" 2>/dev/null || true   # restore so the EXIT-trap rm -rf can clean up
+  chmod 0700 "${mdprobe}" 2>/dev/null || true
+  assert_nonzero "${rc}" "apply is refused when the cache dir is unwritable"
+  assert_contains "${out}" "cannot create lock dir" "unwritable cache gives the accurate perms error"
+  assert_not_contains "${out}" "another run is in progress" "unwritable cache is NOT misreported as a concurrent run"
+fi
+
+# --- #13 (M-e): write_user_dirs' backup-name collision loop now tests -e OR -L, so a
+#     DANGLING symlink at the first .bak path is detected and the uniquifier advances
+#     (the old -e-only check saw a dangling link as "missing" and cp would clobber
+#     THROUGH it). uname-shim forces the Linux user-dirs.dirs path; date-shim pins the
+#     stamp so the .bak name is deterministic. ---
+echo "smoke: #13 (M-e) — dangling symlink at the backup path advances the uniquifier"
+meh="${sandbox}/me-home"; mec="${sandbox}/me-cloud"; meshim="${sandbox}/me-shim"
+mecfg="${meh}/.config"; mecache="${meh}/.cache"
+mkdir -p "${mecfg}" "${mecache}" "${mec}" "${meshim}"
+cat > "${meshim}/uname" <<'UNAMESH'
+#!/bin/sh
+case "$1" in
+  -s) echo "Linux" ;;
+  *) exec /usr/bin/uname "$@" ;;
+esac
+UNAMESH
+cat > "${meshim}/date" <<'DATESH'
+#!/bin/sh
+case "$1" in
+  +%Y%m%d-%H%M%S) echo "20260101-120000" ;;
+  *) exec /bin/date "$@" ;;
+esac
+DATESH
+chmod +x "${meshim}/uname" "${meshim}/date"
+printf 'XDG_DOCUMENTS_DIR="/old/hand/tuned"\n' > "${mecfg}/user-dirs.dirs"
+mestamp="20260101-120000"
+medangling="${mecfg}/user-dirs.dirs.bak-${mestamp}"
+ln -s "${sandbox}/no-such-target" "${medangling}"   # a DANGLING symlink at the first .bak name
+set +e
+out="$(HOME="${meh}" XDG_CONFIG_HOME="${mecfg}" XDG_CACHE_HOME="${mecache}" \
+  PATH="${meshim}:${PATH}" /bin/bash "${PROV}" \
+  --cloud-root "${mec}" --apply --allow-local-root 2>&1)"
+rc=$?
+set -e
+if [ "${rc}" -eq 0 ]; then
+  if [ -f "${medangling}.1" ]; then
+    ok "backup advanced to .bak-<stamp>.1 (dangling symlink at .bak-<stamp> was detected)"
+  else
+    fail "backup did not advance past the dangling symlink (-e || -L collision check)"
+  fi
+  if [ -L "${medangling}" ]; then
+    ok "the dangling symlink was left intact (not followed/overwritten)"
+  else
+    fail "the dangling symlink at the backup path was clobbered"
+  fi
+  if grep -q '/old/hand/tuned' "${medangling}.1"; then
+    ok ".1 backup preserved the original hand-tuned content"
+  else
+    fail ".1 backup did not preserve the original content"
+  fi
+else
+  echo "  SKIP: #13 — shimmed-Linux apply path unstable on this host (exit ${rc})"
+fi
+
+# --- #15 (M-g): the deny-delete ACL gate now matches `deny` AND `delete` on the SAME
+#     ACE line via acl_denies_delete (a here-doc loop — a `case` inside `$(...)` would
+#     fail to PARSE under stock bash 3.2). Two directions via an `ls -lde` shim, in
+#     dry-run --relocate (the ACL gate runs before any DRY_RUN guard, so no real moves
+#     happen): a COMPOUND ACE ('deny write,delete') that the old substring would MISS
+#     is now caught (gate returns before the "RELOCATE" line); a benign 'deny write'
+#     ACE is NOT mistaken for it (relocate proceeds). macOS-only (the gate is
+#     PLATFORM=macos). ---
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo "smoke: #15 (M-g) — deny-delete ACL detection (compound caught; benign not over-matched)"
+  mgshim="${sandbox}/mg-shim"; mkdir -p "${mgshim}"
+  mg_set_acl() {   # $1 = the ACE rights text embedded in the shimmed `ls -lde` output
+    cat > "${mgshim}/ls" <<LSSH
+#!/bin/sh
+if [ "\$1" = "-lde" ]; then
+  printf '%s\n' "drwx------+ 2 me staff 64 Jan 1 00:00 \$2"
+  printf '%s\n' " 0: group:everyone $1"
+  exit 0
+fi
+exec /bin/ls "\$@"
+LSSH
+    chmod +x "${mgshim}/ls"
+  }
+  # (a) compound, reordered deny ACE — the old "deny delete" substring would miss it.
+  mga_h="${sandbox}/mg-a-home"; mga_c="${sandbox}/mg-a-cloud"
+  mkdir -p "${mga_h}/Documents" "${mga_c}"; printf 'PAYLOAD\n' > "${mga_h}/Documents/keep.txt"
+  mg_set_acl "deny write,delete"
+  set +e
+  out="$(HOME="${mga_h}" PATH="${mgshim}:${PATH}" /bin/bash "${PROV}" \
+    --cloud-root "${mga_c}" --relocate --allow-local-root 2>&1)"
+  rc=$?
+  set -e
+  pass_if "${rc}" "dry-run --relocate over a compound deny-delete ACE exits 0" \
+    "compound-ACE dry-run failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "deny delete' ACL" "compound 'deny write,delete' ACE IS detected (robustness over substring)"
+  assert_not_contains "${out}" "RELOCATE  " "detected ACL blocks the relocate (gate returns before the RELOCATE line)"
+  # (b) benign 'deny write' (no delete) — must NOT be mistaken for deny-delete.
+  mgb_h="${sandbox}/mg-b-home"; mgb_c="${sandbox}/mg-b-cloud"
+  mkdir -p "${mgb_h}/Documents" "${mgb_c}"; printf 'PAYLOAD\n' > "${mgb_h}/Documents/keep.txt"
+  mg_set_acl "deny write"
+  set +e
+  out="$(HOME="${mgb_h}" PATH="${mgshim}:${PATH}" /bin/bash "${PROV}" \
+    --cloud-root "${mgb_c}" --relocate --allow-local-root 2>&1)"
+  rc=$?
+  set -e
+  pass_if "${rc}" "dry-run --relocate over a benign deny-write ACE exits 0" \
+    "benign-ACE dry-run failed (exit ${rc}): ${out}"
+  assert_not_contains "${out}" "deny delete' ACL" "benign 'deny write' ACE is NOT mistaken for deny-delete"
+  assert_contains "${out}" "RELOCATE  " "benign ACE proceeds past the ACL gate into the relocate flow"
+else
+  echo "  SKIP: #15 (M-g) — ACL deny-delete gate is macOS-only (uname=$(uname -s))"
+fi
+
 echo "smoke: PASS"

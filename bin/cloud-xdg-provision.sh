@@ -104,7 +104,7 @@ LOCK_OWNED=0
 #   redirect  : 1 = eligible to symlink local->cloud, 0 = create only
 #               (downloads is redirect=1 but EXCEPTIONALLY off by default — its
 #               extra REDIRECT_DOWNLOADS gate in redirect_one keeps it create-only
-#               until --redirect-downloads is passed. See is_redirected().)
+#               until --redirect-downloads is passed. See should_redirect().)
 # Derived from the canonical registry in the shared lib (xdg_offload_set emits the
 # CLOUDXDG_KEYS rows in order — identical to the old literal, sans the blank lines
 # every consumer already skips with `[ -z "$line" ] && continue`).
@@ -211,13 +211,20 @@ acquire_lock() {
   [ "$DRY_RUN" -eq 0 ] || return 0
   LOCK_DIR="$XDG_CACHE_HOME/cloud-xdg-provision.lock"
   # The atomic `mkdir "$LOCK_DIR"` needs its parent to exist; ensure_local_base
-  # creates $XDG_CACHE_HOME later, so make it here first (idempotent, -p).
-  mkdir -p "$XDG_CACHE_HOME"
+  # creates $XDG_CACHE_HOME later, so make it here first (idempotent, -p). M-d: guard
+  # it so an unwritable/unset cache yields an accurate message, not a raw `set -e` abort.
+  mkdir -p "$XDG_CACHE_HOME" 2>/dev/null || die "cannot create cache dir for the lock: $XDG_CACHE_HOME
+  Check that it (or its parent) is writable, or set XDG_CACHE_HOME to a writable path."
+  # M-d: a failed `mkdir "$LOCK_DIR"` has TWO distinct causes — don't conflate them.
+  # If the lock dir already EXISTS, another run genuinely holds it. If mkdir failed for
+  # any OTHER reason (e.g. $XDG_CACHE_HOME exists but is unwritable), say so accurately.
   if mkdir "$LOCK_DIR" 2>/dev/null; then
     LOCK_OWNED=1
-  else
+  elif [ -d "$LOCK_DIR" ]; then
     die "another run is in progress (lock: $LOCK_DIR).
   If no other run is active, the lock is stale — remove it and retry: rmdir '$LOCK_DIR'"
+  else
+    die "cannot create lock dir under $XDG_CACHE_HOME — check that the directory is writable: $LOCK_DIR"
   fi
 }
 
@@ -417,13 +424,16 @@ local_name() {
   if [ "$PLATFORM" = "macos" ]; then printf '%s' "$1"; else printf '%s' "$2"; fi
 }
 
-# Issue #6: single source of truth for "is this OFFLOAD_SET entry ACTUALLY redirected
-# (symlinked into the cloud)?". Used by BOTH redirect_one (the symlink layer) and
+# Issue #6 / M-h: single source of truth for the POLICY question "SHOULD this
+# OFFLOAD_SET entry be redirected (symlinked into the cloud) per config?" — it is a
+# policy predicate, NOT a filesystem-state query (redirect_one separately inspects
+# the actual on-disk symlink). Used by BOTH redirect_one (the symlink layer) and
 # write_user_dirs (the user-dirs.dirs layer) so the two can never disagree about
 # whether a dir lives in the cloud. Args: $1 = canonical name, $2 = the redirect
-# field. Returns 0 = redirected, 1 = not. downloads is the sole exception: even with
-# redirect=1 it stays create-only until --redirect-downloads (REDIRECT_DOWNLOADS=1).
-is_redirected() {
+# field. Returns 0 = should be redirected, 1 = not. downloads is the sole exception:
+# even with redirect=1 it stays create-only until --redirect-downloads
+# (REDIRECT_DOWNLOADS=1).
+should_redirect() {
   [ "$2" = "1" ] || return 1
   if [ "$1" = "downloads" ] && [ "$REDIRECT_DOWNLOADS" -ne 1 ]; then return 1; fi
   return 0
@@ -459,11 +469,11 @@ redirect_one() {
   lin="$(field "$line" 3)"; xdgvar="$(field "$line" 4)"
   wantredir="$(field "$line" 5)"
 
-  # Symlink layer gate (shared with write_user_dirs via is_redirected). downloads is
+  # Symlink layer gate (shared with write_user_dirs via should_redirect). downloads is
   # the only entry that can be eligible (redirect=1) yet not redirected by default —
   # surface that with the actionable info line; any genuine create-only entry just
   # returns silently.
-  if ! is_redirected "$canon" "$wantredir"; then
+  if ! should_redirect "$canon" "$wantredir"; then
     [ "$canon" = "downloads" ] && info "skip redirect: downloads (use --redirect-downloads to enable)"
     return 0
   fi
@@ -552,6 +562,36 @@ verify_copy() {
   return 1
 }
 
+# M-g: does the `ls -lde` listing ($1) carry a deny-delete ACE? Match `deny` AND
+# `delete` on the SAME line, so a compound/re-ordered ACE (e.g. 'deny write,delete'
+# or 'deny delete,write') is still caught — a single "deny delete" substring would
+# assume that exact token ordering and miss those. Anchoring both tokens to one line
+# also avoids a cross-line false positive (a stray 'deny' on one ACE + 'delete' on
+# another).
+#
+# bash 3.2 NOTE: the listing is fed to the loop via a here-doc (`done <<EOF`), NOT
+# `printf … | while`, and the nested `case` is therefore NOT inside a `$( … )`. Stock
+# bash 3.2's command-substitution parser miscounts a case-pattern `)` as the closing
+# paren of `$(`, so a `case` inside `$( … )` fails to parse AT RUNTIME (and `bash -n`
+# does NOT catch it). The here-doc form keeps the loop in this function's own shell so
+# `return` works directly and the 3.2 quirk is avoided entirely. Do NOT refactor this
+# into a `$(printf | while … case … )`.
+#
+# FAIL-SAFE: even if this ever misses, the B2 rename-probe below still blocks the
+# relocate (a deny-delete ACL fails the probe `mv`) — so a miss degrades to the
+# less-specific TCC message, never to a false relocate.
+acl_denies_delete() {
+  local __aclline
+  while IFS= read -r __aclline; do
+    case "$__aclline" in
+      *deny*) case "$__aclline" in *delete*) return 0 ;; esac ;;
+    esac
+  done <<EOF
+$1
+EOF
+  return 1
+}
+
 relocate_dir() {
   local src="$1" dst="$2" stamp aside copier probe n acl_listing
 
@@ -567,26 +607,26 @@ relocate_dir() {
   # …) relocate normally. macOS only — `ls -lde` is a BSD/macOS extension. Caught
   # BEFORE the B5 cloud guard and the B2 rename-probe so the accurate message wins
   # and nothing is copied or moved. `ls -lde` is the documented way to read a dir's
-  # ACL on macOS; we capture it and case-match (no `ls | grep`) for the deny ACE.
+  # ACL on macOS; we capture it and parse it (no `ls | grep`) for the deny ACE via
+  # acl_denies_delete (deny+delete on the same ACE line — see its comment).
   if [ "$PLATFORM" = "macos" ]; then
     acl_listing="$(ls -lde "$src" 2>/dev/null || true)"
-    case "$acl_listing" in
-      *"deny delete"*)
-        warn "cannot relocate $src — macOS protects it with a 'group:everyone deny delete' ACL."
-        warn "  This is the ACL, NOT TCC: Full Disk Access CANNOT override a deny ACE."
-        case "$(basename "$src")" in
-          Desktop|Documents)
-            warn "  Use Apple's native feature instead: System Settings > [Apple ID] > iCloud >"
-            warn "  iCloud Drive > 'Desktop & Documents Folders'. Skipping — nothing copied." ;;
-          Music|Movies|Pictures|Public)
-            warn "  There is no folder-level iCloud option for this dir (use the Photos app or"
-            warn "  Apple Music where applicable; otherwise leave it local). Skipping — nothing copied." ;;
-          *)
-            warn "  This dir cannot be relocated while the deny-delete ACL is present."
-            warn "  Skipping — nothing copied." ;;
-        esac
-        return 0 ;;
-    esac
+    if acl_denies_delete "$acl_listing"; then
+      warn "cannot relocate $src — macOS protects it with a 'group:everyone deny delete' ACL."
+      warn "  This is the ACL, NOT TCC: Full Disk Access CANNOT override a deny ACE."
+      case "$(basename "$src")" in
+        Desktop|Documents)
+          warn "  Use Apple's native feature instead: System Settings > [Apple ID] > iCloud >"
+          warn "  iCloud Drive > 'Desktop & Documents Folders'. Skipping — nothing copied." ;;
+        Music|Movies|Pictures|Public)
+          warn "  There is no folder-level iCloud option for this dir (use the Photos app or"
+          warn "  Apple Music where applicable; otherwise leave it local). Skipping — nothing copied." ;;
+        *)
+          warn "  This dir cannot be relocated while the deny-delete ACL is present."
+          warn "  Skipping — nothing copied." ;;
+      esac
+      return 0
+    fi
   fi
 
   stamp="$(date +%Y%m%d-%H%M%S)"
@@ -690,7 +730,10 @@ write_user_dirs() {
     stamp="$(date +%Y%m%d-%H%M%S)"
     bak="${f}.bak-${stamp}"
     n=1
-    while [ -e "$bak" ]; do bak="${f}.bak-${stamp}.${n}"; n=$((n + 1)); done
+    # M-e: test -e OR -L (matching relocate_dir's aside loop) so a DANGLING symlink
+    # at the backup path is detected — `[ -e ]` alone reports a dangling link as
+    # missing, so `cp` would then follow/clobber it. Advance the uniquifier instead.
+    while [ -e "$bak" ] || [ -L "$bak" ]; do bak="${f}.bak-${stamp}.${n}"; n=$((n + 1)); done
     cp "$f" "$bak"
     info "Backed up existing user-dirs.dirs -> $bak"
   fi
@@ -702,10 +745,10 @@ write_user_dirs() {
       xdgvar="$(field "$line" 4)"; [ -z "$xdgvar" ] && continue
       # Issue #6: only point an XDG var at the cloud for a dir that is GENUINELY
       # redirected by the symlink layer — otherwise user-dirs.dirs would claim a dir
-      # lives in the cloud while ~/<dir> is still a plain local dir. Same is_redirected
+      # lives in the cloud while ~/<dir> is still a plain local dir. Same should_redirect
       # gate redirect_one uses, so the two layers always agree (notably: downloads is
       # left at its local default unless --redirect-downloads is passed).
-      is_redirected "$(field "$line" 1)" "$(field "$line" 5)" || continue
+      should_redirect "$(field "$line" 1)" "$(field "$line" 5)" || continue
       cn="$(cloud_name "$(field "$line" 1)" "$(field "$line" 2)")"
       printf '%s="%s"\n' "$xdgvar" "$CLOUD_ROOT/$cn"
     done
