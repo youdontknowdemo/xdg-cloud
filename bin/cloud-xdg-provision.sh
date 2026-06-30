@@ -28,6 +28,26 @@
 #
 set -euo pipefail
 
+# --- locate & source the shared library (bash 3.2; symlink- and CWD-safe) ---
+__self_src="${BASH_SOURCE[0]}"
+while [ -h "$__self_src" ]; do
+  __self_dir="$(cd -P "$(dirname "$__self_src")" >/dev/null 2>&1 && pwd)"
+  __self_src="$(readlink "$__self_src")"
+  case "$__self_src" in
+    /*) : ;;                                   # absolute target — use as-is
+    *)  __self_src="$__self_dir/$__self_src" ;; # relative — resolve vs link dir
+  esac
+done
+__self_dir="$(cd -P "$(dirname "$__self_src")" >/dev/null 2>&1 && pwd)"
+XDG_COMMON_LIB="$__self_dir/lib/xdg-common.sh"
+if [ ! -r "$XDG_COMMON_LIB" ]; then
+  printf 'error: required library not found or unreadable: %s\n' "$XDG_COMMON_LIB" >&2
+  exit 1
+fi
+# shellcheck source=bin/lib/xdg-common.sh
+. "$XDG_COMMON_LIB"
+xdg_init_base_defaults   # populate XDG_{CONFIG,DATA,STATE,CACHE}_HOME from env/defaults
+
 # ---------------------------------------------------------------------------
 # Config — override via environment.
 # ---------------------------------------------------------------------------
@@ -42,11 +62,8 @@ set -euo pipefail
 #   mac = capitalized (Documents, Music, Movies)
 : "${STYLE:=xdg}"
 
-# Local XDG base dirs (stay LOCAL — listed so we can ensure + report them).
-: "${XDG_CONFIG_HOME:=$HOME/.config}"
-: "${XDG_DATA_HOME:=$HOME/.local/share}"
-: "${XDG_STATE_HOME:=$HOME/.local/state}"
-: "${XDG_CACHE_HOME:=$HOME/.cache}"
+# Local XDG base dirs (stay LOCAL — listed so we can ensure + report them) are
+# populated by xdg_init_base_defaults() from the shared lib, called above.
 
 DRY_RUN=1          # 1 = print only; --apply to act
 DO_RELOCATE=0      # move existing populated dirs into the cloud, then symlink
@@ -76,7 +93,7 @@ PROBE_SRC=""
 LOCK_DIR=""
 LOCK_OWNED=0
 
-SELF="$(basename "$0")"
+# SELF is set by the shared lib (basename of the executed script — unchanged by sourcing).
 
 # ---------------------------------------------------------------------------
 # The offload set.  Format:  canonical|macName|linuxName|xdgVar|redirect
@@ -88,26 +105,18 @@ SELF="$(basename "$0")"
 #               (downloads is redirect=1 but EXCEPTIONALLY off by default — its
 #               extra REDIRECT_DOWNLOADS gate in redirect_one keeps it create-only
 #               until --redirect-downloads is passed. See is_redirected().)
+# Derived from the canonical registry in the shared lib (xdg_offload_set emits the
+# CLOUDXDG_KEYS rows in order — identical to the old literal, sans the blank lines
+# every consumer already skips with `[ -z "$line" ] && continue`).
 # ---------------------------------------------------------------------------
-OFFLOAD_SET="
-desktop|Desktop|Desktop|XDG_DESKTOP_DIR|1
-documents|Documents|Documents|XDG_DOCUMENTS_DIR|1
-downloads|Downloads|Downloads|XDG_DOWNLOAD_DIR|1
-music|Music|Music|XDG_MUSIC_DIR|1
-pictures|Pictures|Pictures|XDG_PICTURES_DIR|1
-videos|Movies|Videos|XDG_VIDEOS_DIR|1
-public|Public|Public|XDG_PUBLICSHARE_DIR|1
-templates|Templates|Templates|XDG_TEMPLATES_DIR|1
-projects|Projects|Projects||1
-"
+OFFLOAD_SET="$(xdg_offload_set)"
 
 # ---------------------------------------------------------------------------
 # Plumbing
+#   log/info/warn/die come from the shared lib (bin/lib/xdg-common.sh).
+#   run() STAYS here (per-script): cloud-xdg shell-quotes each arg with `printf %q`
+#   — a tested contract (smoke M6) that home-tree's `%s` run() must NOT share.
 # ---------------------------------------------------------------------------
-log()  { printf '%s\n' "$*"; }
-info() { printf '  • %s\n' "$*"; }
-warn() { printf '  ! %s\n' "$*" >&2; }
-die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 run()  {
   # Print the command with each argument shell-quoted (printf %q, available in
   # bash 3.2) so a path containing spaces — e.g. the default macOS cloud root
@@ -264,13 +273,10 @@ case "$STYLE" in xdg|mac) ;; *) die "invalid --style: $STYLE" ;; esac
 # ---------------------------------------------------------------------------
 # Platform + cloud root resolution
 # ---------------------------------------------------------------------------
-case "$(uname -s)" in
-  Darwin) PLATFORM=macos ;;
-  Linux)
-    if [ -n "${TERMUX_VERSION:-}" ] || [ -d /data/data/com.termux ]; then
-      PLATFORM=termux; else PLATFORM=linux; fi ;;
-  *) PLATFORM=unknown ;;
-esac
+# detect_platform (shared lib) sets the global PLATFORM. Called here — top level,
+# after arg parsing, before main — the same point the old inline case ran, so
+# PLATFORM holds the identical value at every use site.
+detect_platform
 
 resolve_cloud_root() {
   if [ -n "$CLOUD_ROOT" ]; then return 0; fi
@@ -424,12 +430,8 @@ is_redirected() {
 }
 
 # ---------------------------------------------------------------------------
-# Field splitter (3.2-safe; no here-strings on assoc arrays)
-# ---------------------------------------------------------------------------
-field() { printf '%s' "$1" | cut -d'|' -f"$2"; }
-
-# ---------------------------------------------------------------------------
 # Steps
+#   field() (the '|'-row splitter) comes from the shared lib.
 # ---------------------------------------------------------------------------
 ensure_local_base() {
   log "XDG base dirs — kept LOCAL (config/data/state/cache):"
