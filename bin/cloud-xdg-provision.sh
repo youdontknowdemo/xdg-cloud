@@ -369,7 +369,7 @@ while [ $# -gt 0 ]; do
     # --- read-only report modes (slice 1, implemented) ---
     --classify)           set_mode classify ;;
     --offload-status)     set_mode offload-status ;;
-    # --- reserved mutating lanes (later slices — recognized here, inert at dispatch) ---
+    # --- mutating lanes (live: offload round-trip + Projects migration + dotfiles) ---
     --migrate-projects)   set_mode migrate-projects ;;
     --offload)            set_mode offload;  shift; MODE_ARG="${1:?--offload needs a dir}" ;;
     --hydrate)            set_mode hydrate;  shift; MODE_ARG="${1:?--hydrate needs a dir}" ;;
