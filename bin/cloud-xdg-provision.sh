@@ -334,8 +334,8 @@ lane per run — combining a mode with the default flags is refused):
   --aside                Offload: move local aside + re-verify before rm (extra safety).
   --dotfiles-init        Create a bare ~/.dotfiles repo + install the 'dotfiles' alias
                          (dry-run unless --apply). Idempotent; backs up your rc first.
-  --dotfiles-track <p>   Track a dotfile/dir into the bare repo (refuses cloud-xdg-managed
-                         paths). --apply to commit.
+  --dotfiles-track <p>…  Track one or more dotfiles/dirs into the bare repo in ONE commit
+                         (refuses cloud-xdg-managed paths; all-or-nothing). --apply to commit.
   --dotfiles-status      Show tracked-file status + whether the alias/rc block are installed.
   --dotfiles-rc PATH     Shell rc to edit (default: ~/.zshrc for zsh, ~/.bashrc for bash).
                          macOS bash login shells usually want --dotfiles-rc ~/.bash_profile.
@@ -374,7 +374,19 @@ while [ $# -gt 0 ]; do
     --offload)            set_mode offload;  shift; MODE_ARG="${1:?--offload needs a dir}" ;;
     --hydrate)            set_mode hydrate;  shift; MODE_ARG="${1:?--hydrate needs a dir}" ;;
     --dotfiles-init)      set_mode dotfiles-init ;;
-    --dotfiles-track)     set_mode dotfiles-track; shift; MODE_ARG="${1:?--dotfiles-track needs a path}" ;;
+    --dotfiles-track)     set_mode dotfiles-track; shift
+                          # v2: consume ALL following non-flag args as the path list,
+                          # newline-joined into MODE_ARG (newline, not space, so paths
+                          # containing spaces survive — the consumer reads it via the same
+                          # here-doc idiom). Stop at the next flag; `continue` skips the
+                          # trailing shift since this arm consumed its own args.
+                          [ $# -gt 0 ] && [ "${1#-}" = "$1" ] || die "--dotfiles-track needs at least one path"
+                          while [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; do
+                            MODE_ARG="$MODE_ARG
+$1"
+                            shift
+                          done
+                          continue ;;
     --dotfiles-status)    set_mode dotfiles-status ;;
     -h|--help)            usage; exit 0 ;;
     *)                    die "unknown option: $1 (try --help)" ;;
@@ -1402,20 +1414,41 @@ dotfiles_guard_path() {
 }
 
 # --dotfiles-track <path>: stage + commit one path into the bare repo (v1: single path).
-cmd_dotfiles_track() {                       # $1 = path (MODE_ARG)
+cmd_dotfiles_track() {                       # $1 = newline-joined path list (MODE_ARG)
   begin_mutating_mode
   dotfiles_is_ours || die "no dotfiles bare repo at $DOTFILES_DIR — run --dotfiles-init first."
-  dotfiles_guard_path "$1"                    # dies on overlap/recursion
-  # Resolve to an ABSOLUTE pathspec so `git add` works regardless of the invoking CWD
-  # (a relative "$1" would otherwise be resolved against CWD, not the $HOME work-tree).
-  local tadd
-  case "$1" in /*) tadd="$1" ;; *) tadd="$HOME/$1" ;; esac
+  local paths="$1" p abs joined
+  # PASS 1 — FAIL-CLOSED ATOMIC: validate EVERY path (overlap/recursion guard + existence)
+  # BEFORE staging or committing anything. dotfiles_guard_path dies on the first managed/
+  # recursive path, so if ANY path is bad nothing is staged (all-or-nothing). Paths are
+  # read via a here-doc (newline-delimited) so spaces in a path are preserved.
+  while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    dotfiles_guard_path "$p"                  # dies on overlap/recursion
+    case "$p" in /*) abs="$p" ;; *) abs="$HOME/$p" ;; esac
+    [ -e "$abs" ] || die "refusing to track '$p' — no such file or directory under \$HOME."
+  done <<EOF
+$paths
+EOF
+  # Human-readable one-line list for messages/commit (newlines -> spaces; safe for display).
+  joined="$(printf '%s' "$paths" | tr '\n' ' ' | sed 's/^ *//; s/ *$//')"
   if [ "$DRY_RUN" -eq 1 ]; then
-    info "[dry-run] dotfiles add $1"; info "[dry-run] dotfiles commit -m 'track: $1'"; return 0
+    while IFS= read -r p; do [ -z "$p" ] && continue; info "[dry-run] dotfiles add $p"; done <<EOF
+$paths
+EOF
+    info "[dry-run] dotfiles commit -m 'track: $joined'  (ONE commit for all paths)"; return 0
   fi
-  run git --git-dir="$DOTFILES_DIR" --work-tree="$HOME" add "$tadd"
-  dotfiles_git commit -m "track: $1"
-  info "Tracked: $1"
+  # PASS 2 — all guards passed: stage every path (ABSOLUTE pathspec so `git add` works from
+  # any CWD, not just $HOME), then exactly ONE commit.
+  while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    case "$p" in /*) abs="$p" ;; *) abs="$HOME/$p" ;; esac
+    run git --git-dir="$DOTFILES_DIR" --work-tree="$HOME" add "$abs"
+  done <<EOF
+$paths
+EOF
+  dotfiles_git commit -m "track: $joined"
+  info "Tracked: $joined"
 }
 
 # --dotfiles-status: read-only. NO begin_mutating_mode, ZERO mutation.
