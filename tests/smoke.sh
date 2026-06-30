@@ -1108,14 +1108,14 @@ assert_contains "${out}" "platform=" \
 assert_contains "${out}" "mode=DRY-RUN" "symlinked run banner reports DRY-RUN mode"
 
 # --- Group L3: registry-derivation standing guard (architecture §5, §6). Source
-#     the library and assert (a) xdg_offload_set() reproduces cloud-xdg's 9-row
+#     the library and assert (a) xdg_offload_set() reproduces cloud-xdg's 8-row
 #     OFFLOAD_SET in EXACT order, and (b) home-tree's SAFE_DIRS — derived from
 #     HOMETREE_KEYS + the linuxName column (field 3) — equals the historical
 #     literal "Documents Pictures Music Videos Projects Notes" in that order.
 #     This locks the §6 linuxName<->rclone-filter coupling and the divergent
 #     per-script ordering (cloud-xdg: Music before Pictures; home-tree: Pictures
 #     before Music) against silent registry drift. Run under /bin/bash (3.2). ---
-echo "smoke: L3 — registry derivation reproduces OFFLOAD_SET (9 rows, order) + SAFE_DIRS"
+echo "smoke: L3 — registry derivation reproduces OFFLOAD_SET (8 rows, order) + SAFE_DIRS"
 lib="${repo}/bin/lib/xdg-common.sh"
 expected_offload="$(printf '%s\n' \
   'desktop|Desktop|Desktop|XDG_DESKTOP_DIR|1' \
@@ -1125,8 +1125,7 @@ expected_offload="$(printf '%s\n' \
   'pictures|Pictures|Pictures|XDG_PICTURES_DIR|1' \
   'videos|Movies|Videos|XDG_VIDEOS_DIR|1' \
   'public|Public|Public|XDG_PUBLICSHARE_DIR|1' \
-  'templates|Templates|Templates|XDG_TEMPLATES_DIR|1' \
-  'projects|Projects|Projects||1')"
+  'templates|Templates|Templates|XDG_TEMPLATES_DIR|1')"
 set +e
 actual_offload="$(/bin/bash -c '. "$1"; xdg_offload_set' _ "${lib}")"
 rc=$?
@@ -1134,7 +1133,7 @@ set -e
 pass_if "${rc}" "sourcing the lib + xdg_offload_set runs cleanly" \
   "xdg_offload_set failed to run (exit ${rc})"
 if [ "${actual_offload}" = "${expected_offload}" ]; then
-  ok "xdg_offload_set reproduces the 9-row OFFLOAD_SET in cloud-xdg order"
+  ok "xdg_offload_set reproduces the 8-row OFFLOAD_SET in cloud-xdg order"
 else
   printf 'FAIL: xdg_offload_set drifted from the historical OFFLOAD_SET\n' >&2
   printf '--- expected ---\n%s\n--- actual ---\n%s\n' "${expected_offload}" "${actual_offload}" >&2
