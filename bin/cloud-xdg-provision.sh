@@ -21,8 +21,9 @@
 #   2. XDG *base* dirs (config/data/state/cache) stay LOCAL. They are
 #      machine-specific, high-churn, or lock-sensitive (SQLite). Live config
 #      belongs in git, not blob cloud.
-#   3. Only XDG *user* dirs + a projects area offload cleanly. That is the
-#      genuine cross-OS portable set.
+#   3. Only XDG *user* dirs are auto-symlinked into the cloud here — the genuine
+#      cross-OS portable set. (A projects area is CODE-class, not symlinked; it is
+#      offloaded on demand in a later slice, not via this lane.)
 #
 # Compatible with stock macOS bash 3.2 (no associative arrays / mapfile).
 #
