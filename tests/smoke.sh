@@ -1966,4 +1966,41 @@ assert_contains "${out}" "refusing" "the managed path is named in the refusal"
 tracked="$(git --git-dir="${df_home}/.dotfiles" --work-tree="${df_home}" ls-files 2>/dev/null)"
 if printf '%s\n' "${tracked}" | grep -qx ".multi3"; then fail "FAIL-CLOSED VIOLATION: the valid path was staged despite a managed path in the set"; else ok "fail-closed: the valid path was NOT staged (all-or-nothing)"; fi
 
+# --- D13 (slice 4): dotfiles ADOPT (--dotfiles-remote) — the CLOBBER surface. Uses a REAL local
+#     bare-repo fixture as the <url> and a SANDBOX HOME (never real $HOME/~/.dotfiles/~/.zshrc).
+#     Asserts: collider→aside (original preserved, remote checked out), managed-lane repo refused
+#     ($HOME UNTOUCHED, clone removed, no leak), refuse when ~/.dotfiles exists. ---
+echo "smoke: D13 — dotfiles adopt: collider→aside, managed-lane refused ($HOME untouched), exists→refuse"
+# Fixture A: a normal dotfiles repo tracking .bashrc (used as the clone <url>).
+adopt_src="${sandbox}/adopt-src"; mkdir -p "${adopt_src}"
+( cd "${adopt_src}" && git init -q && printf 'REMOTE-BASHRC\n' > .bashrc \
+    && git -c user.email=t@t -c user.name=t add .bashrc \
+    && git -c user.email=t@t -c user.name=t commit -qm init ) >/dev/null 2>&1
+# Fixture B: a MISCONFIGURED repo tracking a cloud-xdg-managed path (Documents/) + a normal file.
+adopt_msrc="${sandbox}/adopt-msrc"; mkdir -p "${adopt_msrc}/Documents"
+( cd "${adopt_msrc}" && git init -q && printf 'x\n' > Documents/foo && printf 'y\n' > .vimrc \
+    && git -c user.email=t@t -c user.name=t add -A \
+    && git -c user.email=t@t -c user.name=t commit -qm init ) >/dev/null 2>&1
+adrun() { HOME="$1" XDG_CONFIG_HOME="$1/.config" XDG_CACHE_HOME="$1/.cache" \
+  /bin/bash "${PROV}" --dotfiles-rc "$1/.zshrc" "${@:2}"; }
+# (a) collider: a local .bashrc must be moved aside (content preserved), remote checked out.
+ad_a="${sandbox}/adopt-collide"; mkdir -p "${ad_a}"; printf 'LOCAL-KEEP\n' > "${ad_a}/.bashrc"
+set +e; out="$(adrun "${ad_a}" --dotfiles-remote "${adopt_src}" --apply 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "adopt with a collider exits 0" "adopt collider failed (exit ${rc}): ${out}"
+if [ "$(cat "${ad_a}/.bashrc" 2>/dev/null)" = "REMOTE-BASHRC" ]; then ok "the remote dotfile was checked out"; else fail "adopt did not check out the remote .bashrc"; fi
+ad_aside=""; for f in "${ad_a}"/.bashrc.pre-dotfiles-*; do [ -e "${f}" ] && { ad_aside="${f}"; break; }; done
+if [ -n "${ad_aside}" ] && [ "$(cat "${ad_aside}" 2>/dev/null)" = "LOCAL-KEEP" ]; then ok "the pre-existing local file was moved aside with its content PRESERVED (never clobbered)"; else fail "collider was not asided / original content lost"; fi
+# (b) managed-lane repo: refused, $HOME fully untouched (no clone, no checkout of the non-managed file).
+ad_b="${sandbox}/adopt-managed"; mkdir -p "${ad_b}"
+set +e; out="$(adrun "${ad_b}" --dotfiles-remote "${adopt_msrc}" --apply 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "adopt of a managed-lane repo exits non-zero (fail-closed)"
+assert_contains "${out}" "Documents/foo" "the refusal NAMES the managed offender path"
+if [ -e "${ad_b}/.dotfiles" ]; then fail "CLOBBER RISK: the fresh clone was left behind on managed-refuse"; else ok "the fresh clone was removed on managed-refuse"; fi
+if [ -e "${ad_b}/.vimrc" ]; then fail "\$HOME VIOLATION: a repo file leaked into \$HOME despite the refusal"; else ok "\$HOME left completely untouched on managed-refuse (nothing checked out)"; fi
+# (c) refuse when ~/.dotfiles already exists (fresh-machine only).
+ad_c="${sandbox}/adopt-exists"; mkdir -p "${ad_c}/.dotfiles"
+set +e; out="$(adrun "${ad_c}" --dotfiles-remote "${adopt_src}" --apply 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "adopt refuses when ~/.dotfiles already exists"
+assert_contains "${out}" "refusing to clobber" "the pre-existing ~/.dotfiles is not clobbered"
+
 echo "smoke: PASS"
