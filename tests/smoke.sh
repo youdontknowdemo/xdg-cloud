@@ -2065,6 +2065,9 @@ pass_if "${rc}" "adopt with a symlink collider exits 0" "adopt failed (exit ${rc
 if [ -f "${d16h}/.bashrc" ] && [ ! -L "${d16h}/.bashrc" ] && [ "$(cat "${d16h}/.bashrc")" = "R16" ]; then ok "tracked file checked out as a real file"; else fail "tracked file not checked out as a real file"; fi
 d16_aside=""; for f in "${d16h}"/.bashrc.pre-dotfiles-*; do [ -L "${f}" ] && { d16_aside="${f}"; break; }; done
 if [ -n "${d16_aside}" ]; then ok "the collider SYMLINK was moved aside as a link (not its target)"; else fail "symlink collider was not asided as a link"; fi
+# T-M2: the asided link must still point at the ORIGINAL target (proves the LINK was moved,
+# not dereferenced-and-copied — a subtle clobber where the target's path identity is lost).
+if [ -n "${d16_aside}" ] && [ "$(readlink "${d16_aside}" 2>/dev/null)" = "${d16h}/realtarget" ]; then ok "the asided link still resolves to the ORIGINAL target path (moved, not dereferenced)"; else fail "the asided symlink does not point at the original target"; fi
 if [ "$(cat "${d16h}/realtarget" 2>/dev/null)" = "TARGET-CONTENT" ]; then ok "the symlink's target file is untouched"; else fail "the symlink target was modified"; fi
 
 # --- D17 (slice 4): MANAGED-LANE refuse, fail-closed, MID-LIST + with a COLLIDER present. The
@@ -2118,9 +2121,11 @@ pass_if "${rc}" "adopt dry-run exits 0" "adopt dry-run failed (exit ${rc}): ${ou
 assert_contains "${out}" "would move aside" "dry-run previews the collider it would move aside"
 if [ "${d20_before}" = "$(cd "${d20h}" && find . | sort)" ] && [ ! -e "${d20h}/.dotfiles" ]; then ok "dry-run touched nothing under \$HOME (no aside, no clone)"; else fail "dry-run mutated \$HOME"; fi
 if [ "$(cat "${d20h}/.bashrc" 2>/dev/null)" = "LOCAL20" ]; then ok "the local file is untouched by the dry-run"; else fail "dry-run changed the local file"; fi
-# managed-repo dry-run names the WOULD-REFUSE offender.
+# managed-repo dry-run names the WOULD-REFUSE offender — and (T-M3) must itself mutate NOTHING.
+d20m_before="$(cd "${d20h}" && find . | sort)"
 set +e; out="$(adrun "${d20h}" --dotfiles-remote "${adopt_msrc}" 2>&1)"; set -e
 assert_contains "${out}" "WOULD REFUSE" "dry-run flags a managed offender as WOULD REFUSE"
+if [ "${d20m_before}" = "$(cd "${d20h}" && find . | sort)" ] && [ ! -e "${d20h}/.dotfiles" ]; then ok "the managed-offender dry-run mutated nothing under \$HOME (no aside, no clone)"; else fail "the managed-offender dry-run mutated \$HOME"; fi
 
 # --- D21 (slice 4): unknown $SHELL with no --dotfiles-rc — resolve_rc dies BEFORE the clone; no repo. ---
 echo "smoke: D21 — adopt with an unknown \$SHELL and no --dotfiles-rc refuses before cloning"
@@ -2182,5 +2187,20 @@ assert_contains "${out}" "tracked by the adopted repo" "adopt reports the rc is 
 if grep -qF ">>> xdg-cloud dotfiles >>>" "${d24h}/.zshrc" 2>/dev/null; then fail "our source block was appended into the TRACKED rc (dirties it)"; else ok "the tracked rc was NOT dirtied with our source block"; fi
 d24status="$(git --git-dir="${d24h}/.dotfiles" --work-tree="${d24h}" status --porcelain 2>/dev/null)"
 if [ -z "${d24status}" ]; then ok "post-adopt dotfiles status is clean (tracked rc untouched)"; else fail "post-adopt dotfiles status is DIRTY: ${d24status}"; fi
+
+# --- D25 (T-M1): DIR-collider never-clobber. A pre-existing NON-EMPTY DIRECTORY at $HOME/<p>
+#     that the repo tracks (as a file) is moved aside WHOLE — its contents preserved verbatim at
+#     <p>.pre-dotfiles-*/ — and the tracked file is checked out in its place. This is a DISTINCT
+#     data-preservation path (mv of a directory, not a file): D13/D15 cover file colliders and
+#     D16 a symlink, but a directory collider had no standing never-clobber guard. ---
+echo "smoke: D25 — adopt asides a non-empty DIRECTORY collider WHOLE (contents preserved) + checks out the tracked file"
+d25src="${sandbox}/d25-src"; mkdir -p "${d25src}"; printf 'REMOTE-FOO\n' > "${d25src}/foo"; git_seed "${d25src}"
+d25h="${sandbox}/d25-home"; mkdir -p "${d25h}/foo"
+printf 'PRECIOUS-DIR-DATA\n' > "${d25h}/foo/keep.txt"
+set +e; out="$(adrun "${d25h}" --dotfiles-remote "${d25src}" --apply 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "adopt with a directory collider exits 0" "adopt (dir collider) failed (exit ${rc}): ${out}"
+if [ -f "${d25h}/foo" ] && [ "$(cat "${d25h}/foo" 2>/dev/null)" = "REMOTE-FOO" ]; then ok "the tracked file was checked out where the dir stood"; else fail "the tracked file was not checked out over the dir collider"; fi
+d25_aside=""; for d in "${d25h}"/foo.pre-dotfiles-*; do [ -d "${d}" ] && { d25_aside="${d}"; break; }; done
+if [ -n "${d25_aside}" ] && [ "$(cat "${d25_aside}/keep.txt" 2>/dev/null)" = "PRECIOUS-DIR-DATA" ]; then ok "the whole directory (with its contents) was moved aside — NEVER clobbered"; else fail "DATA LOSS: the directory collider's contents were not preserved at *.pre-dotfiles"; fi
 
 echo "smoke: PASS"

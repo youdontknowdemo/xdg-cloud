@@ -165,11 +165,12 @@ EOF
     return 0
   fi
 
-  # ---- CLONE (apply). Failure => remove the partial repo, $HOME untouched. The trap window is
-  #      NOT armed here: clone (and the managed pre-scan below) touch NO user data — only the fresh
-  #      bare repo — and both clean up explicitly on failure. Arming DOTFILES_ADOPT_ACTIVE during a
-  #      window that ends in a deliberate `die` would make the EXIT trap print a SPURIOUS
-  #      "INTERRUPTED" message. The flag is armed ONLY around aside+checkout (where user data moves). ----
+  # ---- CLONE (apply). Failure => remove the partial repo, $HOME untouched. As-shipped, the flag is
+  #      armed at clone (DOTFILES_ADOPT_ACTIVE=1, STAGE=clone) so a signal DURING the clone is also
+  #      covered, and it is RESET to 0 before every deliberate `die` (clone-fail, managed/unsafe
+  #      refuse) so those do not print a spurious "INTERRUPTED" via the EXIT trap. Net: the trap only
+  #      fires on a genuine mid-adopt interrupt; clone/pre-scan still touch NO user data (only the
+  #      fresh bare repo) and clean up explicitly on failure. ----
   if ! git clone --bare "$url" "$DOTFILES_DIR"; then
     rm -rf "$DOTFILES_DIR"                      # only ours-this-run (a pre-existing repo was refused above)
     die "git clone --bare failed for '$url'. Removed the partial $DOTFILES_DIR; your \$HOME is untouched."
@@ -307,12 +308,13 @@ EOF
   first `mv`* (collect ALL offenders, remove the fresh clone, then die naming them) guarantees a
   misconfigured remote leaves `$HOME` **fully untouched** — a per-path check inside the aside loop
   could aside earlier files before reaching a managed one.
-- **`DOTFILES_ADOPT_ACTIVE` armed ONLY around aside+checkout (single master handler, STAGE marker)** —
-  *because* that is the only window where user data is in flux (originals moved aside, checkout
-  writing). Arming it during clone or the managed pre-scan — windows that end in a deliberate `die` —
-  would make the EXIT trap print a SPURIOUS "INTERRUPTED" message (`cleanup_handler` runs on every exit,
-  including `die`). bash 3.2 has no trap stacking, so one flag + stage gives an accurate interrupt
-  message without a second `trap`; the aside loop is here-doc-fed in the parent shell so the flag it
+- **`DOTFILES_ADOPT_ACTIVE` on the single master handler (STAGE marker), reset before every deliberate `die`** —
+  as shipped, the flag is armed at clone (STAGE=clone) so a signal during the clone is covered too, and
+  it is explicitly reset to 0 before each deliberate `die` (clone-fail, unsafe/managed refuse) so those
+  exits do NOT print a spurious "INTERRUPTED" via the EXIT trap (`cleanup_handler` runs on every exit,
+  including `die`). Net effect matches "only a genuine mid-adopt interrupt fires the message," while also
+  covering an interrupt during clone. bash 3.2 has no trap stacking, so one flag + stage gives an accurate
+  interrupt message without a second `trap`; the aside loop reads from a tempfile in the parent shell so the flag it
   sets is in the handler's scope.
 - **clone-fail removes the partial, $HOME untouched** — *because* before checkout nothing under `$HOME`
   has moved, so the only cleanup is the partial bare repo; leaving `$HOME` pristine is the safe default.
