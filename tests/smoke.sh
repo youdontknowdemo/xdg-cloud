@@ -2134,4 +2134,53 @@ assert_nonzero "${rc}" "adopt with an unknown \$SHELL exits non-zero"
 assert_contains "${out}" "--dotfiles-rc" "the refusal tells the user to pass --dotfiles-rc"
 if [ -e "${d21h}/.dotfiles" ]; then fail "a repo was cloned despite the rc refusal (die must precede clone)"; else ok "no repo cloned when rc resolution failed (die precedes clone)"; fi
 
+# --- D22 (slice 4 remediation): PATH-TRAVERSAL refusal (security Blocking). A malicious repo can
+#     track '../evil' via a crafted tree (nested tree with a '..' subtree). Adopt must refuse it in
+#     PASS A BEFORE any aside/checkout, so the out-of-$HOME target is NEVER written. Sandbox HOME. ---
+echo "smoke: D22 — adopt refuses a work-tree-escaping path ('../evil'), \$HOME untouched"
+d22src="${sandbox}/adopt-trav-src"; mkdir -p "${d22src}"
+( cd "${d22src}" && git init -q
+  d22blob="$(printf 'EVIL-PAYLOAD\n' | git hash-object -w --stdin)"
+  d22inner="$(printf '100644 blob %s\tevil\n' "${d22blob}" | git mktree)"
+  d22outer="$(printf '040000 tree %s\t..\n' "${d22inner}" | git mktree)"
+  d22commit="$(git -c user.email=t@t -c user.name=t commit-tree "${d22outer}" -m evil)"
+  git update-ref HEAD "${d22commit}" ) >/dev/null 2>&1
+d22h="${sandbox}/adopt-trav-home"; mkdir -p "${d22h}"
+d22escape="${sandbox}/evil"            # $HOME/../evil resolves here (HOME=$d22h under $sandbox)
+rm -f "${d22escape}"
+set +e; out="$(adrun "${d22h}" --dotfiles-remote "${d22src}" --apply 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "traversal repo adopt exits non-zero (refused in PASS A)"
+assert_contains "${out}" "unsafe" "the refusal names the path as unsafe / would escape \$HOME"
+if [ -e "${d22escape}" ] || [ -L "${d22escape}" ]; then fail "WORK-TREE ESCAPE: '../evil' was written OUTSIDE \$HOME (${d22escape})"; else ok "the escaping path was NOT written outside \$HOME"; fi
+if [ -e "${d22h}/.dotfiles" ]; then fail "the fresh clone was left behind on a traversal refusal"; else ok "the fresh clone was removed; \$HOME untouched on traversal refusal"; fi
+
+# --- D23 (slice 4 remediation, M1): an EXOTIC-named collider (a name git ls-tree --name-only would
+#     C-quote — here an embedded double-quote) is now correctly pre-asided via the -z enumeration. ---
+echo "smoke: D23 — exotic-named collider is correctly asided (NUL-delimited enumeration)"
+d23src="${sandbox}/adopt-exotic-src"; mkdir -p "${d23src}"
+( cd "${d23src}" && git init -q && printf 'REMOTE-Q\n' > 'q"x.txt' \
+    && git -c user.email=t@t -c user.name=t add -A \
+    && git -c user.email=t@t -c user.name=t commit -qm init ) >/dev/null 2>&1
+d23h="${sandbox}/adopt-exotic-home"; mkdir -p "${d23h}"; printf 'LOCAL-EXOTIC\n' > "${d23h}/q\"x.txt"
+set +e; out="$(adrun "${d23h}" --dotfiles-remote "${d23src}" --apply 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "adopt with an exotic-named collider exits 0" "exotic adopt failed (exit ${rc}): ${out}"
+if [ "$(cat "${d23h}/q\"x.txt" 2>/dev/null)" = "REMOTE-Q" ]; then ok "the remote exotic-named file was checked out"; else fail "exotic-named remote file not checked out"; fi
+d23aside=""; for f in "${d23h}"/q\"x.txt.pre-dotfiles-*; do [ -e "${f}" ] && { d23aside="${f}"; break; }; done
+if [ -n "${d23aside}" ] && [ "$(cat "${d23aside}" 2>/dev/null)" = "LOCAL-EXOTIC" ]; then ok "the exotic-named collider was asided with content preserved (C-quoting no longer misses it)"; else fail "exotic-named collider was NOT asided (C-quoting gap)"; fi
+
+# --- D24 (slice 4 remediation, M3): adopting a repo that TRACKS the rc file must NOT dirty it
+#     (do not append our source block into the tracked rc). Sandbox HOME + --dotfiles-rc=$HOME/.zshrc. ---
+echo "smoke: D24 — adopt of a repo that tracks the rc does NOT dirty it"
+d24src="${sandbox}/adopt-rc-src"; mkdir -p "${d24src}"
+( cd "${d24src}" && git init -q && printf 'export FROM_REPO=1\n' > .zshrc \
+    && git -c user.email=t@t -c user.name=t add -A \
+    && git -c user.email=t@t -c user.name=t commit -qm init ) >/dev/null 2>&1
+d24h="${sandbox}/adopt-rc-home"; mkdir -p "${d24h}"
+set +e; out="$(adrun "${d24h}" --dotfiles-remote "${d24src}" --apply 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "adopt of a repo tracking the rc exits 0" "tracked-rc adopt failed (exit ${rc}): ${out}"
+assert_contains "${out}" "tracked by the adopted repo" "adopt reports the rc is repo-managed (skips the source block)"
+if grep -qF ">>> xdg-cloud dotfiles >>>" "${d24h}/.zshrc" 2>/dev/null; then fail "our source block was appended into the TRACKED rc (dirties it)"; else ok "the tracked rc was NOT dirtied with our source block"; fi
+d24status="$(git --git-dir="${d24h}/.dotfiles" --work-tree="${d24h}" status --porcelain 2>/dev/null)"
+if [ -z "${d24status}" ]; then ok "post-adopt dotfiles status is clean (tracked rc untouched)"; else fail "post-adopt dotfiles status is DIRTY: ${d24status}"; fi
+
 echo "smoke: PASS"

@@ -1508,25 +1508,43 @@ cmd_dotfiles_status() {
 # This is the NON-DYING sibling of dotfiles_guard_path — adopt needs a boolean to scan every
 # tracked path and report ALL offenders in one message. Ends with an explicit `return 1` so the
 # no-match path never leaves a non-zero status that would trip set -e in the caller.
+# Case-fold helper (bash 3.2 has no ${v,,}). Lowercases via tr so a managed-name compare is
+# case-INSENSITIVE — on a case-insensitive FS (macOS default) 'documents/' IS the 'Documents'
+# dir and must still be refused (security review: case-sensitive compare let it evade the guard).
+_dotfiles_lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
 dotfiles_path_is_managed() {
-  local rel="$1" top k nm
+  local rel="$1" top top_lc k nm
   rel="${rel#/}"; top="${rel%%/*}"
-  [ "$top" = ".dotfiles" ] && return 0
+  top_lc="$(_dotfiles_lc "$top")"
+  [ "$top_lc" = ".dotfiles" ] && return 0
   # shellcheck disable=SC2086
   for k in $CLOUDXDG_KEYS; do
     nm="$(local_name "$(field "$(registry_row "$k")" 2)" "$(field "$(registry_row "$k")" 3)")"
-    [ "$top" = "$nm" ] && return 0
+    [ "$top_lc" = "$(_dotfiles_lc "$nm")" ] && return 0
   done
   # shellcheck disable=SC2086
   for k in $CODE_KEYS; do
     nm="$(local_name "$(field "$(code_row "$k")" 2)" "$(field "$(code_row "$k")" 3)")"
-    [ "$top" = "$nm" ] && return 0
+    [ "$top_lc" = "$(_dotfiles_lc "$nm")" ] && return 0
   done
   # shellcheck disable=SC2086
   for k in $LOCAL_KEYS; do
     nm="$(local_name "$(field "$(code_row "$k")" 2)" "$(field "$(code_row "$k")" 3)")"
-    [ "$top" = "$nm" ] && return 0
+    [ "$top_lc" = "$(_dotfiles_lc "$nm")" ] && return 0
   done
+  return 1
+}
+
+# True (0) if a repo-relative path is LEXICALLY unsafe — it could escape the $HOME work tree when
+# joined as "$HOME/$path". SECURITY (Finding 1, empirically confirmed): a malicious repo can track
+# '../evil' via a crafted tree (nested tree with a '..' subtree); `git ls-tree` lists it verbatim,
+# and "$HOME/../evil" escapes $HOME — so the pre-aside mv (or checkout) would touch a file OUTSIDE
+# the work tree. Refused in PASS A before ANY aside/mutation. Explicit `return 1` on safe (set-e).
+dotfiles_path_is_unsafe() {
+  case "$1" in
+    /*|..|../*|./*|*/../*|*/..) return 0 ;;   # absolute, '..', leading '../' or './', embedded/trailing '/..'
+  esac
   return 1
 }
 
@@ -1537,7 +1555,7 @@ dotfiles_path_is_managed() {
 # PASS B pre-asides every collider, THEN checks out.
 cmd_dotfiles_adopt() {                        # $1 = repo URL
   begin_mutating_mode                          # guard_not_root + trap + (apply-only) lock
-  local url="$1" tracked p abs bak stamp n aside_list managed tmp
+  local url="$1" p abs bak stamp n aside_list tmp home_real refused tracked_file parent_real
   # ---- refuse-clobber: adopt is fresh-machine only ----
   if [ -e "$DOTFILES_DIR" ] || [ -L "$DOTFILES_DIR" ]; then
     if dotfiles_is_ours; then
@@ -1547,20 +1565,24 @@ cmd_dotfiles_adopt() {                        # $1 = repo URL
     die "$DOTFILES_DIR exists but is not our bare repo — refusing to clobber it."
   fi
   dotfiles_resolve_rc                          # sets RC_TARGET or dies IN THIS SHELL (before any mutation)
+  # Canonical $HOME (symlinks resolved) for the PASS B realpath confinement backstop.
+  home_real="$(cd "$HOME" 2>/dev/null && pwd -P)" || die "cannot resolve \$HOME ('$HOME')."
 
   # ---- dry-run: temp-clone preview. Nothing under $HOME is touched. ----
   if [ "$DRY_RUN" -eq 1 ]; then
     info "[dry-run] git clone --bare '$url' -> $DOTFILES_DIR ; config status.showUntrackedFiles=no"
     tmp="$(mktemp -d "${TMPDIR:-/tmp}/xdg-adopt.XXXXXX")" || die "cannot create temp dir for dry-run preview"
     if git clone --bare "$url" "$tmp" >/dev/null 2>&1; then
-      tracked="$(git --git-dir="$tmp" ls-tree -r --name-only HEAD 2>/dev/null || true)"
-      while IFS= read -r p; do
+      # NUL-delimited so exotic filenames (non-ASCII/control/quote — which --name-only would
+      # C-quote) round-trip. A PIPE (subshell) is fine here: the preview only prints — it does not
+      # accumulate, die, or set a trap flag (unlike the apply-path scans, which must run in the
+      # parent shell). command-sub would strip the NULs, so it is NOT usable.
+      git --git-dir="$tmp" ls-tree -r -z --name-only HEAD 2>/dev/null | while IFS= read -r -d '' p; do
         [ -z "$p" ] && continue
+        if dotfiles_path_is_unsafe "$p"; then info "[dry-run] WOULD REFUSE: unsafe path '$p' (would escape \$HOME)"; continue; fi
         if dotfiles_path_is_managed "$p"; then info "[dry-run] WOULD REFUSE: repo tracks managed path '$p'"; continue; fi
         if [ -e "$HOME/$p" ] || [ -L "$HOME/$p" ]; then info "[dry-run] would move aside: \$HOME/$p"; fi
-      done <<EOF
-$tracked
-EOF
+      done
       info "[dry-run] would then: dotfiles checkout (NO --force); write $DOTFILES_ALIASES + rc block on $RC_TARGET."
     else
       warn "[dry-run] clone preview failed for '$url' (network/URL?). Under --apply this aborts cleanly, \$HOME untouched."
@@ -1578,36 +1600,51 @@ EOF
   fi
   dotfiles_git config --local status.showUntrackedFiles no
 
-  # ---- enumerate tracked paths (into a var; no die inside $()) ----
-  tracked="$(dotfiles_git ls-tree -r --name-only HEAD 2>/dev/null || true)"
+  # ---- enumerate tracked paths, NUL-delimited, into a TEMP FILE. NUL is the only separator safe
+  #      for arbitrary filenames; command substitution STRIPS NULs and a pipe would run the scan
+  #      loops in a subshell (breaking die/accumulation/trap-flag-in-parent), so each pass reads
+  #      from the file via redirect (parent shell, NULs + exotic names preserved). ----
+  tracked_file="$(mktemp "${TMPDIR:-/tmp}/xdg-adopt-tracked.XXXXXX")" || {
+    rm -rf "$DOTFILES_DIR"; DOTFILES_ADOPT_ACTIVE=0
+    die "cannot create temp file for the tracked-path scan; removed the clone, \$HOME untouched."
+  }
+  dotfiles_git ls-tree -r -z --name-only HEAD > "$tracked_file" 2>/dev/null || true
 
-  # ---- PASS A — managed-lane pre-scan (fail-closed, BEFORE any aside/mutation). Accumulate ALL
-  #      offenders (here-doc fed so the accumulation + die run in the PARENT shell). If any, remove
-  #      the fresh clone so $HOME is FULLY untouched, then die naming every offender. ----
-  managed=""
-  while IFS= read -r p; do
+  # ---- PASS A — fail-closed pre-scan (BEFORE any aside/mutation): refuse the WHOLE adopt if any
+  #      tracked path is UNSAFE (would escape $HOME) or a cloud-xdg-managed lane. Accumulate ALL
+  #      offenders; if any, remove the fresh clone so $HOME is FULLY untouched, then die. ----
+  refused=""
+  # shellcheck disable=SC2094   # false positive: the ls-tree write above fully completes before this read (separate statements)
+  while IFS= read -r -d '' p; do
     [ -z "$p" ] && continue
-    if dotfiles_path_is_managed "$p"; then managed="${managed}    $p
+    if dotfiles_path_is_unsafe "$p"; then refused="${refused}    $p    (unsafe — would escape \$HOME)
+"
+    elif dotfiles_path_is_managed "$p"; then refused="${refused}    $p    (cloud-xdg-managed lane)
 "; fi
-  done <<EOF
-$tracked
-EOF
-  if [ -n "$managed" ]; then
-    rm -rf "$DOTFILES_DIR"
-    DOTFILES_ADOPT_ACTIVE=0
-    die "the remote repo tracks cloud-xdg-managed path(s) — refusing adopt (they would fight the
-  symlink/offload lanes). Removed the fresh clone; your \$HOME is UNTOUCHED. Offenders:
-${managed}  Untrack these in the repo (or manage them via the symlink/offload lanes), then retry."
+  done < "$tracked_file"
+  if [ -n "$refused" ]; then
+    rm -f "$tracked_file"; rm -rf "$DOTFILES_DIR"; DOTFILES_ADOPT_ACTIVE=0
+    die "the remote repo tracks unsafe or cloud-xdg-managed path(s) — refusing adopt. Removed the
+  fresh clone; your \$HOME is UNTOUCHED. Offenders:
+${refused}  Fix the repo (remove escaping paths; untrack managed dirs), then retry."
   fi
 
-  # ---- PASS B — collision pre-aside (here-doc fed, NOT a pipe, so aside_list + the trap flag reach
-  #      the parent). Managed paths were already refused, so this only asides genuine colliders.
-  #      Moves the LINK for a symlink collider (mv, not its target); NEVER overwrites an aside. ----
+  # ---- PASS B — collision pre-aside. Managed/unsafe already refused. BACKSTOP (defense-in-depth
+  #      vs a symlinked intermediate dir the lexical PASS A can't see): resolve the collider's
+  #      parent (pwd -P) and refuse if it lands OUTSIDE $HOME BEFORE mv. Symlink colliders move the
+  #      LINK (not the target); NEVER overwrites an existing aside. ----
   DOTFILES_ADOPT_STAGE="aside"; aside_list=""
-  while IFS= read -r p; do
+  # shellcheck disable=SC2094   # false positive: the ls-tree write above fully completes before this read (separate statements)
+  while IFS= read -r -d '' p; do
     [ -z "$p" ] && continue
     abs="$HOME/$p"
     if [ -e "$abs" ] || [ -L "$abs" ]; then
+      parent_real="$(cd "$(dirname "$abs")" 2>/dev/null && pwd -P)" || parent_real=""
+      case "$parent_real" in
+        "$home_real"|"$home_real"/*) : ;;
+        *) rm -f "$tracked_file"; rm -rf "$DOTFILES_DIR"; DOTFILES_ADOPT_ACTIVE=0
+           die "refusing: tracked path '$p' resolves OUTSIDE \$HOME ('$abs' -> '${parent_real:-unresolved}'). Removed the clone; any asides so far RETAINED — inspect." ;;
+      esac
       stamp="$(date +%Y%m%d-%H%M%S)"; bak="${abs}.pre-dotfiles-${stamp}"; n=1
       while [ -e "$bak" ] || [ -L "$bak" ]; do bak="${abs}.pre-dotfiles-${stamp}.${n}"; n=$((n + 1)); done
       mkdir -p "$(dirname "$abs")"
@@ -1615,24 +1652,32 @@ ${managed}  Untrack these in the repo (or manage them via the symlink/offload la
       aside_list="${aside_list}    $abs  ->  $bak
 "
     fi
-  done <<EOF
-$tracked
-EOF
+  done < "$tracked_file"
+  rm -f "$tracked_file"
 
   # ---- CHECKOUT (NO -f/--force). Colliders are aside, so it writes only absent paths => clean. ----
   DOTFILES_ADOPT_STAGE="checkout"
   if ! dotfiles_git checkout; then
     DOTFILES_ADOPT_ACTIVE=0
     warn "dotfiles checkout FAILED unexpectedly after pre-asiding colliders — NOT forcing."
-    [ -n "$aside_list" ] && { warn "Files moved aside (RETAINED):"; printf '%s' "$aside_list" >&2; }
-    die "adopt incomplete: bare repo left at $DOTFILES_DIR; asides retained. Inspect, then retry or
-  restore. Delete NOTHING until verified."
+    if [ -n "$aside_list" ]; then
+      warn "Files moved aside (RETAINED):"; printf '%s' "$aside_list" >&2
+      die "adopt incomplete: bare repo left at $DOTFILES_DIR; the asides above are retained. Inspect, then retry or restore. Delete NOTHING until verified."
+    fi
+    die "adopt incomplete: bare repo left at $DOTFILES_DIR (no files were moved aside). Inspect, then retry. Delete NOTHING until verified."
   fi
   DOTFILES_ADOPT_ACTIVE=0
 
-  # ---- RC wiring (reuse init's writers, unchanged) ----
+  # ---- RC wiring. Always write the alias file. But if the ADOPTED repo TRACKS the rc we'd edit,
+  #      do NOT append our sentinel block — it would dirty the just-checked-out tracked rc and risk
+  #      folding our machine-specific block into their repo. Inform the user instead. ----
   dotfiles_write_aliases
-  dotfiles_install_rc_source
+  if dotfiles_git ls-files --error-unmatch "$RC_TARGET" >/dev/null 2>&1; then
+    info "Your rc ($RC_TARGET) is tracked by the adopted repo — NOT adding our source block (it would"
+    info "  dirty the tracked rc). Ensure your rc sources the alias file: $DOTFILES_ALIASES"
+  else
+    dotfiles_install_rc_source
+  fi
 
   # ---- report ----
   if [ -n "$aside_list" ]; then
