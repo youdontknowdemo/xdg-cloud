@@ -2203,4 +2203,177 @@ if [ -f "${d25h}/foo" ] && [ "$(cat "${d25h}/foo" 2>/dev/null)" = "REMOTE-FOO" ]
 d25_aside=""; for d in "${d25h}"/foo.pre-dotfiles-*; do [ -d "${d}" ] && { d25_aside="${d}"; break; }; done
 if [ -n "${d25_aside}" ] && [ "$(cat "${d25_aside}/keep.txt" 2>/dev/null)" = "PRECIOUS-DIR-DATA" ]; then ok "the whole directory (with its contents) was moved aside — NEVER clobbered"; else fail "DATA LOSS: the directory collider's contents were not preserved at *.pre-dotfiles"; fi
 
+# --- I1 (slice 5): iCloud evict FAIL-CLOSED gate. macOS-gated (the iCloud modes are macOS-only;
+#     PLATFORM=macos comes from `uname -s`). Live iCloud is NOT testable — brctl is shimmed on PATH
+#     (records every call) and the upload-state helper is shimmed via $ICLOUD_HELPER (exit 0 = all
+#     uploaded / exit 1 = some not). Asserts the load-bearing property: evict calls brctl ONLY when
+#     every gate passes AND the helper confirms all candidates uploaded. Sandbox HOME (a CloudDocs
+#     tree under it), NEVER real iCloud. ---
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo "smoke: I1 — iCloud evict is fail-closed (gates + helper-confirms-uploaded); brctl is shimmed"
+  i1h="${sandbox}/icloud-home"; i1cd="${i1h}/Library/Mobile Documents/com~apple~CloudDocs/td"
+  mkdir -p "${i1cd}"; printf 'a\n' > "${i1cd}/f1"; printf 'b\n' > "${i1cd}/f2"
+  i1shim="${sandbox}/icloud-shim"; mkdir -p "${i1shim}"
+  printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s/brctl.log"\nexit 0\n' "${sandbox}" > "${i1shim}/brctl"
+  chmod +x "${i1shim}/brctl"
+  i1ok="${sandbox}/helper-ok"
+  # shellcheck disable=SC2016   # $p is literal inside the shim script being written, not expanded here
+  printf '#!/bin/bash\nfor p; do printf "uploaded\\t%%s\\n" "$p"; done\nexit 0\n' > "${i1ok}"; chmod +x "${i1ok}"
+  i1no="${sandbox}/helper-no"
+  # shellcheck disable=SC2016   # $p is literal inside the shim script being written, not expanded here
+  printf '#!/bin/bash\nfor p; do printf "not-uploaded\\t%%s\\n" "$p"; done\nexit 1\n' > "${i1no}"; chmod +x "${i1no}"
+  i1run() { PATH="${i1shim}:${PATH}" HOME="${i1h}" XDG_CONFIG_HOME="${i1h}/.config" XDG_CACHE_HOME="${i1h}/.cache" \
+    /bin/bash "${PROV}" "$@"; }
+  : > "${sandbox}/brctl.log"
+  # (a) path OUTSIDE CloudDocs → die, ZERO evict.
+  set +e; out="$(ICLOUD_HELPER="${i1ok}" i1run --icloud-evict /tmp --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "evict of a path outside CloudDocs is refused"
+  assert_contains "${out}" "not under iCloud Drive" "the refusal explains the path must be under iCloud Drive"
+  # (b) missing consent flag → die.
+  set +e; out="$(ICLOUD_HELPER="${i1ok}" i1run --icloud-evict "${i1cd}" --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "evict without --i-understand-data-loss-risk is refused"
+  assert_contains "${out}" "i-understand-data-loss-risk" "the refusal names the required consent flag"
+  # (c) helper not built/executable → graceful degrade (die pointing at --offload).
+  set +e; out="$(ICLOUD_HELPER="${sandbox}/no-such-helper" i1run --icloud-evict "${i1cd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "evict without the upload-state helper is refused"
+  assert_contains "${out}" "make helper" "the helper-absent refusal tells the user to build it"
+  assert_contains "${out}" "--offload" "the helper-absent refusal points at the safer rclone offload"
+  # (d) THE fail-closed gate: helper reports not-uploaded → refuse, evict NOTHING.
+  set +e; out="$(ICLOUD_HELPER="${i1no}" i1run --icloud-evict "${i1cd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "evict is refused when the helper reports a file not-uploaded (fail-closed)"
+  assert_contains "${out}" "fail-closed" "the refusal states it is fail-closed"
+  if [ -s "${sandbox}/brctl.log" ] && grep -q evict "${sandbox}/brctl.log"; then fail "DATA LOSS: brctl evict was called despite a not-uploaded file"; else ok "brctl evict was NOT called on the not-uploaded set (evicted NOTHING)"; fi
+  # (e) dry-run (helper OK) → previews, calls NO evict.
+  : > "${sandbox}/brctl.log"
+  set +e; out="$(ICLOUD_HELPER="${i1ok}" i1run --icloud-evict "${i1cd}" --i-understand-data-loss-risk 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "dry-run evict (all uploaded) exits 0" "dry-run evict failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "dry-run" "dry-run evict labels its output as a preview"
+  if grep -q evict "${sandbox}/brctl.log" 2>/dev/null; then fail "dry-run evict actually called brctl evict"; else ok "dry-run evict called NO brctl evict"; fi
+  # (f) apply (helper OK) → evicts every uploaded candidate (shimmed brctl records the calls).
+  : > "${sandbox}/brctl.log"
+  set +e; out="$(ICLOUD_HELPER="${i1ok}" i1run --icloud-evict "${i1cd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "apply evict (all uploaded) exits 0" "apply evict failed (exit ${rc}): ${out}"
+  i1n="$(grep -c evict "${sandbox}/brctl.log" 2>/dev/null || printf 0)"
+  if [ "${i1n}" -eq 2 ]; then ok "apply evict called brctl evict for each uploaded candidate (2)"; else fail "expected 2 brctl evict calls, got ${i1n}"; fi
+  # (g) status is read-only (no helper needed) and calls no brctl.
+  : > "${sandbox}/brctl.log"
+  set +e; out="$(i1run --icloud-status "${i1cd}" 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "icloud-status exits 0 (read-only, no helper)" "icloud-status failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "iCloud status under" "status prints its read-only header"
+  if grep -q . "${sandbox}/brctl.log" 2>/dev/null; then fail "icloud-status called brctl (should be read-only)"; else ok "icloud-status called no brctl (read-only)"; fi
+else
+  echo "smoke: I1 iCloud evict gate — SKIPPED (macOS-only; uname=$(uname -s))"
+fi
+
+# --- I2 (slice 5): iCloud evict — extra gate coverage extending I1. Same mock model (brctl
+#     PATH-shim RECORDS to $BRCTL_LOG and never evicts; ICLOUD_HELPER env-shim is controllable).
+#     Adds: brctl-absent, a MIXED upload set (whole-set-before-any-evict), a helper ERROR,
+#     dataless-skip (stat-shim), --icloud-download (add-only), mode mutual-exclusion, and
+#     `make helper` graceful-degrade without swiftc. macOS-gated; NO real brctl/iCloud/eviction. ---
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo "smoke: I2 — iCloud evict extra gates (brctl-absent, mixed/error, dataless-skip, download, mutual-exclusion)"
+  i2h="${sandbox}/i2-home"; i2cd="${i2h}/Library/Mobile Documents/com~apple~CloudDocs/td"; mkdir -p "${i2cd}"
+  i2log="${sandbox}/i2-brctl.log"
+  i2shim="${sandbox}/i2-shim"; mkdir -p "${i2shim}"
+  cat > "${i2shim}/brctl" <<'SH'
+#!/bin/bash
+printf '%s\n' "$*" >> "$BRCTL_LOG"
+exit 0
+SH
+  chmod +x "${i2shim}/brctl"
+  i2ok="${sandbox}/i2-helper-ok"
+  cat > "${i2ok}" <<'SH'
+#!/bin/bash
+for p; do printf 'uploaded\t%s\n' "$p"; done
+exit 0
+SH
+  chmod +x "${i2ok}"
+  i2mix="${sandbox}/i2-helper-mixed"
+  cat > "${i2mix}" <<'SH'
+#!/bin/bash
+i=0
+for p; do i=$((i + 1)); if [ "$i" = 1 ]; then printf 'uploaded\t%s\n' "$p"; else printf 'not-uploaded\t%s\n' "$p"; fi; done
+exit 1
+SH
+  chmod +x "${i2mix}"
+  i2err="${sandbox}/i2-helper-err"
+  cat > "${i2err}" <<'SH'
+#!/bin/bash
+exit 2
+SH
+  chmod +x "${i2err}"
+  i2run() { PATH="${i2shim}:${PATH}" BRCTL_LOG="${i2log}" HOME="${i2h}" \
+    XDG_CONFIG_HOME="${i2h}/.config" XDG_CACHE_HOME="${i2h}/.cache" /bin/bash "${PROV}" "$@"; }
+  # One curated bin: all /usr/bin symlinks MINUS brctl and swiftc, reused for (h) + (n). Pure
+  # builtin path-strip (no basename subshell). brctl/swiftc ship in /usr/bin, so this is the only
+  # reliable way to simulate their absence on a stock Mac.
+  i2cur="${sandbox}/i2-curated-bin"; mkdir -p "${i2cur}"
+  for f in /usr/bin/*; do b="${f##*/}"; case "$b" in brctl|swiftc) : ;; *) ln -sf "$f" "${i2cur}/$b" ;; esac; done
+
+  # (h) brctl ABSENT → die, ZERO evict (curated PATH has no brctl; the recording shim is absent too).
+  printf 'a\n' > "${i2cd}/fh"; : > "${i2log}"
+  set +e
+  out="$(PATH="${i2cur}:/bin" BRCTL_LOG="${i2log}" HOME="${i2h}" XDG_CONFIG_HOME="${i2h}/.config" \
+    XDG_CACHE_HOME="${i2h}/.cache" ICLOUD_HELPER="${i2ok}" \
+    /bin/bash "${PROV}" --icloud-evict "${i2cd}" --i-understand-data-loss-risk --apply 2>&1)"
+  rc=$?
+  set -e
+  assert_nonzero "${rc}" "evict is refused when brctl is absent"
+  assert_contains "${out}" "brctl not found" "the brctl-absent refusal explains brctl is required"
+  if grep -q evict "${i2log}" 2>/dev/null; then fail "DATA LOSS: an evict was recorded despite brctl being absent"; else ok "brctl-absent path evicted NOTHING"; fi
+
+  # (i) MIXED set (first uploaded, second not) → die, ZERO evict (whole set checked before any evict).
+  rm -f "${i2cd:?}"/*; printf '1\n' > "${i2cd}/f1"; printf '2\n' > "${i2cd}/f2"; : > "${i2log}"
+  set +e; out="$(ICLOUD_HELPER="${i2mix}" i2run --icloud-evict "${i2cd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "evict is refused when the helper reports a MIXED (one not-uploaded) set"
+  if grep -q evict "${i2log}" 2>/dev/null; then fail "DATA LOSS: evicted despite a mixed not-uploaded set (per-file interleave)"; else ok "mixed set evicted NOTHING (whole set gated before any evict)"; fi
+
+  # (j) helper ERROR (exit 2, no output) → die, ZERO evict.
+  : > "${i2log}"
+  set +e; out="$(ICLOUD_HELPER="${i2err}" i2run --icloud-evict "${i2cd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "evict is refused when the helper errors"
+  if grep -q evict "${i2log}" 2>/dev/null; then fail "DATA LOSS: evicted despite a helper error"; else ok "helper-error evicted NOTHING"; fi
+
+  # (k) DATALESS-SKIP: a stat-shim reports one file dataless (icloud_is_dataless reads `stat -f %Sf`),
+  #     so a dir with [dataless + uploaded] evicts ONLY the uploaded, non-dataless file.
+  i2sshim="${sandbox}/i2-stat-shim"; mkdir -p "${i2sshim}"
+  cat > "${i2sshim}/stat" <<'SH'
+#!/bin/bash
+for last; do :; done
+case "$last" in *DATALESS*) echo dataless; exit 0 ;; esac
+exec /usr/bin/stat "$@"
+SH
+  chmod +x "${i2sshim}/stat"; cp "${i2shim}/brctl" "${i2sshim}/brctl"
+  rm -f "${i2cd:?}"/*; printf 'u\n' > "${i2cd}/f_upload"; printf 'd\n' > "${i2cd}/f_DATALESS"; : > "${i2log}"
+  set +e
+  out="$(PATH="${i2sshim}:${PATH}" BRCTL_LOG="${i2log}" HOME="${i2h}" XDG_CONFIG_HOME="${i2h}/.config" \
+    XDG_CACHE_HOME="${i2h}/.cache" ICLOUD_HELPER="${i2ok}" \
+    /bin/bash "${PROV}" --icloud-evict "${i2cd}" --i-understand-data-loss-risk --apply 2>&1)"
+  rc=$?
+  set -e
+  pass_if "${rc}" "evict with a dataless file present exits 0" "dataless-skip evict failed (exit ${rc}): ${out}"
+  i2ne="$(grep -c evict "${i2log}" 2>/dev/null || printf 0)"
+  if [ "${i2ne}" -eq 1 ] && grep -q 'f_upload' "${i2log}" && ! grep -q 'f_DATALESS' "${i2log}"; then ok "only the uploaded, non-dataless file was evicted (dataless one skipped)"; else fail "dataless-skip wrong — evicted ${i2ne} file(s): $(cat "${i2log}" 2>/dev/null)"; fi
+
+  # (l) --icloud-download → brctl download per file, add-only (NO evict); works with the default (no) helper.
+  rm -f "${i2cd:?}"/*; printf 'x\n' > "${i2cd}/g1"; printf 'y\n' > "${i2cd}/g2"; : > "${i2log}"
+  set +e; out="$(i2run --icloud-download "${i2cd}" --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "icloud-download --apply exits 0 (no helper needed)" "download failed (exit ${rc}): ${out}"
+  i2dn="$(grep -c download "${i2log}" 2>/dev/null || printf 0)"
+  if [ "${i2dn}" -eq 2 ]; then ok "download called brctl download once per file (add-only, 2)"; else fail "expected 2 brctl download calls, got ${i2dn}"; fi
+  if grep -q evict "${i2log}" 2>/dev/null; then fail "download called brctl EVICT (must be add-only)"; else ok "download called NO evict (add-only)"; fi
+
+  # (m) mode mutual-exclusion: two modes in one invocation → refused.
+  set +e; out="$(i2run --icloud-evict "${i2cd}" --icloud-status "${i2cd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "combining two modes in one run is refused"
+  assert_contains "${out}" "ONE mode" "the refusal explains only one mode runs per invocation"
+
+  # (n) `make helper` WITHOUT swiftc → graceful exit 0 (curated PATH minus swiftc; no build attempted).
+  set +e; out="$(PATH="${i2cur}:/bin" make -C "${repo}" helper 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "make helper exits 0 when swiftc is absent (graceful degrade)" "make helper failed without swiftc (exit ${rc}): ${out}"
+  assert_contains "${out}" "swiftc not found" "make helper explains swiftc is needed and skips gracefully"
+else
+  echo "smoke: I2 iCloud evict extra gates — SKIPPED (macOS-only; uname=$(uname -s))"
+fi
+
 echo "smoke: PASS"

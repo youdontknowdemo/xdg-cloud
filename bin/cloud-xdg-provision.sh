@@ -97,6 +97,15 @@ DOTFILES_SENTINEL_END="# <<< xdg-cloud dotfiles <<<"      # rc-block end marker
 : "${DOTFILES_RC:=}"                                      # explicit rc path (--dotfiles-rc); else $SHELL-derived
 RC_TARGET=""                                              # resolved rc (set by dotfiles_resolve_rc)
 
+# iCloud brctl lane (slice 5, step 9) — macOS-only true-offload for iCloud-native data. SECONDARY
+# to the rclone --offload (which verifies durable upload before dropping local); iCloud evict is
+# heavily gated + fail-closed. status/download are stock; evict needs the compiled upload-state
+# helper (make helper) — it is env-overridable so tests can shim it.
+ICLOUD_ROOT="$HOME/Library/Mobile Documents/com~apple~CloudDocs"   # same iCloud root as cloud_root_is_live
+: "${ICLOUD_HELPER:=$__self_dir/icloud-uploaded}"                  # compiled binary beside this script
+ICLOUD_CONFIRM=0                                                    # set by --i-understand-data-loss-risk
+ICLOUD_TARGET=""                                                    # resolved target (set by icloud_resolve_under_root)
+
 # State for the single master cleanup trap (cleanup_handler). bash 3.2 allows only
 # ONE handler per signal and has no trap-stacking, so the concurrency lock (#5c),
 # the macOS TCC-probe revert (B2), and the mid-relocate recovery message (B3) must
@@ -360,6 +369,17 @@ lane per run — combining a mode with the default flags is refused):
   --dotfiles-rc PATH     Shell rc to edit (default: ~/.zshrc for zsh, ~/.bashrc for bash).
                          macOS bash login shells usually want --dotfiles-rc ~/.bash_profile.
 
+iCloud (macOS only; paths under ~/Library/Mobile Documents/com~apple~CloudDocs):
+  --icloud-status <path>    Report in-iCloud / dataless / uploaded state (read-only).
+  --icloud-download <path>  Materialize (hydrate) dataless files — only ADDS data, reversible.
+  --icloud-evict <path>     Free local space by evicting FULLY-UPLOADED files to dataless
+                            placeholders. Requires the compiled upload-state helper (make helper)
+                            AND --i-understand-data-loss-risk. dry-run unless --apply.
+                            NOTE: for guaranteed space-freeing prefer the rclone offload (--offload);
+                            it verifies durable upload before dropping local.
+  --i-understand-data-loss-risk  Required consent for --icloud-evict (no reliable programmatic
+                            check for the 'Optimize Mac Storage' setting).
+
 Nothing is moved without --apply --relocate together.
 EOF
 }
@@ -409,6 +429,10 @@ $1"
                           continue ;;
     --dotfiles-status)    set_mode dotfiles-status ;;
     --dotfiles-remote)    set_mode dotfiles-remote; shift; MODE_ARG="${1:?--dotfiles-remote needs a repo URL}" ;;
+    --icloud-status)      set_mode icloud-status;   shift; MODE_ARG="${1:?--icloud-status needs a path}" ;;
+    --icloud-download)    set_mode icloud-download; shift; MODE_ARG="${1:?--icloud-download needs a path}" ;;
+    --icloud-evict)       set_mode icloud-evict;    shift; MODE_ARG="${1:?--icloud-evict needs a path}" ;;
+    --i-understand-data-loss-risk) ICLOUD_CONFIRM=1 ;;
     -h|--help)            usage; exit 0 ;;
     *)                    die "unknown option: $1 (try --help)" ;;
   esac
@@ -1690,6 +1714,121 @@ ${refused}  Fix the repo (remove escaping paths; untrack managed dirs), then ret
 }
 
 # ---------------------------------------------------------------------------
+# iCloud brctl lane (slice 5, step 9) — macOS-only. SECONDARY to the rclone --offload (which
+# verifies durable upload before dropping local). --icloud-evict is fail-closed: it evicts NOTHING
+# unless every gate passes AND the compiled helper confirms EVERY candidate is fully uploaded.
+# --icloud-status is read-only; --icloud-download only ADDS data (reversible). Live iCloud is not
+# testable in smoke — brctl is invoked via run() (PATH-shimmable) and the helper via $ICLOUD_HELPER.
+# ---------------------------------------------------------------------------
+
+icloud_guard_macos() { [ "$PLATFORM" = "macos" ] || die "iCloud modes are macOS-only (this is $PLATFORM)."; }
+
+icloud_require_brctl() { command -v brctl >/dev/null 2>&1 || die "brctl not found (macOS iCloud tool). Cannot proceed."; }
+
+# Normalize $1 to an absolute path and require it under $ICLOUD_ROOT (and that it exists).
+# bash 3.2 — no readlink -f. Sets the global ICLOUD_TARGET.
+icloud_resolve_under_root() {
+  case "$1" in /*) ICLOUD_TARGET="$1" ;; *) ICLOUD_TARGET="$(pwd)/$1" ;; esac
+  case "$ICLOUD_TARGET" in
+    "$ICLOUD_ROOT"|"$ICLOUD_ROOT"/*) : ;;
+    *) die "path is not under iCloud Drive ($ICLOUD_ROOT): $ICLOUD_TARGET" ;;
+  esac
+  [ -e "$ICLOUD_TARGET" ] || die "no such path: $ICLOUD_TARGET"
+}
+
+# True (0) if $1 is already dataless (evicted / no local extents) — evict would be a no-op.
+# Explicit return in each branch (set-e trailing-match footgun).
+icloud_is_dataless() {
+  case "$(stat -f '%Sf' "$1" 2>/dev/null)" in
+    *dataless*) return 0 ;;
+    *)          return 1 ;;
+  esac
+}
+
+# --icloud-status <path>: read-only report. NO helper required (reports 'unknown' without it).
+cmd_icloud_status() {                    # $1 = path
+  icloud_guard_macos
+  icloud_resolve_under_root "$1"
+  local have_helper=0; [ -x "$ICLOUD_HELPER" ] && have_helper=1
+  log "iCloud status under: $ICLOUD_TARGET (read-only)"
+  local ftmp f ubi datal upl
+  ftmp="$(mktemp "${TMPDIR:-/tmp}/xdg-icloud.XXXXXX")" || die "cannot create temp file"
+  find "$ICLOUD_TARGET" -type f > "$ftmp" 2>/dev/null || true
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    if icloud_is_dataless "$f"; then datal="dataless"; else datal="materialized"; fi
+    case "$(mdls -name kMDItemFSIsUbiquitous -raw "$f" 2>/dev/null)" in 1|"(1)"|true) ubi="in-icloud" ;; *) ubi="local?" ;; esac
+    if [ "$have_helper" -eq 1 ]; then
+      if "$ICLOUD_HELPER" "$f" >/dev/null 2>&1; then upl="uploaded"; else upl="not-uploaded"; fi
+    else upl="unknown(helper not built)"; fi
+    printf '  %-12s %-14s %-24s %s\n' "$ubi" "$datal" "$upl" "$f"
+  done < "$ftmp"
+  rm -f "$ftmp"
+}
+
+# --icloud-download <path>: materialize dataless files. Only ADDS data — reversible/safe. No helper.
+cmd_icloud_download() {                  # $1 = path
+  begin_mutating_mode
+  icloud_guard_macos; icloud_resolve_under_root "$1"; icloud_require_brctl
+  local ftmp f
+  ftmp="$(mktemp "${TMPDIR:-/tmp}/xdg-icloud.XXXXXX")" || die "cannot create temp file"
+  find "$ICLOUD_TARGET" -type f > "$ftmp" 2>/dev/null || true
+  [ -s "$ftmp" ] || { rm -f "$ftmp"; info "no files to download under: $ICLOUD_TARGET"; return 0; }
+  while IFS= read -r f; do [ -z "$f" ] && continue; run brctl download "$f"; done < "$ftmp"
+  rm -f "$ftmp"
+  if [ "$DRY_RUN" -eq 1 ]; then info "[dry-run] would download (hydrate) the files above (re-run with --apply)."
+  else info "Download (hydrate) complete."; fi
+}
+
+# --icloud-evict <path>: THE fail-closed gate. Evict local copies of FULLY-UPLOADED files to dataless
+# placeholders. Gates cheapest -> most-expensive; ANY fail => die, evict NOTHING. No trap flag: each
+# evict is pre-proven-uploaded AND reversible (re-download), so a mid-batch interrupt is safe.
+cmd_icloud_evict() {                     # $1 = path
+  begin_mutating_mode
+  icloud_guard_macos                                   # (1) macOS only
+  icloud_resolve_under_root "$1"                       # (2) under CloudDocs (+ exists)
+  icloud_require_brctl                                 # (3) brctl present
+  [ -x "$ICLOUD_HELPER" ] || die "upload-state helper not built ($ICLOUD_HELPER).
+  Run 'make helper' (needs Xcode Command Line Tools). Without it, upload state can't be verified, so
+  evict is refused. For guaranteed space-freeing use the rclone offload: '$SELF --offload <dir>'."   # (4) graceful degrade
+  [ "$ICLOUD_CONFIRM" -eq 1 ] || die "evict can lose data if 'Optimize Mac Storage' is off or files
+  aren't uploaded; that OS setting has no reliable programmatic check. Re-run with
+  --i-understand-data-loss-risk to proceed. (Safer alternative: '$SELF --offload <dir>'.)"           # (5) explicit consent
+
+  # (6) candidate list = every NON-dataless file (dataless = already evicted, skip as a no-op).
+  # bash 3.2: temp file + while-read + indexed-array append (no mapfile / no process-substitution).
+  local ftmp f; local candidates=()
+  ftmp="$(mktemp "${TMPDIR:-/tmp}/xdg-icloud.XXXXXX")" || die "cannot create temp file"
+  find "$ICLOUD_TARGET" -type f > "$ftmp" 2>/dev/null || true
+  while IFS= read -r f; do [ -z "$f" ] && continue; icloud_is_dataless "$f" && continue; candidates+=("$f"); done < "$ftmp"
+  rm -f "$ftmp"
+  [ "${#candidates[@]}" -gt 0 ] || { info "nothing to evict (all already dataless or empty)."; return 0; }
+
+  # (7) THE UPLOAD GATE — the helper must confirm EVERY candidate uploaded (rc 0), in ONE exec.
+  # Read-only; runs in dry-run too for an accurate preview. Fail-closed: any not-uploaded/error =>
+  # evict NOTHING (covers the WHOLE set before a single evict — no per-file interleave).
+  local hout; hout="$(mktemp "${TMPDIR:-/tmp}/xdg-icloud.XXXXXX")" || die "cannot create temp file"
+  if ! "$ICLOUD_HELPER" "${candidates[@]}" > "$hout" 2>/dev/null; then
+    warn "refusing to evict — NOT every target file is confirmed fully-uploaded (fail-closed):"
+    grep -v '^uploaded	' "$hout" 2>/dev/null | sed 's/^/    /' >&2 || true
+    rm -f "$hout"
+    die "evict aborted. Wait for iCloud upload (check '$SELF --icloud-status <path>'), or use
+  '$SELF --offload <dir>' for a verified space-free. Nothing was evicted."
+  fi
+  rm -f "$hout"
+
+  # (8) EVICT (apply only; dry-run prints via run()). Per-file — 'brctl evict <dir>' is undocumented.
+  local c
+  for c in "${candidates[@]}"; do run brctl evict "$c"; done
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "[dry-run] would evict ${#candidates[@]} fully-uploaded file(s). Re-run with --apply to act."
+  else
+    info "Evicted ${#candidates[@]} fully-uploaded file(s) to dataless placeholders. Re-download with
+  '$SELF --icloud-download <path>' or by opening them."
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 main() {
@@ -1765,6 +1904,9 @@ dispatch_mode() {
     dotfiles-track)   cmd_dotfiles_track "$MODE_ARG" ;;
     dotfiles-status)  cmd_dotfiles_status ;;
     dotfiles-remote)  cmd_dotfiles_adopt "$MODE_ARG" ;;
+    icloud-status)    cmd_icloud_status   "$MODE_ARG" ;;
+    icloud-download)  cmd_icloud_download "$MODE_ARG" ;;
+    icloud-evict)     cmd_icloud_evict    "$MODE_ARG" ;;
     *)                die "internal: unknown mode '$MODE'" ;;
   esac
 }

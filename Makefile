@@ -4,7 +4,7 @@
 
 VERSION := $(shell cat VERSION)
 
-.PHONY: lint test install version
+.PHONY: lint test install version helper
 .DEFAULT_GOAL := lint
 
 ## lint: shellcheck all shell sources; honors .shellcheckrc; non-zero on any finding.
@@ -36,3 +36,15 @@ install:
 ## version: print the canonical version string from the VERSION file.
 version:
 	@echo $(VERSION)
+
+## helper: compile the iCloud upload-state helper (macOS + Xcode Command Line Tools). OPTIONAL —
+##         only `--icloud-evict` needs it. If swiftc is absent (e.g. Linux/CI), the binary is NOT
+##         produced and evict refuses at runtime — this target still EXITS 0 so make never breaks.
+##         The compiled binary (bin/icloud-uploaded) is .gitignore'd — never commit it.
+helper:
+	@if command -v swiftc >/dev/null 2>&1; then \
+	   swiftc -O -o bin/icloud-uploaded bin/icloud-uploaded.swift && chmod +x bin/icloud-uploaded && \
+	   echo "built bin/icloud-uploaded"; \
+	 else \
+	   echo "swiftc not found (install Xcode Command Line Tools) — skipping helper; --icloud-evict will refuse until built." >&2; \
+	 fi
