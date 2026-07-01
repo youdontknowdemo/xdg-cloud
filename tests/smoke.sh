@@ -1966,4 +1966,241 @@ assert_contains "${out}" "refusing" "the managed path is named in the refusal"
 tracked="$(git --git-dir="${df_home}/.dotfiles" --work-tree="${df_home}" ls-files 2>/dev/null)"
 if printf '%s\n' "${tracked}" | grep -qx ".multi3"; then fail "FAIL-CLOSED VIOLATION: the valid path was staged despite a managed path in the set"; else ok "fail-closed: the valid path was NOT staged (all-or-nothing)"; fi
 
+# --- D13 (slice 4): dotfiles ADOPT (--dotfiles-remote) — the CLOBBER surface. Uses a REAL local
+#     bare-repo fixture as the <url> and a SANDBOX HOME (never real $HOME/~/.dotfiles/~/.zshrc).
+#     Asserts: collider→aside (original preserved, remote checked out), managed-lane repo refused
+#     ($HOME UNTOUCHED, clone removed, no leak), refuse when ~/.dotfiles exists. ---
+echo "smoke: D13 — dotfiles adopt: collider→aside, managed-lane refused ($HOME untouched), exists→refuse"
+# Fixture A: a normal dotfiles repo tracking .bashrc (used as the clone <url>).
+adopt_src="${sandbox}/adopt-src"; mkdir -p "${adopt_src}"
+( cd "${adopt_src}" && git init -q && printf 'REMOTE-BASHRC\n' > .bashrc \
+    && git -c user.email=t@t -c user.name=t add .bashrc \
+    && git -c user.email=t@t -c user.name=t commit -qm init ) >/dev/null 2>&1
+# Fixture B: a MISCONFIGURED repo tracking a cloud-xdg-managed path (Documents/) + a normal file.
+adopt_msrc="${sandbox}/adopt-msrc"; mkdir -p "${adopt_msrc}/Documents"
+( cd "${adopt_msrc}" && git init -q && printf 'x\n' > Documents/foo && printf 'y\n' > .vimrc \
+    && git -c user.email=t@t -c user.name=t add -A \
+    && git -c user.email=t@t -c user.name=t commit -qm init ) >/dev/null 2>&1
+adrun() { HOME="$1" XDG_CONFIG_HOME="$1/.config" XDG_CACHE_HOME="$1/.cache" \
+  /bin/bash "${PROV}" --dotfiles-rc "$1/.zshrc" "${@:2}"; }
+# (a) collider: a local .bashrc must be moved aside (content preserved), remote checked out.
+ad_a="${sandbox}/adopt-collide"; mkdir -p "${ad_a}"; printf 'LOCAL-KEEP\n' > "${ad_a}/.bashrc"
+set +e; out="$(adrun "${ad_a}" --dotfiles-remote "${adopt_src}" --apply 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "adopt with a collider exits 0" "adopt collider failed (exit ${rc}): ${out}"
+if [ "$(cat "${ad_a}/.bashrc" 2>/dev/null)" = "REMOTE-BASHRC" ]; then ok "the remote dotfile was checked out"; else fail "adopt did not check out the remote .bashrc"; fi
+ad_aside=""; for f in "${ad_a}"/.bashrc.pre-dotfiles-*; do [ -e "${f}" ] && { ad_aside="${f}"; break; }; done
+if [ -n "${ad_aside}" ] && [ "$(cat "${ad_aside}" 2>/dev/null)" = "LOCAL-KEEP" ]; then ok "the pre-existing local file was moved aside with its content PRESERVED (never clobbered)"; else fail "collider was not asided / original content lost"; fi
+# (b) managed-lane repo: refused, $HOME fully untouched (no clone, no checkout of the non-managed file).
+ad_b="${sandbox}/adopt-managed"; mkdir -p "${ad_b}"
+set +e; out="$(adrun "${ad_b}" --dotfiles-remote "${adopt_msrc}" --apply 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "adopt of a managed-lane repo exits non-zero (fail-closed)"
+assert_contains "${out}" "Documents/foo" "the refusal NAMES the managed offender path"
+if [ -e "${ad_b}/.dotfiles" ]; then fail "CLOBBER RISK: the fresh clone was left behind on managed-refuse"; else ok "the fresh clone was removed on managed-refuse"; fi
+if [ -e "${ad_b}/.vimrc" ]; then fail "\$HOME VIOLATION: a repo file leaked into \$HOME despite the refusal"; else ok "\$HOME left completely untouched on managed-refuse (nothing checked out)"; fi
+# (c) refuse when ~/.dotfiles already exists (fresh-machine only).
+ad_c="${sandbox}/adopt-exists"; mkdir -p "${ad_c}/.dotfiles"
+set +e; out="$(adrun "${ad_c}" --dotfiles-remote "${adopt_src}" --apply 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "adopt refuses when ~/.dotfiles already exists"
+assert_contains "${out}" "refusing to clobber" "the pre-existing ~/.dotfiles is not clobbered"
+
+# git_seed DIR — init a work repo in DIR (files already written), commit everything. The
+# committed repo path is usable directly as a --dotfiles-remote <url> (adopt clones --bare it).
+git_seed() {
+  ( cd "$1" && git init -q \
+      && git -c user.email=t@t -c user.name=t add -A \
+      && git -c user.email=t@t -c user.name=t commit -qm seed ) >/dev/null 2>&1
+}
+
+# --- D14 (slice 4): adopt FRESH (no colliders) — every tracked file is checked out into the
+#     sandbox $HOME with matching content, the alias file + rc block are written, and the bare
+#     repo is configured status.showUntrackedFiles=no. Reuses the D13 adrun helper. ---
+echo "smoke: D14 — fresh adopt checks out all tracked files + writes alias/rc + sets showUntrackedFiles=no"
+d14src="${sandbox}/d14-src"; mkdir -p "${d14src}/.config"
+printf 'FRESH-BASHRC\n' > "${d14src}/.bashrc"; printf 'FRESH-CFG\n' > "${d14src}/.config/app.conf"
+git_seed "${d14src}"
+d14h="${sandbox}/d14-home"; mkdir -p "${d14h}"
+set +e; out="$(adrun "${d14h}" --dotfiles-remote "${d14src}" --apply 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "fresh adopt exits 0" "fresh adopt failed (exit ${rc}): ${out}"
+if [ "$(cat "${d14h}/.bashrc" 2>/dev/null)" = "FRESH-BASHRC" ] && [ "$(cat "${d14h}/.config/app.conf" 2>/dev/null)" = "FRESH-CFG" ]; then
+  ok "all tracked files checked out with matching content (incl. a nested path)"; else fail "adopt did not check out the tracked files"; fi
+# shellcheck disable=SC2016   # INTENTIONAL literal: the alias must keep $HOME unexpanded
+if [ -f "${d14h}/.config/xdg-cloud/aliases.sh" ] && grep -qF 'git --git-dir=$HOME/.dotfiles --work-tree=$HOME' "${d14h}/.config/xdg-cloud/aliases.sh"; then
+  ok "alias file written (literal \$HOME)"; else fail "alias file missing / \$HOME expanded"; fi
+assert_contains "$(cat "${d14h}/.zshrc" 2>/dev/null)" ">>> xdg-cloud dotfiles >>>" "rc source block installed on the sandbox --dotfiles-rc"
+if [ "$(git --git-dir="${d14h}/.dotfiles" config --get status.showUntrackedFiles 2>/dev/null)" = "no" ]; then
+  ok "bare repo configured status.showUntrackedFiles=no"; else fail "showUntrackedFiles was not set to no"; fi
+
+# --- D15 (slice 4): ASIDE-COLLISION — a *.pre-dotfiles-<stamp> already present must NOT be
+#     overwritten; the uniquifier advances to .1. A `date` PATH-shim pins the stamp. ---
+echo "smoke: D15 — adopt aside uniquifier advances on a colliding .pre-dotfiles name (.1), keeps the earlier aside"
+d15shim="${sandbox}/d15-shim"; mkdir -p "${d15shim}"
+cat > "${d15shim}/date" <<'DATESH'
+#!/bin/sh
+echo "20260202-000000"
+DATESH
+chmod +x "${d15shim}/date"
+d15src="${sandbox}/d15-src"; mkdir -p "${d15src}"; printf 'R15\n' > "${d15src}/.bashrc"; git_seed "${d15src}"
+d15h="${sandbox}/d15-home"; mkdir -p "${d15h}"
+printf 'L15-CURRENT\n' > "${d15h}/.bashrc"
+printf 'OLD-ASIDE\n'  > "${d15h}/.bashrc.pre-dotfiles-20260202-000000"
+set +e
+out="$(PATH="${d15shim}:${PATH}" HOME="${d15h}" XDG_CONFIG_HOME="${d15h}/.config" XDG_CACHE_HOME="${d15h}/.cache" \
+  /bin/bash "${PROV}" --dotfiles-rc "${d15h}/.zshrc" --dotfiles-remote "${d15src}" --apply 2>&1)"
+rc=$?
+set -e
+pass_if "${rc}" "adopt with a colliding aside name exits 0" "adopt failed (exit ${rc}): ${out}"
+if [ "$(cat "${d15h}/.bashrc.pre-dotfiles-20260202-000000.1" 2>/dev/null)" = "L15-CURRENT" ]; then ok "the new aside advanced to .1 and holds the CURRENT local content"; else fail "aside uniquifier did not advance / lost content"; fi
+if [ "$(cat "${d15h}/.bashrc.pre-dotfiles-20260202-000000" 2>/dev/null)" = "OLD-ASIDE" ]; then ok "the earlier aside was NOT overwritten"; else fail "CLOBBER: the earlier aside was overwritten"; fi
+if [ "$(cat "${d15h}/.bashrc" 2>/dev/null)" = "R15" ]; then ok "the remote file was checked out"; else fail "remote file not checked out"; fi
+
+# --- D16 (slice 4): SYMLINK collider — a $HOME symlink is moved aside as the LINK (its target
+#     file is untouched), and the tracked file is checked out as a real file. ---
+echo "smoke: D16 — adopt asides a symlink collider (moves the link, target untouched) + checks out the tracked file"
+d16src="${sandbox}/d16-src"; mkdir -p "${d16src}"; printf 'R16\n' > "${d16src}/.bashrc"; git_seed "${d16src}"
+d16h="${sandbox}/d16-home"; mkdir -p "${d16h}"
+printf 'TARGET-CONTENT\n' > "${d16h}/realtarget"
+ln -s "${d16h}/realtarget" "${d16h}/.bashrc"
+set +e; out="$(adrun "${d16h}" --dotfiles-remote "${d16src}" --apply 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "adopt with a symlink collider exits 0" "adopt failed (exit ${rc}): ${out}"
+if [ -f "${d16h}/.bashrc" ] && [ ! -L "${d16h}/.bashrc" ] && [ "$(cat "${d16h}/.bashrc")" = "R16" ]; then ok "tracked file checked out as a real file"; else fail "tracked file not checked out as a real file"; fi
+d16_aside=""; for f in "${d16h}"/.bashrc.pre-dotfiles-*; do [ -L "${f}" ] && { d16_aside="${f}"; break; }; done
+if [ -n "${d16_aside}" ]; then ok "the collider SYMLINK was moved aside as a link (not its target)"; else fail "symlink collider was not asided as a link"; fi
+# T-M2: the asided link must still point at the ORIGINAL target (proves the LINK was moved,
+# not dereferenced-and-copied — a subtle clobber where the target's path identity is lost).
+if [ -n "${d16_aside}" ] && [ "$(readlink "${d16_aside}" 2>/dev/null)" = "${d16h}/realtarget" ]; then ok "the asided link still resolves to the ORIGINAL target path (moved, not dereferenced)"; else fail "the asided symlink does not point at the original target"; fi
+if [ "$(cat "${d16h}/realtarget" 2>/dev/null)" = "TARGET-CONTENT" ]; then ok "the symlink's target file is untouched"; else fail "the symlink target was modified"; fi
+
+# --- D17 (slice 4): MANAGED-LANE refuse, fail-closed, MID-LIST + with a COLLIDER present. The
+#     managed offender (repos/) sorts AFTER a valid dotfile (.aaarc) in ls-tree, and $HOME has a
+#     collider for .aaarc. PASS A must refuse BEFORE PASS B asides anything: the collider is NOT
+#     moved aside and $HOME is byte-identical. This proves the pre-scan runs fully first. ---
+echo "smoke: D17 — managed offender mid-list: refuse before any aside (collider intact, \$HOME byte-identical)"
+d17src="${sandbox}/d17-src"; mkdir -p "${d17src}/repos"
+printf 'OK\n' > "${d17src}/.aaarc"; printf 'BAD\n' > "${d17src}/repos/tracked"   # .aaarc sorts before repos/
+git_seed "${d17src}"
+d17h="${sandbox}/d17-home"; mkdir -p "${d17h}"
+printf 'COLLIDER-KEEP\n' > "${d17h}/.aaarc"           # a collider for the VALID path
+# Snapshot USER content only — exclude .cache (the mutating-mode lock scaffold is an expected
+# side effect of any --apply run, not a $HOME-data change).
+d17_before="$(cd "${d17h}" && find . -path ./.cache -prune -o -print | sort)"
+set +e; out="$(adrun "${d17h}" --dotfiles-remote "${d17src}" --apply 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "managed-lane repo is refused (fail-closed)"
+assert_contains "${out}" "repos/tracked" "the refusal names the managed offender (scanned mid-list)"
+if [ -e "${d17h}/.dotfiles" ]; then fail "CLOBBER RISK: fresh clone left behind on managed-refuse"; else ok "fresh clone removed on managed-refuse"; fi
+d17_asided=0; for f in "${d17h}"/.aaarc.pre-dotfiles-*; do [ -e "${f}" ] && d17_asided=1; done
+if [ "${d17_asided}" -eq 0 ]; then ok "the valid-path collider was NOT asided (PASS A refused before any PASS B aside)"; else fail "ORDER BUG: a collider was moved aside before the managed pre-scan refused"; fi
+if [ "$(cat "${d17h}/.aaarc" 2>/dev/null)" = "COLLIDER-KEEP" ]; then ok "the collider's original content is intact"; else fail "the collider was modified despite the refusal"; fi
+if [ "${d17_before}" = "$(cd "${d17h}" && find . -path ./.cache -prune -o -print | sort)" ]; then ok "\$HOME user content is byte-identical before/after the managed-refuse"; else fail "\$HOME changed despite the fail-closed refusal"; fi
+
+# --- D18 (slice 4): adopt refuses when ~/.dotfiles is ALREADY OURS (fresh-machine-only). ---
+echo "smoke: D18 — adopt refuses an already-initialized (ours) ~/.dotfiles"
+d18h="${sandbox}/d18-home"; mkdir -p "${d18h}"
+adrun "${d18h}" --dotfiles-init --apply >/dev/null 2>&1
+set +e; out="$(adrun "${d18h}" --dotfiles-remote "${adopt_src}" --apply 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "adopt over an already-ours ~/.dotfiles exits non-zero"
+assert_contains "${out}" "already" "the refusal explains the repo is already initialized (use pull/track)"
+
+# --- D19 (slice 4): clone-FAIL (bad url) — dies, the partial ~/.dotfiles is removed, $HOME untouched. ---
+echo "smoke: D19 — adopt clone failure removes the partial repo and leaves \$HOME untouched"
+d19h="${sandbox}/d19-home"; mkdir -p "${d19h}"
+# Exclude .cache (the apply-mode lock scaffold) — the invariant is "no user data / no partial repo".
+d19_before="$(cd "${d19h}" && find . -path ./.cache -prune -o -print | sort)"
+set +e; out="$(adrun "${d19h}" --dotfiles-remote "${sandbox}/does-not-exist.git" --apply 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "adopt of a bad url exits non-zero"
+assert_contains "${out}" "clone" "the failure explains the clone did not succeed"
+if [ -e "${d19h}/.dotfiles" ]; then fail "a partial ~/.dotfiles was left behind after clone failure"; else ok "the partial ~/.dotfiles was removed"; fi
+if [ "${d19_before}" = "$(cd "${d19h}" && find . -path ./.cache -prune -o -print | sort)" ]; then ok "\$HOME user content is byte-identical after a failed clone"; else fail "\$HOME changed after a failed clone"; fi
+
+# --- D20 (slice 4): dry-run — temp-clone preview lists would-aside + WOULD REFUSE and touches
+#     NOTHING under $HOME (no checkout, no aside, no ~/.dotfiles). ---
+echo "smoke: D20 — adopt dry-run previews (would-aside + WOULD REFUSE) and mutates nothing"
+d20h="${sandbox}/d20-home"; mkdir -p "${d20h}"; printf 'LOCAL20\n' > "${d20h}/.bashrc"
+d20_before="$(cd "${d20h}" && find . | sort)"
+set +e; out="$(adrun "${d20h}" --dotfiles-remote "${adopt_src}" 2>&1)"; rc=$?; set -e   # NO --apply
+pass_if "${rc}" "adopt dry-run exits 0" "adopt dry-run failed (exit ${rc}): ${out}"
+assert_contains "${out}" "would move aside" "dry-run previews the collider it would move aside"
+if [ "${d20_before}" = "$(cd "${d20h}" && find . | sort)" ] && [ ! -e "${d20h}/.dotfiles" ]; then ok "dry-run touched nothing under \$HOME (no aside, no clone)"; else fail "dry-run mutated \$HOME"; fi
+if [ "$(cat "${d20h}/.bashrc" 2>/dev/null)" = "LOCAL20" ]; then ok "the local file is untouched by the dry-run"; else fail "dry-run changed the local file"; fi
+# managed-repo dry-run names the WOULD-REFUSE offender — and (T-M3) must itself mutate NOTHING.
+d20m_before="$(cd "${d20h}" && find . | sort)"
+set +e; out="$(adrun "${d20h}" --dotfiles-remote "${adopt_msrc}" 2>&1)"; set -e
+assert_contains "${out}" "WOULD REFUSE" "dry-run flags a managed offender as WOULD REFUSE"
+if [ "${d20m_before}" = "$(cd "${d20h}" && find . | sort)" ] && [ ! -e "${d20h}/.dotfiles" ]; then ok "the managed-offender dry-run mutated nothing under \$HOME (no aside, no clone)"; else fail "the managed-offender dry-run mutated \$HOME"; fi
+
+# --- D21 (slice 4): unknown $SHELL with no --dotfiles-rc — resolve_rc dies BEFORE the clone; no repo. ---
+echo "smoke: D21 — adopt with an unknown \$SHELL and no --dotfiles-rc refuses before cloning"
+d21h="${sandbox}/d21-home"; mkdir -p "${d21h}"
+set +e
+out="$(HOME="${d21h}" XDG_CONFIG_HOME="${d21h}/.config" XDG_CACHE_HOME="${d21h}/.cache" \
+  SHELL=/usr/bin/fish /bin/bash "${PROV}" --dotfiles-remote "${adopt_src}" --apply 2>&1)"
+rc=$?
+set -e
+assert_nonzero "${rc}" "adopt with an unknown \$SHELL exits non-zero"
+assert_contains "${out}" "--dotfiles-rc" "the refusal tells the user to pass --dotfiles-rc"
+if [ -e "${d21h}/.dotfiles" ]; then fail "a repo was cloned despite the rc refusal (die must precede clone)"; else ok "no repo cloned when rc resolution failed (die precedes clone)"; fi
+
+# --- D22 (slice 4 remediation): PATH-TRAVERSAL refusal (security Blocking). A malicious repo can
+#     track '../evil' via a crafted tree (nested tree with a '..' subtree). Adopt must refuse it in
+#     PASS A BEFORE any aside/checkout, so the out-of-$HOME target is NEVER written. Sandbox HOME. ---
+echo "smoke: D22 — adopt refuses a work-tree-escaping path ('../evil'), \$HOME untouched"
+d22src="${sandbox}/adopt-trav-src"; mkdir -p "${d22src}"
+( cd "${d22src}" && git init -q
+  d22blob="$(printf 'EVIL-PAYLOAD\n' | git hash-object -w --stdin)"
+  d22inner="$(printf '100644 blob %s\tevil\n' "${d22blob}" | git mktree)"
+  d22outer="$(printf '040000 tree %s\t..\n' "${d22inner}" | git mktree)"
+  d22commit="$(git -c user.email=t@t -c user.name=t commit-tree "${d22outer}" -m evil)"
+  git update-ref HEAD "${d22commit}" ) >/dev/null 2>&1
+d22h="${sandbox}/adopt-trav-home"; mkdir -p "${d22h}"
+d22escape="${sandbox}/evil"            # $HOME/../evil resolves here (HOME=$d22h under $sandbox)
+rm -f "${d22escape}"
+set +e; out="$(adrun "${d22h}" --dotfiles-remote "${d22src}" --apply 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "traversal repo adopt exits non-zero (refused in PASS A)"
+assert_contains "${out}" "unsafe" "the refusal names the path as unsafe / would escape \$HOME"
+if [ -e "${d22escape}" ] || [ -L "${d22escape}" ]; then fail "WORK-TREE ESCAPE: '../evil' was written OUTSIDE \$HOME (${d22escape})"; else ok "the escaping path was NOT written outside \$HOME"; fi
+if [ -e "${d22h}/.dotfiles" ]; then fail "the fresh clone was left behind on a traversal refusal"; else ok "the fresh clone was removed; \$HOME untouched on traversal refusal"; fi
+
+# --- D23 (slice 4 remediation, M1): an EXOTIC-named collider (a name git ls-tree --name-only would
+#     C-quote — here an embedded double-quote) is now correctly pre-asided via the -z enumeration. ---
+echo "smoke: D23 — exotic-named collider is correctly asided (NUL-delimited enumeration)"
+d23src="${sandbox}/adopt-exotic-src"; mkdir -p "${d23src}"
+( cd "${d23src}" && git init -q && printf 'REMOTE-Q\n' > 'q"x.txt' \
+    && git -c user.email=t@t -c user.name=t add -A \
+    && git -c user.email=t@t -c user.name=t commit -qm init ) >/dev/null 2>&1
+d23h="${sandbox}/adopt-exotic-home"; mkdir -p "${d23h}"; printf 'LOCAL-EXOTIC\n' > "${d23h}/q\"x.txt"
+set +e; out="$(adrun "${d23h}" --dotfiles-remote "${d23src}" --apply 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "adopt with an exotic-named collider exits 0" "exotic adopt failed (exit ${rc}): ${out}"
+if [ "$(cat "${d23h}/q\"x.txt" 2>/dev/null)" = "REMOTE-Q" ]; then ok "the remote exotic-named file was checked out"; else fail "exotic-named remote file not checked out"; fi
+d23aside=""; for f in "${d23h}"/q\"x.txt.pre-dotfiles-*; do [ -e "${f}" ] && { d23aside="${f}"; break; }; done
+if [ -n "${d23aside}" ] && [ "$(cat "${d23aside}" 2>/dev/null)" = "LOCAL-EXOTIC" ]; then ok "the exotic-named collider was asided with content preserved (C-quoting no longer misses it)"; else fail "exotic-named collider was NOT asided (C-quoting gap)"; fi
+
+# --- D24 (slice 4 remediation, M3): adopting a repo that TRACKS the rc file must NOT dirty it
+#     (do not append our source block into the tracked rc). Sandbox HOME + --dotfiles-rc=$HOME/.zshrc. ---
+echo "smoke: D24 — adopt of a repo that tracks the rc does NOT dirty it"
+d24src="${sandbox}/adopt-rc-src"; mkdir -p "${d24src}"
+( cd "${d24src}" && git init -q && printf 'export FROM_REPO=1\n' > .zshrc \
+    && git -c user.email=t@t -c user.name=t add -A \
+    && git -c user.email=t@t -c user.name=t commit -qm init ) >/dev/null 2>&1
+d24h="${sandbox}/adopt-rc-home"; mkdir -p "${d24h}"
+set +e; out="$(adrun "${d24h}" --dotfiles-remote "${d24src}" --apply 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "adopt of a repo tracking the rc exits 0" "tracked-rc adopt failed (exit ${rc}): ${out}"
+assert_contains "${out}" "tracked by the adopted repo" "adopt reports the rc is repo-managed (skips the source block)"
+if grep -qF ">>> xdg-cloud dotfiles >>>" "${d24h}/.zshrc" 2>/dev/null; then fail "our source block was appended into the TRACKED rc (dirties it)"; else ok "the tracked rc was NOT dirtied with our source block"; fi
+d24status="$(git --git-dir="${d24h}/.dotfiles" --work-tree="${d24h}" status --porcelain 2>/dev/null)"
+if [ -z "${d24status}" ]; then ok "post-adopt dotfiles status is clean (tracked rc untouched)"; else fail "post-adopt dotfiles status is DIRTY: ${d24status}"; fi
+
+# --- D25 (T-M1): DIR-collider never-clobber. A pre-existing NON-EMPTY DIRECTORY at $HOME/<p>
+#     that the repo tracks (as a file) is moved aside WHOLE — its contents preserved verbatim at
+#     <p>.pre-dotfiles-*/ — and the tracked file is checked out in its place. This is a DISTINCT
+#     data-preservation path (mv of a directory, not a file): D13/D15 cover file colliders and
+#     D16 a symlink, but a directory collider had no standing never-clobber guard. ---
+echo "smoke: D25 — adopt asides a non-empty DIRECTORY collider WHOLE (contents preserved) + checks out the tracked file"
+d25src="${sandbox}/d25-src"; mkdir -p "${d25src}"; printf 'REMOTE-FOO\n' > "${d25src}/foo"; git_seed "${d25src}"
+d25h="${sandbox}/d25-home"; mkdir -p "${d25h}/foo"
+printf 'PRECIOUS-DIR-DATA\n' > "${d25h}/foo/keep.txt"
+set +e; out="$(adrun "${d25h}" --dotfiles-remote "${d25src}" --apply 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "adopt with a directory collider exits 0" "adopt (dir collider) failed (exit ${rc}): ${out}"
+if [ -f "${d25h}/foo" ] && [ "$(cat "${d25h}/foo" 2>/dev/null)" = "REMOTE-FOO" ]; then ok "the tracked file was checked out where the dir stood"; else fail "the tracked file was not checked out over the dir collider"; fi
+d25_aside=""; for d in "${d25h}"/foo.pre-dotfiles-*; do [ -d "${d}" ] && { d25_aside="${d}"; break; }; done
+if [ -n "${d25_aside}" ] && [ "$(cat "${d25_aside}/keep.txt" 2>/dev/null)" = "PRECIOUS-DIR-DATA" ]; then ok "the whole directory (with its contents) was moved aside — NEVER clobbered"; else fail "DATA LOSS: the directory collider's contents were not preserved at *.pre-dotfiles"; fi
+
 echo "smoke: PASS"
