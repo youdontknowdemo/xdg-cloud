@@ -97,6 +97,12 @@ DOTFILES_SENTINEL_END="# <<< xdg-cloud dotfiles <<<"      # rc-block end marker
 : "${DOTFILES_RC:=}"                                      # explicit rc path (--dotfiles-rc); else $SHELL-derived
 RC_TARGET=""                                              # resolved rc (set by dotfiles_resolve_rc)
 
+# Reclaim lane — DELETES regenerable build artifacts to free disk (counterpart to
+# --offload). dry-run default; --apply acts; --global also sweeps the fixed cache
+# allow-list. RECLAIM_ROOT is set by cmd_reclaim + read by reclaim_rm's guard.
+RECLAIM_GLOBAL=0
+RECLAIM_ROOT=""
+
 # iCloud brctl lane (slice 5, step 9) — macOS-only true-offload for iCloud-native data. SECONDARY
 # to the rclone --offload (which verifies durable upload before dropping local); iCloud evict is
 # heavily gated + fail-closed. status/download are stock; evict needs the compiled upload-state
@@ -380,6 +386,15 @@ iCloud (macOS only; paths under ~/Library/Mobile Documents/com~apple~CloudDocs):
   --i-understand-data-loss-risk  Required consent for --icloud-evict (no reliable programmatic
                             check for the 'Optimize Mac Storage' setting).
 
+Reclaim (free local disk by deleting REGENERABLE build artifacts; dry-run unless --apply):
+  --reclaim [PATH]          Sweep PATH (default: cwd) for build artifacts (Rust target/,
+                            node_modules, __pycache__, framework caches, and manifest-
+                            anchored + git-ignored build/dist/out) and delete them.
+                            Never touches git-tracked or unanchored dirs. Prefers
+                            tool-native clean (cargo/mvn/gradle) over rm.
+  --global                  Also sweep the fixed user-cache allow-list (Homebrew, npm,
+                            pip, Xcode DerivedData, ~/.gradle/caches). Opt-in.
+
 Nothing is moved without --apply --relocate together.
 EOF
 }
@@ -433,6 +448,10 @@ $1"
     --icloud-download)    set_mode icloud-download; shift; MODE_ARG="${1:?--icloud-download needs a path}" ;;
     --icloud-evict)       set_mode icloud-evict;    shift; MODE_ARG="${1:?--icloud-evict needs a path}" ;;
     --i-understand-data-loss-risk) ICLOUD_CONFIRM=1 ;;
+    --reclaim)            set_mode reclaim
+                          # optional root path: consume the next arg only if it's not a flag
+                          if [ $# -gt 1 ] && [ "${2#-}" = "$2" ]; then shift; MODE_ARG="$1"; fi ;;
+    --global)             RECLAIM_GLOBAL=1 ;;
     -h|--help)            usage; exit 0 ;;
     *)                    die "unknown option: $1 (try --help)" ;;
   esac
@@ -1893,6 +1912,218 @@ EOF
 # modes need no cloud-root/lock (main resolves those itself). Reserved mutating
 # lanes are recognized but refuse until their slice lands.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Reclaim lane — purge KNOWN-REGENERABLE build artifacts + (opt-in) global caches
+# to free local disk. The DELETE-side counterpart to --offload. Load-bearing:
+# NEVER a false positive. Tiered detection (docs/preparation/research-reclaim.md §2):
+#   * unambiguous artifact name (target/+Cargo.toml, node_modules/+package.json,
+#     __pycache__/.pytest_cache/.mypy_cache/.ruff_cache/*.egg-info,
+#     .next/.nuxt/.svelte-kit/.turbo+package.json) -> anchor manifest sufficient.
+#   * generic name (build/dist/out) -> anchor manifest AND git-ignored; refused
+#     outside a git repo.
+#   * git-TRACKED -> never touched. Outside a repo -> only tool-native-authoritative
+#     (cargo/mvn/gradle, tool present) or pure-bytecode names; else refused.
+# Guards: no symlink follow (-type d), no ascend above root, degenerate-path
+# refusal, stop-descending into a matched dir, skip node_modules-with-.git.
+# dry-run default; --apply gates deletion; tool-native clean preferred over rm.
+# ---------------------------------------------------------------------------
+
+reclaim_size() { du -sh "$1" 2>/dev/null | cut -f1 || printf '?'; }
+
+# git predicates (fail-closed — any error yields the non-zero/"unsafe" answer).
+reclaim_in_repo()    { git -C "$1" rev-parse --is-inside-work-tree >/dev/null 2>&1; }
+reclaim_is_tracked() { git -C "$2" ls-files --error-unmatch -- "$1" >/dev/null 2>&1; }  # $1=path $2=repo-dir
+reclaim_is_ignored() { git -C "$2" check-ignore -q -- "$1" >/dev/null 2>&1; }           # $1=path $2=repo-dir
+
+# reclaim_anchor NAME PARENT -> echoes the toolchain kind if PARENT holds an
+# anchoring manifest for a candidate named NAME (else empty). Always returns 0.
+reclaim_anchor() {
+  local name="$1" p="$2"
+  case "$name" in
+    target)
+      if   [ -f "$p/Cargo.toml" ]; then printf 'cargo'
+      elif [ -f "$p/pom.xml" ];    then printf 'maven'; fi ;;
+    node_modules|.next|.nuxt|.svelte-kit|.turbo)
+      [ -f "$p/package.json" ] && printf 'node' ;;
+    build|dist|out)
+      if   [ -f "$p/package.json" ];   then printf 'node'
+      elif [ -f "$p/build.gradle" ] || [ -f "$p/build.gradle.kts" ]; then printf 'gradle'
+      elif [ -f "$p/pyproject.toml" ] || [ -f "$p/setup.py" ]; then printf 'py'
+      elif [ -f "$p/CMakeLists.txt" ]; then printf 'cmake'; fi ;;
+  esac
+  return 0
+}
+
+# Guarded rm: degenerate-path refusal (mirror the offload guard) then rm -rf.
+reclaim_rm() {
+  local d="$1"
+  case "$d" in
+    ""|"/"|"$HOME"|"$RECLAIM_ROOT") die "internal: refusing rm of unsafe path '$d'" ;;
+    *..*)                           die "internal: refusing rm of path with '..': '$d'" ;;
+  esac
+  printf '  [run]     rm -rf %q\n' "$d"
+  rm -rf "$d" || warn "  rm failed for $d (left as-is)"
+  return 0
+}
+
+# Tool-native clean inside a project dir. Returns 1 if the tool is ABSENT (caller
+# falls back to guarded rm, which is only reached in-repo); 0 if it ran (or the
+# clean errored — warned, left as-is).
+reclaim_toolclean() {
+  local dir="$1"; shift
+  command -v "$1" >/dev/null 2>&1 || return 1
+  printf '  [run]     (cd %q &&' "$dir"; printf ' %q' "$@"; printf ')\n'
+  ( cd "$dir" 2>/dev/null && "$@" >/dev/null 2>&1 ) || warn "  $* failed in $dir (left as-is)"
+  return 0
+}
+
+# Gradle clean: prefer ./gradlew, then gradle, else (in-repo anchored+ignored) rm.
+reclaim_gradle_clean() {
+  local p="$1" d="$2"
+  if [ -x "$p/gradlew" ]; then
+    printf '  [run]     (cd %q && ./gradlew clean)\n' "$p"
+    ( cd "$p" 2>/dev/null && ./gradlew -q clean >/dev/null 2>&1 ) || warn "  gradlew clean failed in $p"
+    return 0
+  fi
+  reclaim_toolclean "$p" gradle -q clean && return 0
+  reclaim_rm "$d"
+}
+
+# Global caches (opt-in --global). Fixed known paths only — never tree-discovered.
+# Tool-native where available; guarded rm for the pure-artifact dirs.
+reclaim_global_caches() {
+  local drun; drun="$([ "$DRY_RUN" -eq 1 ] && printf dry-run || printf run)"
+  log "Global caches (--global):"
+  if command -v brew >/dev/null 2>&1; then
+    printf '  [%s]  brew cleanup -s\n' "$drun"
+    [ "$DRY_RUN" -eq 0 ] && { brew cleanup -s >/dev/null 2>&1 || true; }
+  fi
+  if command -v npm >/dev/null 2>&1; then
+    printf '  [%s]  npm cache clean --force\n' "$drun"
+    [ "$DRY_RUN" -eq 0 ] && { npm cache clean --force >/dev/null 2>&1 || true; }
+  fi
+  if command -v pip3 >/dev/null 2>&1; then
+    printf '  [%s]  pip3 cache purge\n' "$drun"
+    [ "$DRY_RUN" -eq 0 ] && { pip3 cache purge >/dev/null 2>&1 || true; }
+  fi
+  local dd="$HOME/Library/Developer/Xcode/DerivedData"
+  [ -d "$dd" ] && { printf '  [%s]  rm -rf ~/Library/Developer/Xcode/DerivedData/* (%s)\n' "$drun" "$(reclaim_size "$dd")"; [ "$DRY_RUN" -eq 0 ] && rm -rf "${dd:?}"/* 2>/dev/null; }
+  local gc="$HOME/.gradle/caches"
+  [ -d "$gc" ] && { printf '  [%s]  rm -rf ~/.gradle/caches (%s)\n' "$drun" "$(reclaim_size "$gc")"; [ "$DRY_RUN" -eq 0 ] && rm -rf "${gc:?}" 2>/dev/null; }
+  return 0
+}
+
+cmd_reclaim() {                       # $1 = optional root (default: cwd)
+  begin_mutating_mode                 # guard_not_root + trap + (apply-only) lock
+  local root rootreal cand parent base kind decision why sz cr a skip
+  root="${1:-$PWD}"
+  [ -d "$root" ] || die "reclaim root does not exist: $root"
+  rootreal="$(cd "$root" 2>/dev/null && pwd -P)" || die "cannot resolve reclaim root: $root"
+  case "$rootreal" in
+    ""|"/"|"$HOME") die "refusing to sweep '$rootreal' (too broad — never a blind \$HOME/root walk). Pass a project or dev dir." ;;
+  esac
+  RECLAIM_ROOT="$rootreal"            # consumed by reclaim_rm's degenerate-path guard
+
+  if [ "$DRY_RUN" -eq 1 ]; then log "Reclaim sweep under: $rootreal   (dry-run — nothing deleted; --apply to act)"
+  else log "Reclaim sweep under: $rootreal   (APPLY — deleting reclaimable artifacts)"; fi
+
+  # Discover candidate dirs by name into a NUL-delimited tempfile. -type d excludes
+  # symlinks (no -L); find lists parents before children (enables stop-descend).
+  local tf; tf="$(mktemp "${TMPDIR:-/tmp}/xdg-reclaim.XXXXXX")" || die "cannot create temp file"
+  find "$rootreal" -type d \( -name target -o -name node_modules -o -name __pycache__ \
+      -o -name .pytest_cache -o -name .mypy_cache -o -name .ruff_cache -o -name '*.egg-info' \
+      -o -name .next -o -name .nuxt -o -name .svelte-kit -o -name .turbo \
+      -o -name build -o -name dist -o -name out \) -print0 > "$tf" 2>/dev/null || true
+
+  local -a accepted=()
+  local plan="" n=0
+  while IFS= read -r -d '' cand; do
+    [ -z "$cand" ] && continue
+    cr="$(cd "$cand" 2>/dev/null && pwd -P)" || continue
+    case "$cr" in "$rootreal"/*) : ;; *) continue ;; esac       # strictly under root
+    skip=0
+    for a in ${accepted[@]+"${accepted[@]}"}; do
+      case "$cr" in "$a"/*) skip=1; break ;; esac               # inside an accepted match
+    done
+    [ "$skip" -eq 1 ] && continue
+
+    base="${cand##*/}"; parent="$(dirname "$cand")"
+    kind="$(reclaim_anchor "$base" "$parent")"
+    decision=""; why=""
+    case "$base" in
+      __pycache__|.pytest_cache|.mypy_cache|.ruff_cache|*.egg-info)
+        decision="rm"; why="python cache/artifact (unambiguous)" ;;
+      target)
+        if [ "$kind" = "cargo" ]; then decision="cargo"; why="Rust target/ (Cargo.toml)"
+        elif [ "$kind" = "maven" ]; then decision="maven"; why="Maven target/ (pom.xml)"
+        else why="named 'target' with no Cargo.toml/pom.xml"; fi ;;
+      node_modules)
+        if [ -e "$cand/.git" ]; then why="node_modules holds .git (checked-out dep)"
+        elif [ "$kind" = "node" ]; then decision="rm"; why="node_modules (package.json)"
+        else why="node_modules with no sibling package.json"; fi ;;
+      .next|.nuxt|.svelte-kit|.turbo)
+        if [ "$kind" = "node" ]; then decision="rm"; why="$base build cache (package.json)"
+        else why="$base with no sibling package.json"; fi ;;
+      build|dist|out)
+        if   [ -z "$kind" ]; then why="generic '$base' with no build manifest"
+        elif ! reclaim_in_repo "$parent"; then why="generic '$base' outside a git repo (need gitignore proof)"
+        elif reclaim_is_tracked "$cand" "$parent"; then why="'$base' is git-tracked"
+        elif ! reclaim_is_ignored "$cand" "$parent"; then why="'$base' not git-ignored"
+        elif [ "$kind" = "gradle" ]; then decision="gradle"; why="Gradle build/ (build.gradle + gitignored)"
+        elif [ "$kind" = "cmake" ] && [ -f "$cand/CMakeCache.txt" ]; then decision="rm"; why="CMake build/ (CMakeLists.txt + CMakeCache.txt + gitignored)"
+        elif [ "$kind" = "cmake" ]; then why="'$base' anchored by CMakeLists.txt but no CMakeCache.txt inside"
+        else decision="rm"; why="'$base' (manifest + gitignored)"; fi ;;
+    esac
+
+    # Belt-and-suspenders: never delete a git-TRACKED candidate, even unambiguous ones.
+    if [ -n "$decision" ] && reclaim_in_repo "$parent" && reclaim_is_tracked "$cand" "$parent"; then
+      decision=""; why="$base is git-tracked"
+    fi
+    # Outside-a-repo tier gate: only tool-native-authoritative (cargo/mvn, tool
+    # present) or pure-bytecode names may be reclaimed without a git context.
+    # (generic build/dist/out already required in-repo + gitignored above, so only
+    # unambiguous names reach here with a decision.)
+    if [ -n "$decision" ] && ! reclaim_in_repo "$parent"; then
+      case "$base" in
+        __pycache__|.pytest_cache|.mypy_cache|.ruff_cache|*.egg-info) : ;;
+        target)
+          if   [ "$decision" = "cargo" ] && command -v cargo >/dev/null 2>&1; then :
+          elif [ "$decision" = "maven" ] && command -v mvn   >/dev/null 2>&1; then :
+          else decision=""; why="target/ outside a repo needs cargo/mvn present"; fi ;;
+        *) decision=""; why="$base outside a git repo (not tool-native-authoritative)" ;;
+      esac
+    fi
+
+    if [ -n "$decision" ]; then
+      accepted+=("$cr"); n=$((n + 1)); sz="$(reclaim_size "$cand")"
+      plan="${plan}  reclaim [${decision}]  ${sz}	${cand}
+"
+      if [ "$DRY_RUN" -eq 0 ]; then
+        case "$decision" in
+          cargo)  reclaim_toolclean "$parent" cargo clean || reclaim_rm "$cand" ;;
+          maven)  reclaim_toolclean "$parent" mvn -q clean || reclaim_rm "$cand" ;;
+          gradle) reclaim_gradle_clean "$parent" "$cand" ;;
+          rm)     reclaim_rm "$cand" ;;
+        esac
+      fi
+    elif [ -n "$why" ]; then
+      plan="${plan}  skip            -	${cand}  (${why})
+"
+    fi
+  done < "$tf"
+  rm -f "$tf"
+
+  [ "$RECLAIM_GLOBAL" -eq 1 ] && reclaim_global_caches
+
+  printf '%s' "$plan"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "$n project artifact(s) would be reclaimed. Re-run with --apply to delete."
+    [ "$RECLAIM_GLOBAL" -eq 0 ] && info "add --global to also sweep user caches (Homebrew, npm, pip, Xcode DerivedData, ~/.gradle/caches)."
+  else
+    log "Reclaimed $n project artifact(s) under $rootreal."
+  fi
+}
+
 dispatch_mode() {
   case "$MODE" in
     classify)         cmd_classify ;;
@@ -1907,6 +2138,7 @@ dispatch_mode() {
     icloud-status)    cmd_icloud_status   "$MODE_ARG" ;;
     icloud-download)  cmd_icloud_download "$MODE_ARG" ;;
     icloud-evict)     cmd_icloud_evict    "$MODE_ARG" ;;
+    reclaim)          cmd_reclaim         "$MODE_ARG" ;;
     *)                die "internal: unknown mode '$MODE'" ;;
   esac
 }
