@@ -97,6 +97,50 @@ your local user dirs at it via symlinks. The real data lives in the cloud root.
 /bin/bash bin/cloud-xdg-provision.sh --cloud-root "$HOME/Library/CloudStorage/GoogleDrive-me/My Drive" --style mac --apply --relocate
 ```
 
+### Subcommand modes
+
+Beyond the default provision lane above, `cloud-xdg-provision.sh` hosts a set of
+on-demand data-management modes. **Exactly one lane per invocation**, and every
+mutating mode is **dry-run by default** — a bare call prints a plan and changes
+nothing until you add `--apply`.
+
+| Mode | What it does |
+|------|--------------|
+| `--classify` | Report the class (**xdg** / **code** / **local**) of every known `~/` entry. Read-only. |
+| `--offload-status` | Report which CODE dirs are offloaded to the remote vs. still local. Read-only. |
+| `--offload <dir>` | Push a CODE dir to the rclone **remote** (the only lane that frees local space), gated on per-repo clean/pushed/no-stash guards and an independent read-back verify (`rclone check --download`) before any local drop. |
+| `--hydrate <dir>` | Restore a previously offloaded CODE dir from the remote. An interrupted hydrate is self-detecting via a sentinel. |
+| `--migrate-projects` | Un-symlink a cloud-mounted `~/Projects` back to a real local dir (non-destructive). |
+| `--dotfiles-init` / `--dotfiles-track <paths…>` / `--dotfiles-status` | Bare-repo dotfiles lane: a bare `~/.dotfiles` repo with `$HOME` as the work tree. `--dotfiles-track` accepts multiple paths in one fail-closed atomic commit and refuses cloud-xdg-managed paths. |
+| `--dotfiles-remote <url>` | Adopt an existing dotfiles repo on a fresh machine — clone `--bare`, move colliding files aside (`*.pre-dotfiles`), then check out (never `--force`); tracked paths are lexically rejected and realpath-confined to `$HOME`. |
+| `--icloud-status` / `--icloud-download` / `--icloud-evict <path>` | **macOS iCloud true-offload:** report in-iCloud/dataless/uploaded state, materialize dataless files, or evict fully-uploaded files to dataless placeholders. Evict is gated behind the compiled `bin/icloud-uploaded` helper (`make helper`) **and** `--i-understand-data-loss-risk`. |
+| `--reclaim [PATH]` | **Delete regenerable build artifacts** to free disk — the delete-side counterpart to `--offload` (see below). |
+
+#### `--reclaim [PATH]` — regenerable build-artifact sweep
+
+Purges known-regenerable build/cache dirs under `PATH` (default: cwd): Rust
+`target/`, `node_modules`, Gradle/Maven/CMake `build/`, `__pycache__` + Python
+tool caches, `*.egg-info`, and framework caches. Add `--global` to also sweep a
+fixed user-cache allow-list (Homebrew, npm, pip, Xcode DerivedData,
+`~/.gradle/caches`).
+
+Unlike `--offload`, **there is no cloud copy — deletion is the only outcome** — so
+admission is **false-positive-safe by construction**: a candidate is reclaimable
+only if it's **anchored by a sibling toolchain manifest**, and (for generic names
+`build`/`dist`/`out`) **git-ignored/untracked**. Anything **git-tracked is never
+touched**; outside a git repo, only tool-native-authoritative anchors
+(`cargo`/`mvn`) or pure-bytecode names qualify. Git predicates fail closed (any
+error → the non-deleting answer), symlinked manifests never anchor, symlinks are
+never followed, and every `rm` passes a degenerate-path guard. Tool-native clean
+(`cargo`/`mvn`/`gradle clean`) is preferred over `rm`.
+
+```sh
+# preview what would be deleted under ~/repos (touches nothing):
+/bin/bash bin/cloud-xdg-provision.sh --reclaim "$HOME/repos"
+# then actually reclaim:
+/bin/bash bin/cloud-xdg-provision.sh --reclaim "$HOME/repos" --apply
+```
+
 ## `home-tree.sh` — local home + safe backup mirror
 
 Provisions a clean local XDG tree and mirrors the human-facing folders to the
