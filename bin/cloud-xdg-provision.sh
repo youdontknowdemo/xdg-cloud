@@ -392,6 +392,9 @@ Reclaim (free local disk by deleting REGENERABLE build artifacts; dry-run unless
                             anchored + git-ignored build/dist/out) and delete them.
                             Never touches git-tracked or unanchored dirs. Prefers
                             tool-native clean (cargo/mvn/gradle) over rm.
+                            CAUTION: with --apply this EXECUTES project build tooling
+                            (./gradlew, cargo/mvn/gradle clean) in swept dirs — only
+                            point it at trees you trust.
   --global                  Also sweep the fixed user-cache allow-list (Homebrew, npm,
                             pip, Xcode DerivedData, ~/.gradle/caches). Opt-in.
 
@@ -1930,10 +1933,25 @@ EOF
 
 reclaim_size() { du -sh "$1" 2>/dev/null | cut -f1 || printf '?'; }
 
-# git predicates (fail-closed — any error yields the non-zero/"unsafe" answer).
+# git predicates (fail-closed — any error yields the SAFE, non-deleting answer).
 reclaim_in_repo()    { git -C "$1" rev-parse --is-inside-work-tree >/dev/null 2>&1; }
-reclaim_is_tracked() { git -C "$2" ls-files --error-unmatch -- "$1" >/dev/null 2>&1; }  # $1=path $2=repo-dir
+# reclaim_is_tracked: $1=path $2=repo-dir. Returns 0 (tracked -> DON'T delete) for a
+# match AND for ANY git error; returns 1 (not tracked) ONLY on the specific exit 1
+# that ls-files --error-unmatch uses for a genuine no-match. Fail-closed: a corrupt
+# index / lock / abnormal git state (exit 128) must never be read as "not tracked".
+reclaim_is_tracked() {
+  local rc
+  git -C "$2" ls-files --error-unmatch -- "$1" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 1 ] && return 1   # exit 1 == clean no-match -> not tracked
+  return 0                      # exit 0 (tracked) or any other (error) -> treat as tracked (safe)
+}
 reclaim_is_ignored() { git -C "$2" check-ignore -q -- "$1" >/dev/null 2>&1; }           # $1=path $2=repo-dir
+
+# reclaim_manifest PARENT NAME -> true iff PARENT/NAME is a REGULAR, non-symlink
+# file. A symlinked manifest must not steer classification (it could otherwise
+# qualify an out-of-tree dir for deletion or aim tool-native clean at an
+# attacker-chosen project).
+reclaim_manifest() { [ -f "$1/$2" ] && [ ! -L "$1/$2" ]; }
 
 # reclaim_anchor NAME PARENT -> echoes the toolchain kind if PARENT holds an
 # anchoring manifest for a candidate named NAME (else empty). Always returns 0.
@@ -1941,15 +1959,15 @@ reclaim_anchor() {
   local name="$1" p="$2"
   case "$name" in
     target)
-      if   [ -f "$p/Cargo.toml" ]; then printf 'cargo'
-      elif [ -f "$p/pom.xml" ];    then printf 'maven'; fi ;;
+      if   reclaim_manifest "$p" Cargo.toml; then printf 'cargo'
+      elif reclaim_manifest "$p" pom.xml;    then printf 'maven'; fi ;;
     node_modules|.next|.nuxt|.svelte-kit|.turbo)
-      [ -f "$p/package.json" ] && printf 'node' ;;
+      reclaim_manifest "$p" package.json && printf 'node' ;;
     build|dist|out)
-      if   [ -f "$p/package.json" ];   then printf 'node'
-      elif [ -f "$p/build.gradle" ] || [ -f "$p/build.gradle.kts" ]; then printf 'gradle'
-      elif [ -f "$p/pyproject.toml" ] || [ -f "$p/setup.py" ]; then printf 'py'
-      elif [ -f "$p/CMakeLists.txt" ]; then printf 'cmake'; fi ;;
+      if   reclaim_manifest "$p" package.json;   then printf 'node'
+      elif reclaim_manifest "$p" build.gradle || reclaim_manifest "$p" build.gradle.kts; then printf 'gradle'
+      elif reclaim_manifest "$p" pyproject.toml || reclaim_manifest "$p" setup.py; then printf 'py'
+      elif reclaim_manifest "$p" CMakeLists.txt; then printf 'cmake'; fi ;;
   esac
   return 0
 }

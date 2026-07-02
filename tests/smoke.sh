@@ -2467,4 +2467,16 @@ set +e; out="$(/bin/bash "${PROV}" --reclaim "${rec}/nope" 2>&1)"; rc=$?; set -e
 assert_nonzero "${rc}" "reclaim of a nonexistent root is refused"
 assert_contains "${out}" "does not exist" "the missing-root refusal names the cause"
 
+# --- Group R4: a SYMLINKED manifest must NOT qualify a dir for reclaim (security
+# review: a symlinked anchor could otherwise steer classification / tool-clean).
+echo "smoke: reclaim R4 — a symlinked manifest does not anchor a reclaim"
+symroot="${rec_root}/symcase"
+mkdir -p "${symroot}/proj/target"
+echo real > "${symroot}/realCargo.toml"
+ln -s "${symroot}/realCargo.toml" "${symroot}/proj/Cargo.toml"   # symlinked manifest
+echo art > "${symroot}/proj/target/blob.o"
+out="$(/bin/bash "${PROV}" --reclaim "${symroot}" 2>&1)"
+assert_contains "${out}" "0 project artifact(s) would be reclaimed" "symlinked Cargo.toml does not anchor target/ (0 reclaimable)"
+if [ -e "${symroot}/proj/target/blob.o" ]; then ok "target/ with a symlinked manifest is left untouched"; else fail "target/ was reclaimed via a symlinked manifest (steering vector open)"; fi
+
 echo "smoke: PASS"
