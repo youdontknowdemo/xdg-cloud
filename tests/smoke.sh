@@ -34,9 +34,15 @@ cloud_root="${sandbox}/cloud"
 home_root="${sandbox}/home"
 
 mkdir -p "${cloud_root}" "${home_root}" "${sandbox}/tmp"
+# Capture the host temp dir BEFORE overriding TMPDIR — the reclaim group needs a
+# fixture root OUTSIDE the repo work tree, and the override below points inside it.
+host_tmp="${TMPDIR:-/tmp}"
 export TMPDIR="${sandbox}/tmp"
 
-cleanup() { rm -rf "${sandbox}"; }
+# rec_root is a reclaim fixture created OUTSIDE the repo work tree (see the
+# reclaim group near the end) — cleaned here too. Empty until that group sets it.
+rec_root=""
+cleanup() { rm -rf "${sandbox}" ${rec_root:+"${rec_root}"}; }
 trap cleanup EXIT
 
 # assert_contains HAYSTACK NEEDLE LABEL
@@ -2375,5 +2381,102 @@ SH
 else
   echo "smoke: I2 iCloud evict extra gates — SKIPPED (macOS-only; uname=$(uname -s))"
 fi
+
+# ===========================================================================
+# Reclaim (--reclaim) — the DELETE-side counterpart to --offload. Load-bearing:
+# NEVER a false positive. These groups are the safety contract, exercised on
+# both platforms (git + find only; no macOS-specific tooling). A hermetic git
+# identity is forced so the group does not depend on the user's ~/.gitconfig.
+# ===========================================================================
+export GIT_AUTHOR_NAME="smoke" GIT_AUTHOR_EMAIL="smoke@test" \
+       GIT_COMMITTER_NAME="smoke" GIT_COMMITTER_EMAIL="smoke@test"
+# The reclaim fixture MUST live outside the repo work tree: the repo is itself a
+# git repo, so a fixture under tests/sandbox/ would make git-context predicates
+# ('inside a repo?') true for every dir and mask the outside-repo fail-closed
+# path. rec_root (mktemp, outside the repo) is removed by the EXIT trap above.
+rec_root="$(mktemp -d "${host_tmp}/xdg-reclaim-smoke.XXXXXX")"
+rec="${rec_root}"
+
+# Fixture tree covering every tier + the load-bearing decoys:
+#   plain/build            generic 'build', NO manifest, NOT a repo    -> MUST SURVIVE
+#   trackedrepo/build      'build' committed (git-tracked) in a repo    -> MUST SURVIVE
+#   depproj/node_modules   holds a checked-out dep's .git               -> MUST SURVIVE
+#   looseNM/node_modules   node_modules + package.json, NOT a repo      -> MUST SURVIVE (fail-closed outside repo)
+#   pyproj/__pycache__     pure bytecode cache                          -> reclaim
+#   genrepo/build          generic 'build' + package.json + gitignored  -> reclaim
+#   app/node_modules       node_modules + package.json, in-repo+ignored -> reclaim (the real use case)
+mkdir -p "${rec}/plain/build"; echo precious > "${rec}/plain/build/keep.txt"
+( cd "${rec}" && mkdir trackedrepo && cd trackedrepo && git init -q && echo '{}' > package.json \
+    && mkdir build && echo committed > build/app.js && git add -A && git commit -qm init )
+mkdir -p "${rec}/depproj/node_modules/somedep/.git"; echo '{}' > "${rec}/depproj/package.json"
+echo x > "${rec}/depproj/node_modules/somedep/keep.js"
+mkdir -p "${rec}/looseNM/node_modules/lodash"; echo '{}' > "${rec}/looseNM/package.json"
+echo x > "${rec}/looseNM/node_modules/lodash/i.js"
+mkdir -p "${rec}/pyproj/__pycache__"; echo x > "${rec}/pyproj/__pycache__/mod.pyc"
+( cd "${rec}" && mkdir genrepo && cd genrepo && git init -q && echo '{}' > package.json \
+    && printf 'build/\n' > .gitignore && git add -A && git commit -qm init \
+    && mkdir build && echo generated > build/bundle.js )
+( cd "${rec}" && mkdir app && cd app && git init -q && echo '{}' > package.json \
+    && printf 'node_modules/\n' > .gitignore && git add -A && git commit -qm init \
+    && mkdir -p node_modules/dep && echo x > node_modules/dep/i.js )
+
+# --- Group R1: dry-run is the default and deletes NOTHING; classification is correct.
+echo "smoke: reclaim R1 — dry-run classifies correctly and deletes nothing"
+out="$(/bin/bash "${PROV}" --reclaim "${rec}" 2>&1)"
+assert_contains "${out}" "dry-run — nothing deleted" "reclaim defaults to dry-run"
+assert_contains "${out}" "3 project artifact(s) would be reclaimed" "dry-run counts the 3 reclaimable dirs (pyproj __pycache__, genrepo build/, app node_modules)"
+assert_contains "${out}" "reclaim [rm]"                 "dry-run marks reclaimable dirs with an rm decision"
+assert_contains "${out}" "pyproj/__pycache__"           "dry-run reclaims __pycache__"
+assert_contains "${out}" "genrepo/build"                "dry-run reclaims manifest+gitignored generic build/"
+assert_contains "${out}" "app/node_modules"             "dry-run reclaims in-repo gitignored node_modules"
+# The decoys are explicitly SKIPPED with a reason.
+assert_contains "${out}" "generic 'build' with no build manifest"    "decoy: unanchored build/ is skipped"
+assert_contains "${out}" "'build' is git-tracked"                    "decoy: git-tracked build/ is skipped"
+# Nothing on disk was touched by the dry-run.
+for p in plain/build/keep.txt trackedrepo/build/app.js depproj/node_modules/somedep/.git \
+         looseNM/node_modules/lodash pyproj/__pycache__ genrepo/build/bundle.js app/node_modules/dep; do
+  if [ -e "${rec}/${p}" ]; then ok "dry-run left ${p} untouched"; else fail "dry-run DELETED ${p} (dry-run must never delete)"; fi
+done
+
+# --- Group R2: --apply deletes exactly the reclaimable dirs; every decoy SURVIVES.
+echo "smoke: reclaim R2 — --apply deletes reclaimable, decoys survive, tracked siblings intact"
+out="$(/bin/bash "${PROV}" --reclaim "${rec}" --apply 2>&1)"
+assert_contains "${out}" "APPLY — deleting reclaimable artifacts" "apply announces APPLY mode"
+assert_contains "${out}" "Reclaimed 3 project artifact(s)" "apply reports the reclaim count"
+# Load-bearing: decoys + non-regenerable dirs MUST survive an apply.
+for p in plain/build/keep.txt trackedrepo/build/app.js depproj/node_modules/somedep/.git looseNM/node_modules/lodash; do
+  if [ -e "${rec}/${p}" ]; then ok "apply preserved ${p}"; else fail "apply DELETED ${p} — FALSE POSITIVE (safety contract violated)"; fi
+done
+# The reclaimable dirs are gone…
+for p in pyproj/__pycache__ genrepo/build app/node_modules; do
+  if [ -e "${rec}/${p}" ]; then fail "apply left ${p} behind (should have been reclaimed)"; else ok "apply reclaimed ${p}"; fi
+done
+# …but git-tracked siblings in the same repo are untouched.
+if [ -e "${rec}/genrepo/package.json" ] && [ -e "${rec}/genrepo/.gitignore" ]; then
+  ok "apply left genrepo's tracked files intact (only build/ removed)"
+else
+  fail "apply damaged genrepo's tracked files"
+fi
+
+# --- Group R3: degenerate-root refusals + nonexistent root exit non-zero (never a blind walk).
+echo "smoke: reclaim R3 — degenerate roots and nonexistent paths are refused"
+set +e; out="$(/bin/bash "${PROV}" --reclaim / 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "reclaim of / is refused"
+assert_contains "${out}" "too broad" "the / refusal explains it is too broad to sweep"
+set +e; out="$(/bin/bash "${PROV}" --reclaim "${rec}/nope" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "reclaim of a nonexistent root is refused"
+assert_contains "${out}" "does not exist" "the missing-root refusal names the cause"
+
+# --- Group R4: a SYMLINKED manifest must NOT qualify a dir for reclaim (security
+# review: a symlinked anchor could otherwise steer classification / tool-clean).
+echo "smoke: reclaim R4 — a symlinked manifest does not anchor a reclaim"
+symroot="${rec_root}/symcase"
+mkdir -p "${symroot}/proj/target"
+echo real > "${symroot}/realCargo.toml"
+ln -s "${symroot}/realCargo.toml" "${symroot}/proj/Cargo.toml"   # symlinked manifest
+echo art > "${symroot}/proj/target/blob.o"
+out="$(/bin/bash "${PROV}" --reclaim "${symroot}" 2>&1)"
+assert_contains "${out}" "0 project artifact(s) would be reclaimed" "symlinked Cargo.toml does not anchor target/ (0 reclaimable)"
+if [ -e "${symroot}/proj/target/blob.o" ]; then ok "target/ with a symlinked manifest is left untouched"; else fail "target/ was reclaimed via a symlinked manifest (steering vector open)"; fi
 
 echo "smoke: PASS"
