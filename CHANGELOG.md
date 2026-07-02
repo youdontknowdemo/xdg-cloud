@@ -15,6 +15,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `set -e`.
 
 ### Added
+- `--reclaim [PATH]` (`cloud-xdg-provision.sh`): the delete-side counterpart to
+  `--offload`. Sweeps `PATH` (default: cwd) for known-regenerable build artifacts
+  (Rust `target/`, `node_modules`, Gradle/Maven/CMake `build/`, `__pycache__` and
+  Python tool caches, `*.egg-info`, framework caches) and deletes them to free
+  disk; `--global` also sweeps a fixed user-cache allow-list (Homebrew, npm, pip,
+  Xcode DerivedData, `~/.gradle/caches`). Because it deletes with no cloud copy as
+  a net, admission is false-positive-safe: a candidate must be **anchored by a
+  sibling toolchain manifest** and (for generic names `build`/`dist`/`out`)
+  **git-ignored/untracked**; anything git-tracked is never touched; outside a git
+  repo only tool-native-authoritative anchors or pure-bytecode names qualify. Git
+  predicates are fail-closed (any error → the non-deleting answer), symlinked
+  manifests never anchor, symlinks are never followed, candidates are confined
+  under the resolved root, and every `rm` passes a degenerate-path guard.
+  Tool-native clean (`cargo`/`mvn`/`gradle clean`) is preferred over `rm`. Dry-run
+  by default; `--apply` gates deletion. See `docs/preparation/research-reclaim.md`
+  and `docs/architecture/reclaim-diff.md`.
+- `tests/smoke.sh`: reclaim coverage (R1–R4) — dry-run classification, apply
+  deletes reclaimable while decoys survive, degenerate-root refusal, and
+  symlinked-manifest refusal. All sandboxed (`HOME` + roots), never the real `$HOME`.
+- `CLAUDE.md`: working guide for editing the codebase (invariants, modes, testing).
 - `tests/smoke.sh`: apply-mode idempotency section — `cloud-xdg-provision.sh
   --apply` is now exercised in a sandboxed `HOME` and re-run to assert
   idempotency (ADR §10 #3). Regression guard for the dangling-symlink abort
