@@ -7,15 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Documentation
-- `README.md`: document the `cloud-xdg-provision.sh` subcommand modes. Adds a
-  "Subcommand modes" subsection covering `--classify`, `--offload-status`,
-  `--offload`/`--hydrate`, `--migrate-projects`, the dotfiles lane
-  (`--dotfiles-init`/`-track`/`-status`) + adopt (`--dotfiles-remote`), macOS
-  iCloud true-offload (`--icloud-status`/`-download`/`-evict`), and `--reclaim`
-  (with a dedicated block on its false-positive-safe deletion model) — noting the
-  one-lane-per-invocation rule and dry-run-by-default posture (#35).
-
 ### Known issues / tracked for future work
 - Filter correctness: rclone filter excludes not yet asserted in tests (F2).
 - `redirect_one()` edge-case matrix not yet automated (F3).
@@ -23,6 +14,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accounts are mounted; no disambiguation logic yet (F4).
 - `--version` flag not yet implemented (deferred per ADR §7) (F6).
 - ADR §8.1 sample `.shellcheckrc` differs from the as-built file (F7).
+
+## [0.2.1] - 2026-07-02
+
+Documentation-only patch release. No code changes.
+
+### Documentation
+- `README.md`: document the `cloud-xdg-provision.sh` subcommand modes. Adds a
+  "Subcommand modes" subsection covering `--classify`, `--offload-status`,
+  `--offload`/`--hydrate`, `--migrate-projects`, the dotfiles lane
+  (`--dotfiles-init`/`-track`/`-status`) + adopt (`--dotfiles-remote`), macOS
+  iCloud true-offload (`--icloud-status`/`-download`/`-evict`), and `--reclaim`
+  (with a dedicated block on its false-positive-safe deletion model) — noting the
+  one-lane-per-invocation rule and dry-run-by-default posture (#35, #36).
 
 ## [0.2.0] - 2026-07-02
 
