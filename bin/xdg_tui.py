@@ -327,6 +327,9 @@ class Executor:
             text=True,
             errors="replace",
             env=self.environ(),
+            # A captured child must never read the TUI's tty: a script prompt
+            # would steal keystrokes from curses or block forever.
+            stdin=subprocess.DEVNULL,
         )
         return (proc.returncode, proc.stdout, proc.stderr)
 
@@ -466,6 +469,9 @@ def _prompt_line(stdscr, prompt):
     stdscr.refresh()
     curses.echo()
     try:
+        # Typed consent must be typed AFTER the prompt renders: discard any
+        # buffered type-ahead/paste so it cannot feed the acknowledgment.
+        curses.flushinp()
         raw = stdscr.getstr(height - 1, min(len(prompt), width - 2), 4096)
     finally:
         curses.noecho()
@@ -480,6 +486,9 @@ def _confirm(stdscr, question):
     stdscr.clrtoeol()
     stdscr.addnstr(height - 1, 0, question + " (y/N) ", width - 2, curses.A_BOLD)
     stdscr.refresh()
+    # Buffered type-ahead/paste must not auto-answer a consent gate; only a
+    # 'y' pressed after the question renders is yes (EOF/getch -1 stays No).
+    curses.flushinp()
     return stdscr.getch() == ord("y")
 
 

@@ -114,6 +114,33 @@ class TestCapture(FakeScriptCase):
             else:
                 os.environ["XDG_TUI_TEST_PROBE"] = saved
 
+    def test_capture_child_stdin_is_devnull(self):
+        # A captured child must NEVER see the TUI's stdin (a script prompt
+        # would steal keystrokes from curses or block). Prove it behaviorally:
+        # park real data on the test process's fd 0; the child must get
+        # immediate EOF — not that data, and not a blocking read (timeout).
+        script = self.write_script(
+            "read -t 2 -r line\n"
+            "rc=$?\n"
+            'if [ "$rc" -eq 0 ]; then printf "read:%s" "$line"\n'
+            'elif [ "$rc" -gt 128 ]; then printf "timeout"\n'
+            'else printf "eof"\nfi\n'
+            "exit 0\n"
+        )
+        read_fd, write_fd = os.pipe()
+        saved_stdin = os.dup(0)
+        try:
+            os.write(write_fd, b"stolen keystrokes\n")
+            os.close(write_fd)
+            os.dup2(read_fd, 0)
+            os.close(read_fd)
+            rc, out, _ = xdg_tui.Executor(script, env=self.env()).capture([])
+        finally:
+            os.dup2(saved_stdin, 0)
+            os.close(saved_stdin)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "eof")
+
     def test_undecodable_bytes_do_not_raise(self):
         script = self.write_script("printf '\\xff\\xfe raw bytes\\n'\n")
         rc, out, _ = xdg_tui.Executor(script, env=self.env()).capture([])

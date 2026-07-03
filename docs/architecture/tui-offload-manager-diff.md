@@ -450,8 +450,10 @@ TUI asserts nothing the script didn't already say. The dashboard renders `incons
 
 ### 4.3 Model/UI notes
 
-- Dashboard = 15 classify rows in registry order; the 3 code rows are action-enabled, xdg/local rows
-  are informational (plus the `--migrate-projects` note on code+symlink).
+- Dashboard = 15 classify rows in registry order; the 3 code rows carry the full action set, xdg rows
+  carry the three iCloud lanes only (per §6 — reconciled post-review: the implementation follows §6,
+  deliberately; the script's resolvers gate applicability), local rows are informational (plus the
+  `--migrate-projects` note on code+symlink).
 - `local` code entries show the git field (`clean`/`dirty`/`none`); `dirty` renders as a caution
   marker but the TUI does **not** block offload on it — the script's own git guards decide (verbatim
   refusal if they refuse). No color-only encoding (plan accessibility note).
@@ -672,7 +674,9 @@ Decision 3's dependency rule ("No dependency beyond bash, shellcheck, coreutils.
 - `bin/xdg_tui.py`, launched via `bin/xdg-tui`, is an **optional companion** TUI. It may be
   written in Python 3 (**stdlib only** — curses UI, zero pip packages).
 - The **core toolkit remains bash-3.2-pure**: `bin/*.sh`, `bin/lib/*.sh`, `hooks/`, and
-  `tests/smoke.sh` must never require python, and no shell script may invoke python.
+  `tests/smoke.sh` must never require python, and no *core* script in those sets may invoke
+  python. (`bin/xdg-tui`, the launcher, is the sole sanctioned python-invoking shell script —
+  it exists precisely to gate the optional TUI behind a functional probe.)
 - The Makefile's python steps (`py_compile` in `lint`, `unittest discover` in `test`) are
   **skip-guarded** behind `command -v python3` — a machine without python3 still passes
   `make lint`/`make test` and retains every non-TUI feature (same graceful-skip idiom as the

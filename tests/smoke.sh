@@ -2822,6 +2822,62 @@ assert_nonzero "${rc}" "bare --porcelain (default lane) is refused"
 assert_contains "${out}" "--porcelain applies only to --classify or --offload-status" \
   "bare --porcelain names the two valid modes"
 
+# --- P6: porcelain NEWLINE hardening — the row delimiter is the second thing
+#     that can break a pipe-delimited line format. (a) classify: a symlink
+#     TARGET with an embedded newline must yield exactly ONE 6-field row with
+#     the placeholder, never a row split across two physical lines (readlink
+#     preserves interior newlines; $() strips only trailing ones). (b)
+#     offload-status: a state file with TWO 'remote=' lines must yield exactly
+#     ONE row — FIRST remote wins (head -n1 semantics, pinned here). Row-count
+#     + NF==6 assertions catch any split; grep -qxF pins the whole line. ---
+echo "smoke: P6 — porcelain newline hardening (split-row regressions)"
+p6h="${sandbox}/p6-home"
+p6nl="$(printf '\nx')"; p6nl="${p6nl%x}"               # bash-3.2 literal newline
+mkdir -p "${p6h}/state/xdg-cloud/offloaded"
+ln -s "${sandbox}/evil${p6nl}target" "${p6h}/Documents"  # newline INSIDE the target
+printf 'remote=gdrive:first/remote\nremote=evil:second/remote\n' \
+  > "${p6h}/state/xdg-cloud/offloaded/repos"             # duplicate remote= lines
+p6_out="${sandbox}/p6-classify.out"
+set +e
+HOME="${p6h}" XDG_STATE_HOME="${p6h}/state" /bin/bash "${PROV}" --classify --porcelain \
+  >"${p6_out}" 2>"${sandbox}/p6-classify.err"
+rc=$?
+set -e
+pass_if "${rc}" "--classify --porcelain (newline-in-target) exits 0" \
+  "--classify --porcelain (newline-in-target) failed (exit ${rc}): $(cat "${sandbox}/p6-classify.err")"
+p6_lines="$(wc -l < "${p6_out}" | tr -d ' ')"
+if [ "${p6_lines}" -eq 16 ]; then
+  ok "classify porcelain still emits header + 15 rows (newline target did NOT split a row)"
+else
+  fail "classify porcelain emitted ${p6_lines} lines, expected 16 — a newline target split a row: $(cat "${p6_out}")"
+fi
+set +e; awk -F'|' 'NR>1 && NF!=6 {exit 1}' "${p6_out}"; p6rc=$?; set -e
+pass_if "${p6rc}" "every classify porcelain row still has exactly 6 fields (newline fixture)" \
+  "a classify porcelain row lost field discipline under a newline-containing target"
+set +e; grep -qxF -- "xdg|documents|Documents|symlink|<non-porcelain-target>|" "${p6_out}"; p6rc=$?; set -e
+pass_if "${p6rc}" "newline-containing target is sanitized to the exact placeholder row" \
+  "classify porcelain is MISSING 'xdg|documents|Documents|symlink|<non-porcelain-target>|' for a newline target"
+p6_out="${sandbox}/p6-ofs.out"
+set +e
+HOME="${p6h}" XDG_STATE_HOME="${p6h}/state" GIT_CEILING_DIRECTORIES="${p6h}" \
+  /bin/bash "${PROV}" --offload-status --porcelain >"${p6_out}" 2>"${sandbox}/p6-ofs.err"
+rc=$?
+set -e
+pass_if "${rc}" "--offload-status --porcelain (duplicate remote=) exits 0" \
+  "--offload-status --porcelain (duplicate remote=) failed (exit ${rc}): $(cat "${sandbox}/p6-ofs.err")"
+p6_lines="$(wc -l < "${p6_out}" | tr -d ' ')"
+if [ "${p6_lines}" -eq 4 ]; then
+  ok "offload-status porcelain still emits header + 3 rows (duplicate remote= did NOT split a row)"
+else
+  fail "offload-status porcelain emitted ${p6_lines} lines, expected 4 — duplicate remote= split a row: $(cat "${p6_out}")"
+fi
+set +e; awk -F'|' 'NR>1 && NF!=6 {exit 1}' "${p6_out}"; p6rc=$?; set -e
+pass_if "${p6rc}" "every offload-status porcelain row still has exactly 6 fields (duplicate-remote fixture)" \
+  "an offload-status porcelain row lost field discipline under a duplicate-remote state file"
+set +e; grep -qxF -- "code|repos|repos|offloaded|gdrive:first/remote|" "${p6_out}"; p6rc=$?; set -e
+pass_if "${p6rc}" "duplicate remote= lines resolve to ONE row with the FIRST remote" \
+  "offload-status porcelain is MISSING 'code|repos|repos|offloaded|gdrive:first/remote|' (first-remote-wins drift)"
+
 # ===========================================================================
 # --- Q1: TUI file-pairing drift tripwire (TEST phase, auditor focus). The
 #     Makefile's python steps deliberately SILENT-SKIP when bin/xdg_tui.py or

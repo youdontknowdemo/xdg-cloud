@@ -1062,10 +1062,13 @@ classify_one() {
 # git is ALWAYS empty from classify (offload-status owns that field). Mirrors
 # classify_one's branches exactly; no human header, no advisory lines.
 # canonical/localName come from the fixed pipe-delimited registries, so they can
-# never contain '|'; a symlink TARGET is arbitrary, so a pipe-containing target is
-# sanitized to a fixed placeholder rather than corrupting the row (or dropping it).
+# never contain '|' or a newline; a symlink TARGET is arbitrary, so a target
+# containing either row-breaker (pipe = field delimiter, newline = row delimiter:
+# $() strips only TRAILING newlines, so an embedded one would split this row
+# across two physical lines) is sanitized to a fixed placeholder rather than
+# corrupting the row (or dropping it).
 porcelain_classify_row() {
-  local class row canonical name target state remote
+  local class row canonical name target state remote nl
   class="$1"; row="$2"
   [ -n "$row" ] || return 0                 # unknown key — emit nothing (mirror classify_one)
   canonical="$(field "$row" 1)"
@@ -1075,7 +1078,8 @@ porcelain_classify_row() {
   if [ -L "$target" ]; then
     state="symlink"
     remote="$(readlink "$target")"          # readlink (no -f) on a known symlink
-    case "$remote" in *"|"*) remote="<non-porcelain-target>" ;; esac
+    nl="$(printf '\nx')"; nl="${nl%x}"      # bash-3.2 literal newline
+    case "$remote" in *"$nl"*|*"|"*) remote="<non-porcelain-target>" ;; esac
   elif [ -d "$target" ]; then
     state="localdir"
   fi
@@ -1116,8 +1120,9 @@ EOF
 #   $XDG_STATE_HOME/xdg-cloud/offloaded/<canonical>; slice 1 only READS them, so
 #   with no such file every code dir reports `local` (validating the read path).
 cmd_offload_status() {
-  local k state_dir name target sf remote gitout githint row state gitfield
+  local k state_dir name target sf remote gitout githint row state gitfield nl
   state_dir="$XDG_STATE_HOME/xdg-cloud/offloaded"
+  nl="$(printf '\nx')"; nl="${nl%x}"        # bash-3.2 literal newline (porcelain sanitizer)
   if [ "$PORCELAIN" -eq 1 ]; then
     printf 'porcelain=1\n'
     # shellcheck disable=SC2086   # intentional word-split of the space-separated key list
@@ -1131,9 +1136,13 @@ cmd_offload_status() {
         # tolerate a malformed/empty file). offloaded is state-file-presence ONLY —
         # deliberately NO '-e target' check here: the porcelain is a faithful mirror,
         # and the TUI derives 'inconsistent' by joining the two streams.
-        remote="$(grep '^remote=' "$sf" 2>/dev/null | cut -d= -f2- || true)"
+        # head -n1: a state file with TWO 'remote=' lines would otherwise return
+        # multi-line output and split this row across physical lines — first
+        # remote wins. `|| true` still rescues the no-match (grep exit 1) and
+        # early-close (SIGPIPE/141) pipeline exits under set -euo pipefail.
+        remote="$(grep '^remote=' "$sf" 2>/dev/null | head -n1 | cut -d= -f2- || true)"
         [ -n "$remote" ] || remote="<unknown remote>"
-        case "$remote" in *"|"*) remote="<non-porcelain-remote>" ;; esac
+        case "$remote" in *"$nl"*|*"|"*) remote="<non-porcelain-remote>" ;; esac
         printf 'code|%s|%s|offloaded|%s|\n' "$k" "$name" "$remote"
       else
         state="local"; gitfield="none"
