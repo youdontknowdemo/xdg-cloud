@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-02
+
+Adds a `--version` flag and closes out the tracked test-coverage backlog
+(F2/F3/F4/F6 all resolved). No behavior changes to existing modes.
+
 ### Added
 - `cloud-xdg-provision.sh --version`: print the version — read from the repo-root
   `VERSION` file resolved relative to the script (works from any CWD and via a
