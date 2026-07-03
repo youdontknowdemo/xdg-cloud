@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `xdg-tui`: an optional curses dashboard (`bin/xdg-tui` launcher +
+  `bin/xdg_tui.py`, python 3 stdlib only) that browses every registry entry with
+  live state and drives offload / hydrate / reclaim / iCloud interactively. A
+  strict wrapper: every action is a normal `cloud-xdg-provision.sh` run
+  (dry-run preview → explicit confirm → `--apply`); the script's guards remain
+  the sole enforcement layer, applies get full terminal handover, interrupts
+  surface as interrupts (rc 130), and iCloud evict keeps its typed-consent gate.
+- `--porcelain` modifier for `--classify` / `--offload-status`: versioned
+  (`porcelain=1`) pipe-delimited machine-readable output
+  (`class|canonical|localName|state|remote|git`), format-frozen by golden smoke
+  tests. Human output is byte-unchanged; misuse on any other lane is refused.
+- ADR §5.2 amendment: python permitted **narrowly** for the optional TUI; the
+  core toolkit stays bash-3.2-pure and `make lint`/`make test` python steps
+  skip gracefully where python3 is absent.
+
+### Tests
+- Smoke Group P freezes the porcelain contract (goldens for every state enum,
+  read-only checks, misuse refusal); Group Q1 pins the launcher/module/test
+  pairing so gate steps can never silently skip.
+- `tests/tui/`: 78 stdlib-unittest cases — P0 gates at 100% branch coverage
+  (apply iff literally confirmed, consent-before-argv evict, no-op SIGINT
+  handler never `SIG_IGN`) plus integration: offload→hydrate round-trip
+  (byte-identical), SIGINT mid-apply (lock released, container intact,
+  recovery-trap tripwire), read-back-failure relay.
+
 ## [0.2.2] - 2026-07-02
 
 Adds a `--version` flag and closes out the tracked test-coverage backlog

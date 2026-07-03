@@ -106,8 +106,8 @@ nothing until you add `--apply`.
 
 | Mode | What it does |
 |------|--------------|
-| `--classify` | Report the class (**xdg** / **code** / **local**) of every known `~/` entry. Read-only. |
-| `--offload-status` | Report which CODE dirs are offloaded to the remote vs. still local. Read-only. |
+| `--classify` | Report the class (**xdg** / **code** / **local**) of every known `~/` entry. Read-only. Add `--porcelain` for a machine-readable, versioned pipe-delimited format. |
+| `--offload-status` | Report which CODE dirs are offloaded to the remote vs. still local. Read-only. Also accepts `--porcelain`. |
 | `--offload <dir>` | Push a CODE dir to the rclone **remote** (the only lane that frees local space), gated on per-repo clean/pushed/no-stash guards and an independent read-back verify (`rclone check --download`) before any local drop. |
 | `--hydrate <dir>` | Restore a previously offloaded CODE dir from the remote. An interrupted hydrate is self-detecting via a sentinel. |
 | `--migrate-projects` | Un-symlink a cloud-mounted `~/Projects` back to a real local dir (non-destructive). |
@@ -140,6 +140,25 @@ never followed, and every `rm` passes a degenerate-path guard. Tool-native clean
 # then actually reclaim:
 /bin/bash bin/cloud-xdg-provision.sh --reclaim "$HOME/repos" --apply
 ```
+
+## `xdg-tui` — interactive dashboard (optional)
+
+`bin/xdg-tui` launches a curses dashboard over the provision script: every
+registry entry with its live state (`local` / `offloaded` / `symlink` /
+`inconsistent`), with the CODE dirs action-enabled. It is a **strict wrapper** —
+every action is a normal `cloud-xdg-provision.sh` invocation (dry-run preview →
+explicit confirm → `--apply`), so all of the script's guards, locks, and traps
+remain the sole enforcement layer. During an apply the TUI hands the terminal to
+the script, so rclone progress and any guard refusal render verbatim.
+
+- Lanes: offload, hydrate, reclaim, and the macOS iCloud lane. Evicting still
+  requires typing the target path back — the TUI never reduces that consent gate
+  to a keypress.
+- Requires python 3 with `curses` (stdlib only — no pip packages). The launcher
+  probes for it and prints per-platform install guidance if absent; the core
+  toolkit remains pure bash 3.2 and fully usable without python.
+- `bin/xdg-tui --dump` prints one dashboard frame to stdout (no tty needed);
+  `--version` matches the toolkit version.
 
 ## `home-tree.sh` — local home + safe backup mirror
 
