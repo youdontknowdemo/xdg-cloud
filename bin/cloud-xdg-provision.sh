@@ -86,6 +86,7 @@ MODE_ARG=""        # argument for value-taking modes (--offload <dir>, --hydrate
 : "${CODE_REMOTE:=gdrive}"            # rclone remote name (create via 'rclone config')
 : "${CODE_DEST:=xdg-offload/code}"    # path inside the remote; per-container <canonical> appended
 OFFLOAD_ASIDE=0                       # 1 = move aside + re-verify before rm (opt-in, --aside)
+PORCELAIN=0        # 1 = machine-readable output for --classify/--offload-status (--porcelain)
 
 # Dotfiles bare-repo lane (slice 3, step 8) — purely LOCAL (no cloud mount/remote). A bare
 # git repo at $HOME/.dotfiles with $HOME as the work tree, plus a sourced alias file and a
@@ -357,6 +358,10 @@ Modes (default with no mode flag = the provision/symlink lane above; exactly one
 lane per run — combining a mode with the default flags is refused):
   --classify             Report the class of every known ~/ entry (read-only).
   --offload-status       Report which code dirs are offloaded vs local (read-only).
+  --porcelain               Machine-readable output for --classify/--offload-status:
+                            a 'porcelain=1' version header, then pipe-delimited rows
+                            class|canonical|localName|state|remote|git. Fields are only
+                            ever APPENDED within version 1; breaking changes bump the header.
   --offload <dir>        Push a CODE dir to the rclone remote, verify, then free local
                          space (dry-run unless --apply). git = source of truth.
   --hydrate <dir>        Restore a previously offloaded CODE dir from the remote.
@@ -447,6 +452,7 @@ while [ $# -gt 0 ]; do
     --code-remote)        shift; CODE_REMOTE="${1:?--code-remote needs a name}" ;;
     --code-dest)          shift; CODE_DEST="${1:?--code-dest needs a path}" ;;
     --aside)              OFFLOAD_ASIDE=1 ;;
+    --porcelain)          PORCELAIN=1 ;;
     --dotfiles-rc)        shift; DOTFILES_RC="${1:?--dotfiles-rc needs a path}" ;;
     # --- read-only report modes (slice 1, implemented) ---
     --classify)           set_mode classify ;;
@@ -487,6 +493,15 @@ $1"
 done
 
 case "$STYLE" in xdg|mac) ;; *) die "invalid --style: $STYLE" ;; esac
+
+# --porcelain is a MODIFIER (like --aside), valid only on the two read-only report
+# modes. Fail loud on misuse so callers never silently get human-format output.
+if [ "$PORCELAIN" -eq 1 ]; then
+  case "$MODE" in
+    classify|offload-status) : ;;
+    *) die "--porcelain applies only to --classify or --offload-status" ;;
+  esac
+fi
 
 # ---------------------------------------------------------------------------
 # Platform + cloud root resolution
@@ -1041,9 +1056,45 @@ classify_one() {
   fi
 }
 
+# Emit ONE porcelain row for --classify: class|canonical|localName|state|remote|git.
+#   $1 = class label (xdg|code|local), $2 = a 'canonical|mac|lin|…' registry-style row.
+# States: symlink|localdir|absent. remote = readlink target for symlink, else empty.
+# git is ALWAYS empty from classify (offload-status owns that field). Mirrors
+# classify_one's branches exactly; no human header, no advisory lines.
+# canonical/localName come from the fixed pipe-delimited registries, so they can
+# never contain '|'; a symlink TARGET is arbitrary, so a pipe-containing target is
+# sanitized to a fixed placeholder rather than corrupting the row (or dropping it).
+porcelain_classify_row() {
+  local class row canonical name target state remote
+  class="$1"; row="$2"
+  [ -n "$row" ] || return 0                 # unknown key — emit nothing (mirror classify_one)
+  canonical="$(field "$row" 1)"
+  name="$(local_name "$(field "$row" 2)" "$(field "$row" 3)")"
+  target="$HOME/$name"
+  state="absent"; remote=""
+  if [ -L "$target" ]; then
+    state="symlink"
+    remote="$(readlink "$target")"          # readlink (no -f) on a known symlink
+    case "$remote" in *"|"*) remote="<non-porcelain-target>" ;; esac
+  elif [ -d "$target" ]; then
+    state="localdir"
+  fi
+  printf '%s|%s|%s|%s|%s|\n' "$class" "$canonical" "$name" "$state" "$remote"
+}
+
 # --classify: classify every known top-level ~/ entry. Read-only.
 cmd_classify() {
   local k
+  if [ "$PORCELAIN" -eq 1 ]; then
+    printf 'porcelain=1\n'
+    # shellcheck disable=SC2086   # intentional word-split of the space-separated key lists
+    for k in $CLOUDXDG_KEYS; do porcelain_classify_row xdg   "$(registry_row "$k")"; done
+    # shellcheck disable=SC2086
+    for k in $CODE_KEYS;     do porcelain_classify_row code  "$(code_row "$k")"; done
+    # shellcheck disable=SC2086
+    for k in $LOCAL_KEYS;    do porcelain_classify_row local "$(code_row "$k")"; done
+    return 0
+  fi
   log "Home-dir classification (read-only — no changes made):"
   # shellcheck disable=SC2086   # intentional word-split of the space-separated key lists
   for k in $CLOUDXDG_KEYS; do classify_one xdg   "$(registry_row "$k")"; done
@@ -1065,8 +1116,38 @@ EOF
 #   $XDG_STATE_HOME/xdg-cloud/offloaded/<canonical>; slice 1 only READS them, so
 #   with no such file every code dir reports `local` (validating the read path).
 cmd_offload_status() {
-  local k state_dir name target sf remote gitout githint
+  local k state_dir name target sf remote gitout githint row state gitfield
   state_dir="$XDG_STATE_HOME/xdg-cloud/offloaded"
+  if [ "$PORCELAIN" -eq 1 ]; then
+    printf 'porcelain=1\n'
+    # shellcheck disable=SC2086   # intentional word-split of the space-separated key list
+    for k in $CODE_KEYS; do
+      row="$(code_row "$k")"
+      name="$(local_name "$(field "$row" 2)" "$(field "$row" 3)")"
+      target="$HOME/$name"
+      sf="$state_dir/$k"
+      if [ -f "$sf" ]; then
+        # state file present -> offloaded (same 3.2 parse idiom as the human branch;
+        # tolerate a malformed/empty file). offloaded is state-file-presence ONLY —
+        # deliberately NO '-e target' check here: the porcelain is a faithful mirror,
+        # and the TUI derives 'inconsistent' by joining the two streams.
+        remote="$(grep '^remote=' "$sf" 2>/dev/null | cut -d= -f2- || true)"
+        [ -n "$remote" ] || remote="<unknown remote>"
+        case "$remote" in *"|"*) remote="<non-porcelain-remote>" ;; esac
+        printf 'code|%s|%s|offloaded|%s|\n' "$k" "$name" "$remote"
+      else
+        state="local"; gitfield="none"
+        if [ -d "$target" ] && git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+          gitout="$(git -C "$target" status --porcelain 2>/dev/null || true)"
+          if [ -n "$gitout" ]; then gitfield="dirty"; else gitfield="clean"; fi
+        elif [ ! -e "$target" ]; then
+          state="absent"
+        fi
+        printf 'code|%s|%s|%s||%s\n' "$k" "$name" "$state" "$gitfield"
+      fi
+    done
+    return 0
+  fi
   log "Code-dir offload status (read-only — no changes made):"
   # shellcheck disable=SC2086   # intentional word-split of the space-separated key list
   for k in $CODE_KEYS; do
