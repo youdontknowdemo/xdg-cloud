@@ -1,19 +1,45 @@
 # xdg-cloud Makefile
 # Thin targets only — each is a one-or-two-line shell-out (ADR Decision 3).
-# Requires: bash, shellcheck (for lint), coreutils. No just/npm/python.
+# Requires: bash, shellcheck (for lint), coreutils. No just/npm. python3 is
+# OPTIONAL (ADR Decision 3 amendment): only the companion TUI needs it, and
+# every python step below skip-guards behind a FUNCTIONAL probe
+# (`python3 -c ''`, same idiom as bin/xdg-tui) — never a bare `command -v`:
+# stock macOS ships a CLT stub python3 that exists on PATH but pops a GUI
+# installer and exits non-zero when CLT is absent.
 
 VERSION := $(shell cat VERSION)
 
 .PHONY: lint test install version helper
 .DEFAULT_GOAL := lint
 
-## lint: shellcheck all shell sources; honors .shellcheckrc; non-zero on any finding.
+## lint: shellcheck all shell sources (incl. the extensionless launcher); then
+##       byte-compile the TUI as its zero-dep python "lint". Skips cleanly where
+##       python3 is absent — the shell toolkit's gate is unchanged on such machines.
+##       Also skips while bin/xdg_tui.py has not landed yet (concurrent-dev window).
 lint:
-	shellcheck bin/*.sh bin/lib/*.sh hooks/pre-commit tests/*.sh
+	shellcheck bin/*.sh bin/lib/*.sh bin/xdg-tui hooks/pre-commit tests/*.sh
+	@if ! python3 -c '' </dev/null >/dev/null 2>&1; then \
+	  echo "python3 not found — skipping TUI byte-compile (install python3 to lint the TUI)"; \
+	elif [ ! -f bin/xdg_tui.py ]; then \
+	  echo "bin/xdg_tui.py not present — skipping TUI byte-compile"; \
+	else \
+	  files="bin/xdg_tui.py"; \
+	  for f in tests/tui/*.py; do [ -f "$$f" ] && files="$$files $$f"; done; \
+	  python3 -m py_compile $$files && \
+	  echo "py_compile OK: $$files"; \
+	fi
 
-## test: run smoke + idempotency checks in a sandbox (never touches real $$HOME).
+## test: smoke suite (bash contract, incl. the porcelain golden group) + stdlib
+##       unittest for the TUI core. Same graceful skip as lint.
 test:
 	bash tests/smoke.sh
+	@if ! python3 -c '' </dev/null >/dev/null 2>&1; then \
+	  echo "python3 not found — skipping TUI unit tests (install python3 to run them)"; \
+	elif ! ls tests/tui/test_*.py >/dev/null 2>&1; then \
+	  echo "tests/tui has no test files yet — skipping TUI unit tests"; \
+	else \
+	  python3 -m unittest discover -s tests/tui -p 'test_*.py'; \
+	fi
 
 ## install: make scripts/hook executable and wire the pre-commit hook (idempotent).
 install:

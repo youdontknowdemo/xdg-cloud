@@ -33,3 +33,6 @@ bin/icloud-uploaded
 # redirects it into the repo, ignore generated filters:
 *.rclone-filter
 home-tree.rclone-filter
+
+# python bytecode (optional TUI)
+__pycache__/

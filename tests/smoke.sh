@@ -2642,4 +2642,268 @@ pass_if "${rc}" "--version via a symlink exits 0" \
   "--version via a symlink did not exit 0 (exit ${rc}): ${out}"
 assert_contains "${out}" "${ver}" "--version via a symlink still contains the VERSION-file version"
 
+# ===========================================================================
+# Group P: --porcelain golden group (tui-offload-manager diff-spec §2.6 / §8.3).
+# The porcelain format is the FROZEN machine contract the Python TUI parses:
+#   line 1: 'porcelain=1'   rows: class|canonical|localName|state|remote|git
+# Every reachable enum state is pinned as an EXACT whole line (grep -qxF), so any
+# drift in the shape fails here before it can corrupt the TUI's parser. Fields are
+# append-only within version 1; a deliberate change must update these goldens AND
+# bump the header. CAPTURE-then-INSPECT via files (never pipe the script into
+# grep -q — SIGPIPE/141 under pipefail). Names asserted are platform-stable
+# (macName==linuxName for every asserted row).
+# ===========================================================================
+
+# --- P1: --classify --porcelain — header, row count, field discipline, every
+#     classify enum state (symlink/localdir/absent) + pipe-target sanitization,
+#     and zero mutation (find-snapshot before/after). ---
+echo "smoke: P1 — --classify --porcelain golden shapes"
+p1h="${sandbox}/p1-home"; p1c="${sandbox}/p1-cloud"
+mkdir -p "${p1h}" "${p1c}/documents" "${p1c}/Projects" "${p1h}/Music" "${p1h}/repos" "${p1h}/pyenv"
+ln -s "${p1c}/documents" "${p1h}/Documents"       # xdg symlink -> remote = readlink target
+ln -s "${p1c}/Projects"  "${p1h}/Projects"        # code symlink (TUI derives the migrate hint)
+ln -s "${sandbox}/evil|pipe" "${p1h}/Desktop"     # pipe in the TARGET -> sanitized placeholder
+p1_before="$(cd "${p1h}" && find . | sort)"
+p1_out="${sandbox}/p1-classify.out"
+set +e
+HOME="${p1h}" XDG_STATE_HOME="${p1h}/state" /bin/bash "${PROV}" --classify --porcelain \
+  >"${p1_out}" 2>"${sandbox}/p1-classify.err"
+rc=$?
+set -e
+pass_if "${rc}" "--classify --porcelain exits 0" \
+  "--classify --porcelain failed (exit ${rc}): $(cat "${sandbox}/p1-classify.err")"
+if [ "$(sed -n 1p "${p1_out}")" = "porcelain=1" ]; then
+  ok "classify porcelain header is exactly 'porcelain=1'"
+else
+  fail "classify porcelain first line is '$(sed -n 1p "${p1_out}")', expected 'porcelain=1'"
+fi
+p1_lines="$(wc -l < "${p1_out}" | tr -d ' ')"
+if [ "${p1_lines}" -eq 16 ]; then
+  ok "classify porcelain emits header + 15 rows (8 xdg + 3 code + 4 local)"
+else
+  fail "classify porcelain emitted ${p1_lines} lines, expected 16: $(cat "${p1_out}")"
+fi
+set +e; awk -F'|' 'NR>1 && NF!=6 {exit 1}' "${p1_out}"; p1rc=$?; set -e
+pass_if "${p1rc}" "every classify porcelain row has exactly 6 pipe-delimited fields" \
+  "a classify porcelain row does not have 6 fields (or prose leaked into stdout)"
+for p1line in \
+  "xdg|documents|Documents|symlink|${p1c}/documents|" \
+  "xdg|music|Music|localdir||" \
+  "xdg|templates|Templates|absent||" \
+  "xdg|desktop|Desktop|symlink|<non-porcelain-target>|" \
+  "code|projects|Projects|symlink|${p1c}/Projects|" \
+  "code|repos|repos|localdir||" \
+  "local|pyenv|pyenv|localdir||"; do
+  set +e; grep -qxF -- "${p1line}" "${p1_out}"; p1rc=$?; set -e
+  pass_if "${p1rc}" "classify golden row '${p1line}'" \
+    "classify porcelain is MISSING the exact row '${p1line}' (frozen-contract drift)"
+done
+p1_after="$(cd "${p1h}" && find . | sort)"
+if [ "${p1_before}" = "${p1_after}" ]; then
+  ok "--classify --porcelain mutated nothing (sandbox HOME tree identical before/after)"
+else
+  fail "--classify --porcelain mutated the home tree"
+fi
+
+# --- P2: --offload-status --porcelain, run A — offloaded-with-remote, absent,
+#     and local-not-a-git-tree. GIT_CEILING_DIRECTORIES=$HOME stops the git
+#     upward probe of $HOME/<name> at the sandbox (the ceiling must be the PARENT
+#     of the probed dir), so a plain dir inside this repo's work tree reports
+#     'none' instead of inheriting the repo's git state. ---
+echo "smoke: P2 — --offload-status --porcelain golden shapes (offloaded/absent/none)"
+p2h="${sandbox}/p2-home"
+mkdir -p "${p2h}/state/xdg-cloud/offloaded" "${p2h}/Projects"
+printf 'remote=gdrive:xdg-offload/code/repos\n' > "${p2h}/state/xdg-cloud/offloaded/repos"
+p2_before="$(cd "${p2h}" && find . | sort)"
+p2_out="${sandbox}/p2-ofs.out"
+set +e
+HOME="${p2h}" XDG_STATE_HOME="${p2h}/state" GIT_CEILING_DIRECTORIES="${p2h}" \
+  /bin/bash "${PROV}" --offload-status --porcelain >"${p2_out}" 2>"${sandbox}/p2-ofs.err"
+rc=$?
+set -e
+pass_if "${rc}" "--offload-status --porcelain exits 0" \
+  "--offload-status --porcelain failed (exit ${rc}): $(cat "${sandbox}/p2-ofs.err")"
+if [ "$(sed -n 1p "${p2_out}")" = "porcelain=1" ]; then
+  ok "offload-status porcelain header is exactly 'porcelain=1'"
+else
+  fail "offload-status porcelain first line is '$(sed -n 1p "${p2_out}")', expected 'porcelain=1'"
+fi
+p2_lines="$(wc -l < "${p2_out}" | tr -d ' ')"
+if [ "${p2_lines}" -eq 4 ]; then
+  ok "offload-status porcelain emits header + 3 rows (CODE_KEYS order)"
+else
+  fail "offload-status porcelain emitted ${p2_lines} lines, expected 4: $(cat "${p2_out}")"
+fi
+set +e; awk -F'|' 'NR>1 && NF!=6 {exit 1}' "${p2_out}"; p2rc=$?; set -e
+pass_if "${p2rc}" "every offload-status porcelain row has exactly 6 fields" \
+  "an offload-status porcelain row does not have 6 fields (or prose leaked into stdout)"
+for p2line in \
+  "code|repos|repos|offloaded|gdrive:xdg-offload/code/repos|" \
+  "code|androidstudio|AndroidStudioProjects|absent||none" \
+  "code|projects|Projects|local||none"; do
+  set +e; grep -qxF -- "${p2line}" "${p2_out}"; p2rc=$?; set -e
+  pass_if "${p2rc}" "offload-status golden row '${p2line}'" \
+    "offload-status porcelain is MISSING the exact row '${p2line}' (frozen-contract drift)"
+done
+p2_after="$(cd "${p2h}" && find . | sort)"
+if [ "${p2_before}" = "${p2_after}" ]; then
+  ok "--offload-status --porcelain mutated nothing (HOME + state dir identical before/after)"
+else
+  fail "--offload-status --porcelain mutated the home/state tree"
+fi
+
+# --- P3: --offload-status --porcelain, run B — malformed state file
+#     (<unknown remote>) and the git clean/dirty fields. Fixture git state is
+#     SETTLED with a throwaway `git status` before the snapshot so the script's
+#     own read-only `git status` cannot create index files mid-test. ---
+echo "smoke: P3 — --offload-status --porcelain golden shapes (unknown-remote/clean/dirty)"
+p3h="${sandbox}/p3-home"
+mkdir -p "${p3h}/state/xdg-cloud/offloaded" "${p3h}/AndroidStudioProjects" "${p3h}/Projects"
+: > "${p3h}/state/xdg-cloud/offloaded/repos"          # present but malformed/empty
+git -C "${p3h}/AndroidStudioProjects" init -q         # git tree, nothing to report -> clean
+git -C "${p3h}/Projects" init -q
+printf 'x\n' > "${p3h}/Projects/untracked.txt"        # untracked file -> dirty
+git -C "${p3h}/AndroidStudioProjects" status --porcelain >/dev/null
+git -C "${p3h}/Projects" status --porcelain >/dev/null
+p3_before="$(cd "${p3h}" && find . | sort)"
+p3_out="${sandbox}/p3-ofs.out"
+set +e
+HOME="${p3h}" XDG_STATE_HOME="${p3h}/state" GIT_CEILING_DIRECTORIES="${p3h}" \
+  /bin/bash "${PROV}" --offload-status --porcelain >"${p3_out}" 2>"${sandbox}/p3-ofs.err"
+rc=$?
+set -e
+pass_if "${rc}" "--offload-status --porcelain (run B) exits 0" \
+  "--offload-status --porcelain (run B) failed (exit ${rc}): $(cat "${sandbox}/p3-ofs.err")"
+for p3line in \
+  "code|repos|repos|offloaded|<unknown remote>|" \
+  "code|androidstudio|AndroidStudioProjects|local||clean" \
+  "code|projects|Projects|local||dirty"; do
+  set +e; grep -qxF -- "${p3line}" "${p3_out}"; p3rc=$?; set -e
+  pass_if "${p3rc}" "offload-status golden row '${p3line}'" \
+    "offload-status porcelain is MISSING the exact row '${p3line}' (frozen-contract drift)"
+done
+p3_after="$(cd "${p3h}" && find . | sort)"
+if [ "${p3_before}" = "${p3_after}" ]; then
+  ok "--offload-status --porcelain (run B) mutated nothing"
+else
+  fail "--offload-status --porcelain (run B) mutated the home/state tree"
+fi
+
+# --- P4: the HUMAN output paths are unchanged when --porcelain is absent —
+#     header + Notes block still present (the porcelain branch must not leak). ---
+echo "smoke: P4 — human --classify/--offload-status output unchanged without --porcelain"
+out="$(HOME="${p1h}" XDG_STATE_HOME="${p1h}/state" /bin/bash "${PROV}" --classify 2>&1)"
+assert_contains "${out}" "Home-dir classification" "--classify still prints its human header"
+assert_contains "${out}" "Entries under ~/ not listed above are unclassified." \
+  "--classify still prints its human Notes block"
+assert_not_contains "${out}" "porcelain=1" "--classify (human) does not emit the porcelain header"
+out="$(HOME="${p2h}" XDG_STATE_HOME="${p2h}/state" GIT_CEILING_DIRECTORIES="${p2h}" \
+  /bin/bash "${PROV}" --offload-status 2>&1)"
+assert_contains "${out}" "Code-dir offload status" "--offload-status still prints its human header"
+assert_contains "${out}" "offloaded -> gdrive:xdg-offload/code/repos" \
+  "--offload-status (human) still renders the offloaded arrow line"
+assert_not_contains "${out}" "porcelain=1" "--offload-status (human) does not emit the porcelain header"
+
+# --- P5: misuse fails LOUD — --porcelain on a non-report mode, and bare
+#     --porcelain (default provision lane), both die with the §2.3 message. ---
+echo "smoke: P5 — --porcelain misuse is refused"
+set +e
+out="$(HOME="${p1h}" /bin/bash "${PROV}" --porcelain --offload repos 2>&1)"
+rc=$?
+set -e
+assert_nonzero "${rc}" "--porcelain --offload is refused"
+assert_contains "${out}" "--porcelain applies only to --classify or --offload-status" \
+  "--porcelain --offload names the two valid modes"
+set +e
+out="$(HOME="${p1h}" /bin/bash "${PROV}" --porcelain 2>&1)"
+rc=$?
+set -e
+assert_nonzero "${rc}" "bare --porcelain (default lane) is refused"
+assert_contains "${out}" "--porcelain applies only to --classify or --offload-status" \
+  "bare --porcelain names the two valid modes"
+
+# --- P6: porcelain NEWLINE hardening — the row delimiter is the second thing
+#     that can break a pipe-delimited line format. (a) classify: a symlink
+#     TARGET with an embedded newline must yield exactly ONE 6-field row with
+#     the placeholder, never a row split across two physical lines (readlink
+#     preserves interior newlines; $() strips only trailing ones). (b)
+#     offload-status: a state file with TWO 'remote=' lines must yield exactly
+#     ONE row — FIRST remote wins (head -n1 semantics, pinned here). Row-count
+#     + NF==6 assertions catch any split; grep -qxF pins the whole line. ---
+echo "smoke: P6 — porcelain newline hardening (split-row regressions)"
+p6h="${sandbox}/p6-home"
+p6nl="$(printf '\nx')"; p6nl="${p6nl%x}"               # bash-3.2 literal newline
+mkdir -p "${p6h}/state/xdg-cloud/offloaded"
+ln -s "${sandbox}/evil${p6nl}target" "${p6h}/Documents"  # newline INSIDE the target
+printf 'remote=gdrive:first/remote\nremote=evil:second/remote\n' \
+  > "${p6h}/state/xdg-cloud/offloaded/repos"             # duplicate remote= lines
+p6_out="${sandbox}/p6-classify.out"
+set +e
+HOME="${p6h}" XDG_STATE_HOME="${p6h}/state" /bin/bash "${PROV}" --classify --porcelain \
+  >"${p6_out}" 2>"${sandbox}/p6-classify.err"
+rc=$?
+set -e
+pass_if "${rc}" "--classify --porcelain (newline-in-target) exits 0" \
+  "--classify --porcelain (newline-in-target) failed (exit ${rc}): $(cat "${sandbox}/p6-classify.err")"
+p6_lines="$(wc -l < "${p6_out}" | tr -d ' ')"
+if [ "${p6_lines}" -eq 16 ]; then
+  ok "classify porcelain still emits header + 15 rows (newline target did NOT split a row)"
+else
+  fail "classify porcelain emitted ${p6_lines} lines, expected 16 — a newline target split a row: $(cat "${p6_out}")"
+fi
+set +e; awk -F'|' 'NR>1 && NF!=6 {exit 1}' "${p6_out}"; p6rc=$?; set -e
+pass_if "${p6rc}" "every classify porcelain row still has exactly 6 fields (newline fixture)" \
+  "a classify porcelain row lost field discipline under a newline-containing target"
+set +e; grep -qxF -- "xdg|documents|Documents|symlink|<non-porcelain-target>|" "${p6_out}"; p6rc=$?; set -e
+pass_if "${p6rc}" "newline-containing target is sanitized to the exact placeholder row" \
+  "classify porcelain is MISSING 'xdg|documents|Documents|symlink|<non-porcelain-target>|' for a newline target"
+p6_out="${sandbox}/p6-ofs.out"
+set +e
+HOME="${p6h}" XDG_STATE_HOME="${p6h}/state" GIT_CEILING_DIRECTORIES="${p6h}" \
+  /bin/bash "${PROV}" --offload-status --porcelain >"${p6_out}" 2>"${sandbox}/p6-ofs.err"
+rc=$?
+set -e
+pass_if "${rc}" "--offload-status --porcelain (duplicate remote=) exits 0" \
+  "--offload-status --porcelain (duplicate remote=) failed (exit ${rc}): $(cat "${sandbox}/p6-ofs.err")"
+p6_lines="$(wc -l < "${p6_out}" | tr -d ' ')"
+if [ "${p6_lines}" -eq 4 ]; then
+  ok "offload-status porcelain still emits header + 3 rows (duplicate remote= did NOT split a row)"
+else
+  fail "offload-status porcelain emitted ${p6_lines} lines, expected 4 — duplicate remote= split a row: $(cat "${p6_out}")"
+fi
+set +e; awk -F'|' 'NR>1 && NF!=6 {exit 1}' "${p6_out}"; p6rc=$?; set -e
+pass_if "${p6rc}" "every offload-status porcelain row still has exactly 6 fields (duplicate-remote fixture)" \
+  "an offload-status porcelain row lost field discipline under a duplicate-remote state file"
+set +e; grep -qxF -- "code|repos|repos|offloaded|gdrive:first/remote|" "${p6_out}"; p6rc=$?; set -e
+pass_if "${p6rc}" "duplicate remote= lines resolve to ONE row with the FIRST remote" \
+  "offload-status porcelain is MISSING 'code|repos|repos|offloaded|gdrive:first/remote|' (first-remote-wins drift)"
+
+# ===========================================================================
+# --- Q1: TUI file-pairing drift tripwire (TEST phase, auditor focus). The
+#     Makefile's python steps deliberately SILENT-SKIP when bin/xdg_tui.py or
+#     tests/tui/test_*.py are absent (correct for python-less machines) — but
+#     that same skip would also mask an accidental DELETION of the TUI module
+#     or its suites while the launcher still ships. Pin the pairing here, in
+#     the bash gate that never skips: if bin/xdg-tui exists, so must
+#     bin/xdg_tui.py and at least one tests/tui/test_*.py. ---
+echo "smoke: Q1 — TUI launcher/module/tests pairing (Makefile silent-skip tripwire)"
+if [ -e "${repo}/bin/xdg-tui" ]; then
+  if [ -f "${repo}/bin/xdg_tui.py" ]; then
+    ok "bin/xdg-tui is paired with bin/xdg_tui.py"
+  else
+    fail "bin/xdg-tui exists but bin/xdg_tui.py is MISSING — make lint/test would silently skip the TUI gate"
+  fi
+  q1_found=0
+  for q1_f in "${repo}/tests/tui/"test_*.py; do
+    if [ -e "${q1_f}" ]; then q1_found=1; fi
+  done
+  if [ "${q1_found}" -eq 1 ]; then
+    ok "tests/tui has at least one test_*.py (unittest discovery stays non-empty)"
+  else
+    fail "bin/xdg-tui exists but tests/tui/test_*.py is MISSING — make test would silently skip the TUI suite"
+  fi
+else
+  ok "bin/xdg-tui not present — TUI pairing check not applicable"
+fi
+
 echo "smoke: PASS"

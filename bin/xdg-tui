@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+#
+# xdg-tui — launcher for the OPTIONAL Python TUI (bin/xdg_tui.py).
+#
+# bash 3.2. Finds a WORKING python3 with stdlib curses via a FUNCTIONAL probe —
+# never a bare `command -v`: stock macOS ships a CLT shim python3 that exists on
+# PATH but pops a GUI installer and exits non-zero when CLT is absent. Probing
+# `import curses` folds "python missing" and "curses missing" into ONE failure
+# path with one guidance message. On failure: guidance to stderr, exit 127.
+#
+set -euo pipefail
+
+# --- locate self (symlink- and CWD-safe; same idiom as cloud-xdg-provision.sh) ---
+__self_src="${BASH_SOURCE[0]}"
+while [ -h "$__self_src" ]; do
+  __self_dir="$(cd -P "$(dirname "$__self_src")" >/dev/null 2>&1 && pwd)"
+  __self_src="$(readlink "$__self_src")"
+  case "$__self_src" in
+    /*) : ;;                                   # absolute target — use as-is
+    *)  __self_src="$__self_dir/$__self_src" ;; # relative — resolve vs link dir
+  esac
+done
+__self_dir="$(cd -P "$(dirname "$__self_src")" >/dev/null 2>&1 && pwd)"
+
+# Functional probe: proves python3 RUNS *and* stdlib curses imports, in one shot.
+# </dev/null so the probe can never block on stdin. On stock macOS without CLT this
+# may surface Apple's own installer dialog (the supported install route) and then
+# fall through to the guidance below.
+if python3 -c 'import curses' </dev/null >/dev/null 2>&1; then
+  exec python3 "$__self_dir/xdg_tui.py" "$@"
+fi
+
+cat >&2 <<'EOF'
+xdg-tui needs python3 with the stdlib `curses` module (no pip packages required),
+which was not found or failed to run. Install python3, then re-run xdg-tui:
+
+  macOS          xcode-select --install      # installs /usr/bin/python3
+  Debian/Ubuntu  sudo apt install python3    # usually already present
+  Termux         pkg install python
+
+EOF
+exit 127
