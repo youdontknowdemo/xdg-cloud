@@ -188,6 +188,25 @@ Required Makefile conventions:
 - `VERSION := $(shell cat VERSION)` — Makefile reads the VERSION file; it does not hardcode the string.
 - No dependency beyond `bash`, `shellcheck` (for lint), coreutils. Do **not** call `just`, `npm`, `python`, etc.
 
+### 5.2 Amendment (2026-07-03) — Python permitted for the OPTIONAL TUI only
+
+Decision 3's dependency rule ("No dependency beyond bash, shellcheck, coreutils. Do **not** call
+`just`, `npm`, `python`, etc.") is amended **narrowly**:
+
+- `bin/xdg_tui.py`, launched via `bin/xdg-tui`, is an **optional companion** TUI. It may be
+  written in Python 3 (**stdlib only** — curses UI, zero pip packages).
+- The **core toolkit remains bash-3.2-pure**: `bin/*.sh`, `bin/lib/*.sh`, `hooks/`, and
+  `tests/smoke.sh` must never require python, and no shell script may invoke python.
+- The Makefile's python steps (`py_compile` in `lint`, `unittest discover` in `test`) are
+  **skip-guarded** behind `command -v python3` — a machine without python3 still passes
+  `make lint`/`make test` and retains every non-TUI feature (same graceful-skip idiom as the
+  no-`swiftc` `helper` target).
+- The TUI is a **strict wrapper** (see `docs/architecture/tui-offload-manager-diff.md`): it adds
+  UX, never policy; the provision script's guards remain the sole enforcement layer.
+
+Everything else in Decision 3 (Makefile over just; thin targets; no npm) is unchanged. A future
+proposal to require python for any *core* lane re-opens this decision; this amendment does not.
+
 ---
 
 ## 6. Decision 4 — Branching & Commit Convention
