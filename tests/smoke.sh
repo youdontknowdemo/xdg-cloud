@@ -2822,4 +2822,32 @@ assert_nonzero "${rc}" "bare --porcelain (default lane) is refused"
 assert_contains "${out}" "--porcelain applies only to --classify or --offload-status" \
   "bare --porcelain names the two valid modes"
 
+# ===========================================================================
+# --- Q1: TUI file-pairing drift tripwire (TEST phase, auditor focus). The
+#     Makefile's python steps deliberately SILENT-SKIP when bin/xdg_tui.py or
+#     tests/tui/test_*.py are absent (correct for python-less machines) — but
+#     that same skip would also mask an accidental DELETION of the TUI module
+#     or its suites while the launcher still ships. Pin the pairing here, in
+#     the bash gate that never skips: if bin/xdg-tui exists, so must
+#     bin/xdg_tui.py and at least one tests/tui/test_*.py. ---
+echo "smoke: Q1 — TUI launcher/module/tests pairing (Makefile silent-skip tripwire)"
+if [ -e "${repo}/bin/xdg-tui" ]; then
+  if [ -f "${repo}/bin/xdg_tui.py" ]; then
+    ok "bin/xdg-tui is paired with bin/xdg_tui.py"
+  else
+    fail "bin/xdg-tui exists but bin/xdg_tui.py is MISSING — make lint/test would silently skip the TUI gate"
+  fi
+  q1_found=0
+  for q1_f in "${repo}/tests/tui/"test_*.py; do
+    if [ -e "${q1_f}" ]; then q1_found=1; fi
+  done
+  if [ "${q1_found}" -eq 1 ]; then
+    ok "tests/tui has at least one test_*.py (unittest discovery stays non-empty)"
+  else
+    fail "bin/xdg-tui exists but tests/tui/test_*.py is MISSING — make test would silently skip the TUI suite"
+  fi
+else
+  ok "bin/xdg-tui not present — TUI pairing check not applicable"
+fi
+
 echo "smoke: PASS"
