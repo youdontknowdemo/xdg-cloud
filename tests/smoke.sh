@@ -2479,4 +2479,136 @@ out="$(/bin/bash "${PROV}" --reclaim "${symroot}" 2>&1)"
 assert_contains "${out}" "0 project artifact(s) would be reclaimed" "symlinked Cargo.toml does not anchor target/ (0 reclaimable)"
 if [ -e "${symroot}/proj/target/blob.o" ]; then ok "target/ with a symlinked manifest is left untouched"; else fail "target/ was reclaimed via a symlinked manifest (steering vector open)"; fi
 
+# ===========================================================================
+# Group F2: home-tree.sh rclone filter — EVERY exclude line is asserted, plus
+# the deny -> allow -> catch-all ORDERING. Group 6 only spot-checks a few deny
+# lines; the filter is the single source of truth preventing data leaks, so a
+# silently dropped deny line would leak secrets/SQLite to the cloud. Each remaining
+# exclude is pinned as an EXACT whole-line match (grep -qxF) so a regression that
+# drops exactly one line fails here even when a neighbouring line still contains
+# its substring (e.g. '- **/*.db' vs '- **/*.db-journal'). Ordering matters because
+# rclone is first-match-wins: the deny block must precede the '+' allow block, which
+# must precede the final catch-all '- *'. Same generation path as Group 6.
+# ===========================================================================
+echo "smoke: F2 — every rclone-filter exclude line present, in deny<allow<catch-all order"
+f2root="${sandbox}/f2-home"; mkdir -p "${f2root}"
+out="$(/bin/bash "${repo}/bin/home-tree.sh" --root "${f2root}" 2>&1)"
+f2filter="${TMPDIR}/home-tree.rclone-filter"
+if [ -f "${f2filter}" ]; then
+  ok "F2: filter file was written to TMPDIR"
+else
+  fail "F2: home-tree did not write its rclone filter"
+fi
+# Every currently-unasserted exclude line, pinned as an EXACT whole line (grep -x)
+# so dropping just one — even if a sibling line shares its prefix — fails the suite.
+for f2line in \
+  "- /State/**" \
+  "- /Config/**" \
+  "- .cache/**" \
+  "- .local/state/**" \
+  "- **/*.sqlite-wal" \
+  "- **/*.sqlite-shm" \
+  "- **/*.db" \
+  "- **/*.db-journal" \
+  "- **/.DS_Store" \
+  "- **/node_modules/**" \
+  "- **/__pycache__/**" \
+  "- **/*.lock"; do
+  set +e; grep -qxF -- "${f2line}" "${f2filter}"; f2rc=$?; set -e
+  pass_if "${f2rc}" "filter denies exact line '${f2line}'" \
+    "filter is MISSING the deny line '${f2line}' (data-leak regression)"
+done
+# ORDERING (first match wins): a representative deny line must precede the allow
+# block, which must precede the final catch-all deny. Compare 1-based grep -n line
+# numbers — no fragile parsing. The three anchors are guaranteed present by the
+# loop above and by Group 6 ('+ /Documents/**', '- *'), so grep always matches here.
+f2deny_ln="$(grep -nxF -- "- /State/**" "${f2filter}" | cut -d: -f1)"
+f2allow_ln="$(grep -nxF -- "+ /Documents/**" "${f2filter}" | cut -d: -f1)"
+f2catch_ln="$(grep -nxF -- "- *" "${f2filter}" | cut -d: -f1)"
+if [ -n "${f2deny_ln}" ] && [ -n "${f2allow_ln}" ] && [ -n "${f2catch_ln}" ] &&
+   [ "${f2deny_ln}" -lt "${f2allow_ln}" ] && [ "${f2allow_ln}" -lt "${f2catch_ln}" ]; then
+  ok "filter order is deny(${f2deny_ln}) < allow(${f2allow_ln}) < catch-all(${f2catch_ln}) — first-match-wins preserved"
+else
+  fail "filter ORDER broken: deny='${f2deny_ln}' allow='${f2allow_ln}' catch-all='${f2catch_ln}' (must be deny<allow<catch-all)"
+fi
+
+# ===========================================================================
+# Group F3: redirect_one() edge branches NOT covered by Groups 1-3 (which cover
+# populated-without-relocate, dangling-symlink-left-untouched, and the relocate
+# happy path). Adds: (1) an EMPTY real dir replaced by a symlink (the rmdir+ln -s
+# branch); (2) downloads create-only skip by default vs --redirect-downloads;
+# (3) a LIVE foreign symlink (existing WRONG target) left untouched — Group 2 only
+# covers a DANGLING link. Every apply run overrides HOME to a sandbox dir.
+# ===========================================================================
+
+# (1) empty real dir -> symlink. An EMPTY ~/Documents is neither "missing" nor
+# "populated": redirect_one rmdir's it and creates the cloud symlink. Distinct branch.
+echo "smoke: F3.1 — an EMPTY real user dir is replaced by a cloud symlink"
+f31h="${sandbox}/f31-home"; f31c="${sandbox}/f31-cloud"
+mkdir -p "${f31h}/Documents" "${f31c}"          # Documents exists but is EMPTY
+set +e
+out="$(HOME="${f31h}" /bin/bash "${PROV}" --cloud-root "${f31c}" --apply --allow-local-root 2>&1)"
+rc=$?
+set -e
+pass_if "${rc}" "empty-dir apply run exits 0" "empty-dir apply failed (exit ${rc}): ${out}"
+if [ -L "${f31h}/Documents" ] && [ "$(readlink "${f31h}/Documents")" = "${f31c}/documents" ]; then
+  ok "empty ~/Documents was rmdir'd and replaced by a symlink into the cloud root"
+else
+  fail "empty ~/Documents was not replaced by the expected cloud symlink"
+fi
+
+# (2) downloads is eligible (redirect=1) but create-only until --redirect-downloads.
+echo "smoke: F3.2 — downloads skipped by default, symlinked only with --redirect-downloads"
+f32c="${sandbox}/f32-cloud"; mkdir -p "${f32c}"
+# 2a: a bare dry-run emits the actionable skip line.
+f32h="${sandbox}/f32-home"; mkdir -p "${f32h}"
+out="$(HOME="${f32h}" /bin/bash "${PROV}" --cloud-root "${f32c}" 2>&1)"   # dry-run
+assert_contains "${out}" "skip redirect: downloads" "dry-run emits the actionable downloads-skip info line"
+# 2b: WITHOUT --redirect-downloads, apply creates NO Downloads symlink.
+f32ha="${sandbox}/f32-home-apply"; mkdir -p "${f32ha}"
+set +e
+out="$(HOME="${f32ha}" /bin/bash "${PROV}" --cloud-root "${f32c}" --apply --allow-local-root 2>&1)"
+rc=$?
+set -e
+pass_if "${rc}" "default apply (no --redirect-downloads) exits 0" "run failed (exit ${rc}): ${out}"
+if [ -e "${f32ha}/Downloads" ] || [ -L "${f32ha}/Downloads" ]; then
+  fail "Downloads symlink was created despite no --redirect-downloads (must stay create-only)"
+else
+  ok "no ~/Downloads symlink created by default"
+fi
+# 2c: WITH --redirect-downloads --apply, Downloads becomes a cloud symlink.
+f32hr="${sandbox}/f32-home-redir"; mkdir -p "${f32hr}"
+set +e
+out="$(HOME="${f32hr}" /bin/bash "${PROV}" --cloud-root "${f32c}" --apply --allow-local-root --redirect-downloads 2>&1)"
+rc=$?
+set -e
+pass_if "${rc}" "--redirect-downloads apply exits 0" "run failed (exit ${rc}): ${out}"
+if [ -L "${f32hr}/Downloads" ] && [ "$(readlink "${f32hr}/Downloads")" = "${f32c}/downloads" ]; then
+  ok "--redirect-downloads symlinks ~/Downloads into the cloud root"
+else
+  fail "--redirect-downloads did not symlink ~/Downloads to ${f32c}/downloads"
+fi
+
+# (3) a LIVE foreign symlink (points at an EXISTING but WRONG target) is left
+# untouched. Group 2 covers only a DANGLING link; this exercises the same
+# `[ -L ]` guard for a live-but-wrong target (readlink != cloud target), proving
+# the guard does not repoint or clobber a pre-existing user symlink.
+echo "smoke: F3.3 — a live symlink to a wrong existing target is left untouched"
+f33h="${sandbox}/f33-home"; f33c="${sandbox}/f33-cloud"; f33wrong="${sandbox}/f33-wrong-target"
+mkdir -p "${f33h}" "${f33c}" "${f33wrong}"
+printf 'wrong\n' > "${f33wrong}/marker.txt"
+ln -s "${f33wrong}" "${f33h}/Documents"          # live link to an EXISTING non-cloud dir
+set +e
+out="$(HOME="${f33h}" /bin/bash "${PROV}" --cloud-root "${f33c}" --apply --allow-local-root 2>&1)"
+rc=$?
+set -e
+pass_if "${rc}" "apply exits 0 with a live foreign symlink present" \
+  "apply aborted (exit ${rc}) on a live foreign symlink: ${out}"
+assert_contains "${out}" "is a symlink to" "live foreign symlink is reported and left in place"
+if [ -L "${f33h}/Documents" ] && [ "$(readlink "${f33h}/Documents")" = "${f33wrong}" ]; then
+  ok "live foreign ~/Documents symlink unchanged (still points at the wrong target)"
+else
+  fail "live foreign ~/Documents symlink was modified"
+fi
+
 echo "smoke: PASS"

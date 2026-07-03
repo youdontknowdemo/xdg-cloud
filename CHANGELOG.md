@@ -7,9 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Tests
+- `tests/smoke.sh`: assert **every** `home-tree.sh` rclone-filter exclude line as
+  an exact whole line (`grep -qxF`), plus deny→allow→catch-all ordering — a
+  dropped deny line is a data-leak regression the suite now catches (F2).
+- `tests/smoke.sh`: automate the `redirect_one()` edge-case matrix — empty real
+  dir replaced by a cloud symlink, `downloads` create-only-by-default vs.
+  `--redirect-downloads`, and a live foreign symlink (existing wrong target) left
+  untouched (F3).
+
 ### Known issues / tracked for future work
-- Filter correctness: rclone filter excludes not yet asserted in tests (F2).
-- `redirect_one()` edge-case matrix not yet automated (F3).
 - `resolve_cloud_root()` picks the first alphabetically if two Google Drive
   accounts are mounted; no disambiguation logic yet (F4).
 - `--version` flag not yet implemented (deferred per ADR §7) (F6).
