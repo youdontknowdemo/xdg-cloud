@@ -88,8 +88,8 @@ regenerable-artifact reclaim), all dry-run by default and `--apply`-gated.
 
 ### Changed
 - Refactored `cloud-xdg-provision.sh` and `home-tree.sh` onto a shared
-  `bin/lib/xdg-common.sh` library with a single unified dir registry, eliminating
-  duplicated logic while keeping each script's `run()` deliberately per-script.
+  `bin/lib/xdg-common.sh` library, deduplicating plumbing and platform-detection
+  logic while keeping each script's `run()` deliberately per-script.
 
 ### Fixed
 - `redirect_one()` (`cloud-xdg-provision.sh`): dangling-symlink detection now
