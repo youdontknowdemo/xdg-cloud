@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `cloud-xdg-provision.sh --version`: print the version — read from the repo-root
+  `VERSION` file resolved relative to the script (works from any CWD and via a
+  symlink to the script), degrading to `(version unknown)` if `VERSION` is absent.
+  An early-exit flag like `--help`; engages no mode or lock (F6, per ADR §7).
+
 ### Tests
 - `tests/smoke.sh`: assert **every** `home-tree.sh` rclone-filter exclude line as
   an exact whole line (`grep -qxF`), plus deny→allow→catch-all ordering — a
@@ -15,11 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dir replaced by a cloud symlink, `downloads` create-only-by-default vs.
   `--redirect-downloads`, and a live foreign symlink (existing wrong target) left
   untouched (F3).
+- `tests/smoke.sh`: `--version` prints the `VERSION`-file contents and exits 0,
+  including when invoked through a symlink from a different CWD (F6).
 
-### Known issues / tracked for future work
-- `resolve_cloud_root()` picks the first alphabetically if two Google Drive
-  accounts are mounted; no disambiguation logic yet (F4).
-- `--version` flag not yet implemented (deferred per ADR §7) (F6).
+### Fixed
+- CHANGELOG: retire the stale F4 known-issue. `resolve_cloud_root()` no longer
+  picks a Google Drive mount silently — it already refuses multiple mounts with a
+  disambiguation message (Issue #4, shipped in 0.2.0) and is covered by smoke
+  group #4. The known-issue entry described a bug that no longer exists.
 
 ## [0.2.1] - 2026-07-02
 

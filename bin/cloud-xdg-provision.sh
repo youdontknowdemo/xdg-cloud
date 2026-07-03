@@ -350,6 +350,7 @@ Usage: $SELF [options]
   --fast-verify          After a relocate copy, verify with size+mtime instead of
                          a full checksum read-back. Faster on huge libraries, but
                          will NOT catch a silent FUSE async-upload failure.
+  --version              Print the version (from the repo-root VERSION file) and exit.
   -h, --help             This help.
 
 Modes (default with no mode flag = the provision/symlink lane above; exactly one
@@ -400,6 +401,29 @@ Reclaim (free local disk by deleting REGENERABLE build artifacts; dry-run unless
 
 Nothing is moved without --apply --relocate together.
 EOF
+}
+
+# Print the script version and exit-worthy string. Single source of truth is the
+# repo-root VERSION file (a bare semver line), resolved relative to __self_dir
+# (the bin/ dir), so it works from any CWD and via a symlink to the script.
+# Degrades gracefully: a missing/unreadable/empty VERSION prints "(version
+# unknown)" and never dies — this keeps --version a safe early-exit flag.
+# bash 3.2-safe: `read` guarded with `|| true` (returns non-zero on the final
+# no-newline line) so set -e can't trip; the first-whitespace strip trims a
+# trailing newline/CR (CRLF files) and pins output to a single line.
+print_version() {
+  local version_file version_str
+  version_file="$__self_dir/../VERSION"
+  version_str=""
+  if [ -r "$version_file" ]; then
+    IFS= read -r version_str < "$version_file" || true
+  fi
+  version_str="${version_str%%[[:space:]]*}"   # first token only (strips CR/newline)
+  if [ -n "$version_str" ]; then
+    printf '%s %s\n' "$SELF" "$version_str"
+  else
+    printf '%s (version unknown)\n' "$SELF"
+  fi
 }
 
 # Select a subcommand mode; refuse two lanes in one invocation.
@@ -455,6 +479,7 @@ $1"
                           # optional root path: consume the next arg only if it's not a flag
                           if [ $# -gt 1 ] && [ "${2#-}" = "$2" ]; then shift; MODE_ARG="$1"; fi ;;
     --global)             RECLAIM_GLOBAL=1 ;;
+    --version)            print_version; exit 0 ;;
     -h|--help)            usage; exit 0 ;;
     *)                    die "unknown option: $1 (try --help)" ;;
   esac

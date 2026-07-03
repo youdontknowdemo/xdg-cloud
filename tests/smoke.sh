@@ -2611,4 +2611,35 @@ else
   fail "live foreign ~/Documents symlink was modified"
 fi
 
+# ===========================================================================
+# F6 — --version flag (known-issue F6, ADR §7). --version prints the version
+# (from the repo-root VERSION file, resolved relative to __self_dir) and exits 0.
+# It is an early-exit flag, NOT a mode lane, so it engages no lock/mutation.
+# The expected value is read from the VERSION file (not hardcoded) so the test
+# stays correct across version bumps. The symlink sub-case proves __self_dir
+# resolution holds when the script is invoked via a symlink from a foreign CWD.
+# ===========================================================================
+echo "smoke: F6 — --version prints the VERSION-file version and exits 0"
+ver="$(cat "${repo}/VERSION")"
+set +e
+out="$(/bin/bash "${PROV}" --version 2>&1)"
+rc=$?
+set -e
+pass_if "${rc}" "--version exits 0" "--version did not exit 0 (exit ${rc}): ${out}"
+assert_contains "${out}" "${ver}" "--version output contains the VERSION-file version"
+
+# Robustness: invoke through a symlink to the script from a different CWD. The
+# symlink lives in the sandbox and points at the absolute ${PROV}; __self_dir
+# must still resolve the sibling lib and the ../VERSION file, so the output must
+# still contain the same version.
+f6link="${sandbox}/f6-provision-link.sh"
+ln -s "${PROV}" "${f6link}"
+set +e
+out="$( cd "${sandbox}" && /bin/bash "${f6link}" --version 2>&1 )"
+rc=$?
+set -e
+pass_if "${rc}" "--version via a symlink exits 0" \
+  "--version via a symlink did not exit 0 (exit ${rc}): ${out}"
+assert_contains "${out}" "${ver}" "--version via a symlink still contains the VERSION-file version"
+
 echo "smoke: PASS"
