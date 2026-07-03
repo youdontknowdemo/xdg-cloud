@@ -266,6 +266,12 @@ already pass clean, so this config formalizes the bar rather than papering over 
 
 ### 8.1 Final `.shellcheckrc`
 
+As-built (this block is kept in sync with the repo's `.shellcheckrc`). CODE ran
+`make lint` per the guidance below; `enable=all` surfaced ~230 purely stylistic/info
+suggestions on the two verbatim `bin/` scripts, so the tentative
+`# disable=SC2310,SC2311` draft was replaced by the narrowly-scoped, inline-justified
+disable list below (each code justified; none hides a bug):
+
 ```
 # xdg-cloud shellcheck configuration
 # Both scripts target stock macOS bash 3.2.57 and must stay 3.2-safe.
@@ -277,12 +283,25 @@ shell=bash
 enable=all
 
 # --- Justified, repo-wide disables ---
-# SC2310/SC2311: 'enable=all' turns on function-in-condition invalidates-set-e warnings.
-#   These scripts intentionally use functions in conditionals (e.g. `if mount="$(find_macos_drive_mount)"`)
-#   where the non-zero path is handled. Enable per-case review in CODE, but do not let the
-#   blanket warning block an already-correct, safe-by-default codebase.
-# Leave SC2310/SC2311 commented unless `make lint` actually surfaces them — add only if needed:
-# disable=SC2310,SC2311
+# 'enable=all' opts into ShellCheck's optional STYLE/INFO layer on top of the
+# default checks. The two bin/ scripts pass the DEFAULT checks with zero findings
+# (verified in PREPARE), but enable=all surfaces ~230 purely stylistic/info
+# suggestions on them. They are scope-locked (verbatim, no logic edits), so we
+# disable exactly those opt-in codes — and ONLY those. None is a real bug; this is
+# the escape hatch ADR §8 documents ("add only if needed... never to hide a bug").
+#
+#   SC2250  style: prefer ${braces} around every variable reference.
+#   SC2292  style: prefer [[ ]] over [ ] in bash (the scripts target POSIX-ish [ ]).
+#   SC2312  info:  invoke command separately to avoid masking a return value.
+#   SC2310  info:  function used in a condition disables `set -e` for it — these
+#                  call sites (e.g. `if mount="$(find_macos_drive_mount)"`) handle
+#                  the non-zero path deliberately.
+#   SC2249  info:  `case` without a default branch.
+#
+# Our own scaffolding files (hooks/pre-commit, tests/smoke.sh) are written to pass
+# enable=all WITHOUT relying on these disables — the disables exist only for the
+# verbatim upstream scripts.
+disable=SC2250,SC2292,SC2312,SC2310,SC2249
 ```
 
 **Guidance to coder:** Start with `shell=bash` + `enable=all` and **no** disables. Run `make lint`.
