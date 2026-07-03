@@ -13,7 +13,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `resolve_cloud_root()` picks the first alphabetically if two Google Drive
   accounts are mounted; no disambiguation logic yet (F4).
 - `--version` flag not yet implemented (deferred per ADR §7) (F6).
-- ADR §8.1 sample `.shellcheckrc` differs from the as-built file (F7).
 
 ## [0.2.1] - 2026-07-02
 
