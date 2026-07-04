@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-03
+
+Adds `xdg-tui`, an optional interactive dashboard over the provision script,
+and the machine-readable `--porcelain` contract that backs it. The core
+toolkit remains bash-3.2-pure and fully usable without python.
+
 ### Added
 - `xdg-tui`: an optional curses dashboard (`bin/xdg-tui` launcher +
   `bin/xdg_tui.py`, python 3 stdlib only) that browses every registry entry with
