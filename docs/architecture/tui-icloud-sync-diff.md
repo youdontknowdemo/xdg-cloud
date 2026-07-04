@@ -73,7 +73,16 @@ ICLOUD_TARGET=""                                                    # resolved t
 # disk, where a %-of-download margin under-protects small downloads. Env-overridable as the smoke
 # seam (huge value => deterministic refusal; 0 => deterministic pass) and as a user knob.
 : "${ICLOUD_DL_MARGIN_BYTES:=1073741824}"
+# As-built (added post-review): this value flows into an arithmetic context ($((bytes_need + …))),
+# where bash re-evaluates a variable's VALUE as an expression — an array-subscript-with-command-
+# substitution executes at eval time. Validate digits-only at load, fail-closed, matching the df guard.
+case "${ICLOUD_DL_MARGIN_BYTES}" in ''|*[!0-9]*) die "ICLOUD_DL_MARGIN_BYTES must be a non-negative integer" ;; esac
 ```
+
+> **As-built additions beyond the original spec bodies** (all committed, all test-pinned): (1) the
+> `ICLOUD_DL_MARGIN_BYTES` load-time numeric guard above; (2) `< /dev/null` on the chunk-flush helper
+> exec (§2.3) and on the download-loop `brctl` exec (§2.5) — both sever an inherited `while … < list`
+> stdin. Reconciled here per the repo's as-built convention (cf. ADR §8.1 / F7).
 
 ### 2.2 `icloud_resolve_under_root` — resolve-then-confine (SAFETY-CRITICAL)
 
@@ -199,7 +208,9 @@ icloud_sync_flush_chunk() {
   local hout line state size i tab
   tab="$(printf '\t')"
   hout="$(mktemp "${TMPDIR:-/tmp}/xdg-icloud.XXXXXX")" || die "cannot create temp file"
-  "$ICLOUD_HELPER" ${SYNC_CHUNK[@]+"${SYNC_CHUNK[@]}"} > "$hout" 2>/dev/null || true
+  # </dev/null (as-built, added post-review): mid-walk flushes run inside a `while … < list`
+  # loop — the helper must never see the file list on stdin (silent under-scan otherwise).
+  "$ICLOUD_HELPER" ${SYNC_CHUNK[@]+"${SYNC_CHUNK[@]}"} < /dev/null > "$hout" 2>/dev/null || true
   i=0
   while IFS= read -r line; do
     [ -z "$line" ] && continue
