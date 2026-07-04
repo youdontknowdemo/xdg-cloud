@@ -1985,7 +1985,8 @@ icloud_sync_flush_chunk() {
   local hout line state size i tab
   tab="$(printf '\t')"
   hout="$(mktemp "${TMPDIR:-/tmp}/xdg-icloud.XXXXXX")" || die "cannot create temp file"
-  "$ICLOUD_HELPER" ${SYNC_CHUNK[@]+"${SYNC_CHUNK[@]}"} > "$hout" 2>/dev/null || true
+  # </dev/null: mid-walk flushes run inside a `while … < list` loop — the helper must never see the file list on stdin.
+  "$ICLOUD_HELPER" ${SYNC_CHUNK[@]+"${SYNC_CHUNK[@]}"} < /dev/null > "$hout" 2>/dev/null || true
   i=0
   while IFS= read -r line; do
     [ -z "$line" ] && continue
