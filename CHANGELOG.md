@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `--icloud-sync-status <path>`: read-only recursive iCloud sync summary —
+  dataless / not-uploaded / in-sync counts, bytes-to-download, bytes-evictable,
+  free-space line, and a `brctl` health check that surfaces stuck sync. Batched
+  helper invocation (one spawn per ARG_MAX-safe chunk, fail-closed accounting).
+  Wired into `xdg-tui` as a read-only pane on code and xdg rows.
+
+### Changed
+- `--icloud-download` materializes **dataless files only** and its plan header
+  reports count + total bytes; it refuses (fail-closed, dry-run and apply alike)
+  when the download would leave less than `ICLOUD_DL_MARGIN_BYTES` free
+  (default 1 GiB) — ENOSPC mid-materialization can jam fileproviderd.
+
+### Fixed
+- iCloud path confinement now **resolves symlinks on both sides** before the
+  CloudDocs prefix check (`icloud_resolve_under_root`): on a provisioned home
+  (symlinked entries) every TUI iCloud action previously failed with "path is
+  not under iCloud Drive"; conversely a path that lexically looked inside but
+  resolved outside was accepted. Both directions are now smoke-pinned by a
+  symlink-escape matrix, and `ICLOUD_ROOT` is env-overridable for sandboxed
+  tests without weakening production confinement (the root itself is resolved
+  before every compare).
+
+### Tests
+- Smoke Group I3 (escape matrix, sync-status semantics incl. helper-failure
+  degradation, free-space gate both directions, blank-line deficit accounting)
+  and TUI-level integration through the real script in a sandbox. Resolver,
+  gate, and accounting were mutation-verified (one surviving mutant found and
+  a killing assertion added). Gate: ~552 smoke assertions + 87 python tests.
+
 ## [0.3.0] - 2026-07-03
 
 Adds `xdg-tui`, an optional interactive dashboard over the provision script,

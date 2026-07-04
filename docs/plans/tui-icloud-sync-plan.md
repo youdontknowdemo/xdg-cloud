@@ -1,7 +1,7 @@
 # Implementation Plan: TUI iCloud Sync (`icloud-sync-status` + usable bulk download)
 
 > Generated from targeted PREPARE research on 2026-07-04
-> Status: IN_PROGRESS
+> Status: IMPLEMENTED
 > Research: `docs/preparation/research-tui-icloud-sync.md` (uncommitted alongside this plan)
 
 ## Summary
