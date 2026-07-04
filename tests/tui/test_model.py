@@ -114,13 +114,19 @@ class TestNotes(unittest.TestCase):
         self.assertEqual(documents.note, "")
 
     def test_ops_for_entry_classes(self):
+        # Exact §3 orders: sync-status is the "look before you touch" op —
+        # fourth for code (after the offload trio), first for xdg.
         entries = _model()
-        code_ops = xdg_tui.ops_for_entry(_entry(entries, "repos"))
-        self.assertIn("offload", code_ops)
-        self.assertIn("icloud-evict", code_ops)
-        xdg_ops = xdg_tui.ops_for_entry(_entry(entries, "documents"))
-        self.assertNotIn("offload", xdg_ops)
-        self.assertIn("icloud-status", xdg_ops)
+        self.assertEqual(
+            xdg_tui.ops_for_entry(_entry(entries, "repos")),
+            ["offload", "hydrate", "reclaim", "icloud-sync-status",
+             "icloud-status", "icloud-download", "icloud-evict"],
+        )
+        self.assertEqual(
+            xdg_tui.ops_for_entry(_entry(entries, "documents")),
+            ["icloud-sync-status", "icloud-status",
+             "icloud-download", "icloud-evict"],
+        )
         self.assertEqual(xdg_tui.ops_for_entry(_entry(entries, "pyenv")), [])
 
 

@@ -89,6 +89,7 @@ ACTIONS = {
     "hydrate":         {"flag": "--hydrate",         "target": "key",  "read_only": False},
     "reclaim":         {"flag": "--reclaim",         "target": "path", "read_only": False},
     "icloud-status":   {"flag": "--icloud-status",   "target": "path", "read_only": True},
+    "icloud-sync-status": {"flag": "--icloud-sync-status", "target": "path", "read_only": True},
     "icloud-download": {"flag": "--icloud-download", "target": "path", "read_only": False},
     "icloud-evict":    {"flag": "--icloud-evict",    "target": "path", "read_only": False},
 }
@@ -245,10 +246,10 @@ def ops_for_entry(entry):
     the script (wrap-don't-bypass): every lane valid for the CLASS is shown;
     a lane the script refuses renders as a verbatim refusal."""
     if entry.klass == "code":
-        return ["offload", "hydrate", "reclaim",
+        return ["offload", "hydrate", "reclaim", "icloud-sync-status",
                 "icloud-status", "icloud-download", "icloud-evict"]
     if entry.klass == "xdg":
-        return ["icloud-status", "icloud-download", "icloud-evict"]
+        return ["icloud-sync-status", "icloud-status", "icloud-download", "icloud-evict"]
     return []  # 'local' class: machine-local, informational only
 
 
