@@ -2343,10 +2343,18 @@ SH
   # (k) DATALESS-SKIP: a stat-shim reports one file dataless (icloud_is_dataless reads `stat -f %Sf`),
   #     so a dir with [dataless + uploaded] evicts ONLY the uploaded, non-dataless file.
   i2sshim="${sandbox}/i2-stat-shim"; mkdir -p "${i2sshim}"
+  # The shim answers BOTH stat formats the iCloud lanes use: bare '%Sf' (icloud_is_dataless)
+  # and the combined '%z %Sf' (sync-status/download size-first parse) — a fixed size of 5.
   cat > "${i2sshim}/stat" <<'SH'
 #!/bin/bash
 for last; do :; done
-case "$last" in *DATALESS*) echo dataless; exit 0 ;; esac
+case "$last" in
+  *DATALESS*)
+    case "$*" in
+      *"%z %Sf"*) echo "5 dataless"; exit 0 ;;
+      *)          echo "dataless";   exit 0 ;;
+    esac ;;
+esac
 exec /usr/bin/stat "$@"
 SH
   chmod +x "${i2sshim}/stat"; cp "${i2shim}/brctl" "${i2sshim}/brctl"
@@ -2361,12 +2369,20 @@ SH
   i2ne="$(grep -c evict "${i2log}" 2>/dev/null || printf 0)"
   if [ "${i2ne}" -eq 1 ] && grep -q 'f_upload' "${i2log}" && ! grep -q 'f_DATALESS' "${i2log}"; then ok "only the uploaded, non-dataless file was evicted (dataless one skipped)"; else fail "dataless-skip wrong — evicted ${i2ne} file(s): $(cat "${i2log}" 2>/dev/null)"; fi
 
-  # (l) --icloud-download → brctl download per file, add-only (NO evict); works with the default (no) helper.
-  rm -f "${i2cd:?}"/*; printf 'x\n' > "${i2cd}/g1"; printf 'y\n' > "${i2cd}/g2"; : > "${i2log}"
-  set +e; out="$(i2run --icloud-download "${i2cd}" --apply 2>&1)"; rc=$?; set -e
+  # (l) --icloud-download → brctl download per DATALESS file, add-only (NO evict); works with the
+  #     default (no) helper. The lane is dataless-only now, so the fixtures are made dataless via
+  #     the stat shim (*_DATALESS names). ICLOUD_DL_MARGIN_BYTES=0 keeps the new free-space gate
+  #     machine-independent (real df must not flake this subtest on a nearly-full host).
+  rm -f "${i2cd:?}"/*; printf 'x\n' > "${i2cd}/g1_DATALESS"; printf 'y\n' > "${i2cd}/g2_DATALESS"; : > "${i2log}"
+  set +e
+  out="$(PATH="${i2sshim}:${PATH}" BRCTL_LOG="${i2log}" HOME="${i2h}" XDG_CONFIG_HOME="${i2h}/.config" \
+    XDG_CACHE_HOME="${i2h}/.cache" ICLOUD_DL_MARGIN_BYTES=0 \
+    /bin/bash "${PROV}" --icloud-download "${i2cd}" --apply 2>&1)"
+  rc=$?
+  set -e
   pass_if "${rc}" "icloud-download --apply exits 0 (no helper needed)" "download failed (exit ${rc}): ${out}"
   i2dn="$(grep -c download "${i2log}" 2>/dev/null || printf 0)"
-  if [ "${i2dn}" -eq 2 ]; then ok "download called brctl download once per file (add-only, 2)"; else fail "expected 2 brctl download calls, got ${i2dn}"; fi
+  if [ "${i2dn}" -eq 2 ]; then ok "download called brctl download once per dataless file (add-only, 2)"; else fail "expected 2 brctl download calls, got ${i2dn}"; fi
   if grep -q evict "${i2log}" 2>/dev/null; then fail "download called brctl EVICT (must be add-only)"; else ok "download called NO evict (add-only)"; fi
 
   # (m) mode mutual-exclusion: two modes in one invocation → refused.
@@ -2380,6 +2396,202 @@ SH
   assert_contains "${out}" "swiftc not found" "make helper explains swiftc is needed and skips gracefully"
 else
   echo "smoke: I2 iCloud evict extra gates — SKIPPED (macOS-only; uname=$(uname -s))"
+fi
+
+# --- I3 (TUI iCloud sync): resolve-then-confine resolver matrix, --icloud-sync-status summary,
+#     and the --icloud-download free-space gate. Same mock model as I1/I2 (recording brctl
+#     PATH-shim; ICLOUD_HELPER env-shim; stat shim makes *_DATALESS fixtures dataless). The brctl
+#     shim additionally answers `brctl status` from $BRCTL_STATUS_FILE (canned per case). The
+#     margin env override (ICLOUD_DL_MARGIN_BYTES) is the primary df seam — real df, deterministic
+#     both directions; a PATH-shimmed failing df covers ONLY the df-failure fail-closed case.
+#     macOS-gated; NO real brctl/iCloud. ---
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo "smoke: I3 — iCloud resolver escape matrix, sync-status summary, download free-space gate"
+  i3h="${sandbox}/i3-home"
+  i3cd="${i3h}/Library/Mobile Documents/com~apple~CloudDocs"
+  mkdir -p "${i3cd}/td" "${i3cd}/documents" "${sandbox}/i3-outside/sub"
+  printf '1\n' > "${i3cd}/td/f1"; printf '2\n' > "${i3cd}/td/f2"
+  # ESCAPE fixtures: lexically inside the root, resolving OUTSIDE it (dir symlinks; the landing
+  # zone must exist so `cd` succeeds and the resolver sees the real out-of-root path).
+  ln -s "${sandbox}/i3-outside" "${i3cd}/escape"
+  ln -s "${sandbox}/i3-outside" "${i3cd}/linkdir"
+  # Provisioned-machine shape: $HOME/Documents is a symlink INTO CloudDocs.
+  ln -s "${i3cd}/documents" "${i3h}/Documents"
+  # Symlinked-ROOT fixture for the env-override cases (g)/(h).
+  ln -s "${i3cd}" "${sandbox}/i3-rootlink"
+  i3log="${sandbox}/i3-brctl.log"
+  i3status="${sandbox}/i3-brctl-status"
+  printf 'x <com.apple.CloudDocs[1] observer:smoke state:caught-up>\n' > "${i3status}"
+  i3shim="${sandbox}/i3-shim"; mkdir -p "${i3shim}"
+  cat > "${i3shim}/brctl" <<'SH'
+#!/bin/bash
+if [ "$1" = "status" ]; then cat "$BRCTL_STATUS_FILE" 2>/dev/null; exit 0; fi
+printf '%s\n' "$*" >> "$BRCTL_LOG"
+exit 0
+SH
+  chmod +x "${i3shim}/brctl"
+  cat > "${i3shim}/stat" <<'SH'
+#!/bin/bash
+for last; do :; done
+case "$last" in
+  *DATALESS*)
+    case "$*" in
+      *"%z %Sf"*) echo "5 dataless"; exit 0 ;;
+      *)          echo "dataless";   exit 0 ;;
+    esac ;;
+esac
+exec /usr/bin/stat "$@"
+SH
+  chmod +x "${i3shim}/stat"
+  # Upload-state helper stub: basename → state, one "<state>\t<path>" line per argv arg, exit 1
+  # whenever any file is not plain-uploaded (like the real helper). sync-status must IGNORE that
+  # rc (chunking breaks whole-set exit semantics) — asserted below.
+  i3help="${sandbox}/i3-helper"
+  cat > "${i3help}" <<'SH'
+#!/bin/bash
+rc=0
+for p; do
+  b="${p##*/}"
+  case "$b" in
+    *_UP*)              printf 'uploaded\t%s\n' "$p" ;;
+    *_WAIT*)            printf 'not-uploaded\t%s\n' "$p"; rc=1 ;;
+    .DS_Store|*_NOTIN*) printf 'not-in-icloud\t%s\n' "$p"; rc=1 ;;
+    *)                  printf 'error\t%s\n' "$p"; rc=1 ;;
+  esac
+done
+exit "$rc"
+SH
+  chmod +x "${i3help}"
+  i3run() { PATH="${i3shim}:${PATH}" BRCTL_LOG="${i3log}" BRCTL_STATUS_FILE="${i3status}" HOME="${i3h}" \
+    XDG_CONFIG_HOME="${i3h}/.config" XDG_CACHE_HOME="${i3h}/.cache" /bin/bash "${PROV}" "$@"; }
+  : > "${i3log}"
+
+  # (a) provisioned-machine shape: $HOME/Documents (symlink INTO the root) is ACCEPTED and the
+  #     output names the RESOLVED CloudDocs path — the TUI-killing bug this PR fixes.
+  i3docs="$(cd "${i3cd}/documents" && pwd -P)"
+  set +e; out="$(ICLOUD_HELPER="${i3help}" i3run --icloud-sync-status "${i3h}/Documents" 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "sync-status accepts \$HOME/<name> symlinked INTO CloudDocs (exit 0)" "symlink-into-root target refused (exit ${rc}): ${out}"
+  assert_contains "${out}" "iCloud sync status under: ${i3docs}" "the report names the RESOLVED (physical) CloudDocs path"
+
+  # (b) ESCAPE: lexically-inside path resolving OUTSIDE the root is refused by BOTH lanes,
+  #     and nothing reaches brctl.
+  : > "${i3log}"
+  set +e; out="$(ICLOUD_HELPER="${i3help}" i3run --icloud-sync-status "${i3cd}/escape" 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "sync-status refuses a symlink escaping the root (resolve-then-confine)"
+  assert_contains "${out}" "not under iCloud Drive" "the sync-status escape refusal names the confinement"
+  set +e; out="$(i3run --icloud-download "${i3cd}/escape" --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "download refuses a symlink escaping the root (resolve-then-confine)"
+  assert_contains "${out}" "not under iCloud Drive" "the download escape refusal names the confinement"
+  if grep -q . "${i3log}" 2>/dev/null; then fail "an escape target reached brctl: $(cat "${i3log}")"; else ok "escape targets never reached brctl (log empty)"; fi
+
+  # (c) mid-path escape: <root>/linkdir/sub where linkdir resolves outside.
+  set +e; out="$(ICLOUD_HELPER="${i3help}" i3run --icloud-sync-status "${i3cd}/linkdir/sub" 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "sync-status refuses a mid-path symlink escape"
+  assert_contains "${out}" "not under iCloud Drive" "the mid-path escape refusal names the confinement"
+
+  # (d) the root itself is accepted.
+  set +e; out="$(ICLOUD_HELPER="${i3help}" i3run --icloud-sync-status "${i3cd}" 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "sync-status accepts the root itself (exit 0)" "root target refused (exit ${rc}): ${out}"
+
+  # (e) a plain (no-symlink) subdir is accepted.
+  set +e; out="$(ICLOUD_HELPER="${i3help}" i3run --icloud-sync-status "${i3cd}/td" 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "sync-status accepts a plain subdir (exit 0)" "plain subdir refused (exit ${rc}): ${out}"
+
+  # (f) nonexistent path: existence is checked BEFORE confinement (resolution needs it).
+  set +e; out="$(ICLOUD_HELPER="${i3help}" i3run --icloud-sync-status "${i3cd}/no-such-thing" 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "sync-status refuses a nonexistent path"
+  assert_contains "${out}" "no such path" "the nonexistent-path refusal says so"
+
+  # (g)+(h) env-overridden SYMLINKED root: the root is resolved before the compare, so the
+  #     override relocates confinement without weakening it.
+  set +e; out="$(ICLOUD_ROOT="${sandbox}/i3-rootlink" ICLOUD_HELPER="${i3help}" i3run --icloud-sync-status "${i3cd}/td" 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "symlinked ICLOUD_ROOT override: real-root target accepted (root resolved before compare)" "override root refused a legit target (exit ${rc}): ${out}"
+  set +e; out="$(ICLOUD_ROOT="${sandbox}/i3-rootlink" ICLOUD_HELPER="${i3help}" i3run --icloud-sync-status "${i3cd}/escape" 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "symlinked ICLOUD_ROOT override still refuses an escape (override cannot weaken confinement)"
+
+  # --- sync-status summary behavior (fixture: 2 dataless + 2 UP + 1 WAIT + 1 .DS_Store + 1 error) ---
+  i3ss="${i3cd}/ss"; mkdir -p "${i3ss}"
+  printf 'd1\n' > "${i3ss}/a_DATALESS"; printf 'd2\n' > "${i3ss}/b_DATALESS"   # stat shim: 5 bytes each
+  printf 'aaa\n' > "${i3ss}/c_UP"; printf 'bbb\n' > "${i3ss}/d_UP"             # 4 bytes each (real stat)
+  printf 'w\n' > "${i3ss}/e_WAIT"
+  printf 'n\n' > "${i3ss}/.DS_Store"
+  printf 'x\n' > "${i3ss}/f_ERRNAME"
+  i3snap_before="$(cd "${i3ss}" && find . | sort)"
+  : > "${i3log}"
+  set +e; out="$(ICLOUD_HELPER="${i3help}" i3run --icloud-sync-status "${i3ss}" 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "sync-status exits 0 although the chunked helper exits 1 (rc ignored; stdout parsed)" "sync-status failed on a mixed set (exit ${rc}): ${out}"
+  assert_contains "${out}" "scanned: 7 file(s)" "all 7 fixture files are scanned"
+  assert_contains "${out}" "dataless (to download): 2 file(s), 10 B" "dataless count + byte total (2 x 5 B via stat shim)"
+  assert_contains "${out}" "materialized + uploaded (evictable*): 2 file(s), 8 B" "uploaded count + byte total (2 x 4 B real stat)"
+  assert_contains "${out}" "materialized, NOT uploaded (waiting on iCloud): 1 file(s)" "waiting count from helper stdout"
+  assert_contains "${out}" "not in iCloud (excluded from sync, e.g. .DS_Store): 1 file(s)" "not-in-icloud count from helper stdout"
+  assert_contains "${out}" "unreadable / helper-error: 1 file(s)" "helper-error line counted fail-closed"
+  assert_contains "${out}" "free space on volume:" "the free-space line is reported (real df)"
+  assert_contains "${out}" "container health (brctl status): caught-up" "caught-up health line from the canned brctl status"
+  assert_not_contains "${out}" "NOT caught up" "no wedge warning when the container is caught-up"
+  # read-only proof: no lock, nothing mutated, no download/evict reached brctl.
+  if [ -e "${i3h}/.cache/cloud-xdg-provision.lock" ]; then fail "sync-status left a lock dir (read-only mode must not lock)"; else ok "sync-status created no lock dir (read-only)"; fi
+  if grep -Eq 'download|evict' "${i3log}" 2>/dev/null; then fail "sync-status invoked brctl download/evict (must be read-only): $(cat "${i3log}")"; else ok "sync-status invoked no brctl download/evict (read-only)"; fi
+  i3snap_after="$(cd "${i3ss}" && find . | sort)"
+  if [ "${i3snap_before}" = "${i3snap_after}" ]; then ok "fixture tree is structurally untouched after sync-status"; else fail "sync-status mutated the fixture tree"; fi
+
+  # helper ABSENT → degrade (rc 0) with the make-helper hint.
+  set +e; out="$(ICLOUD_HELPER="${sandbox}/i3-no-helper" i3run --icloud-sync-status "${i3ss}" 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "sync-status exits 0 without the helper (degraded report)" "helper-absent sync-status failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "upload split unknown" "the degraded report says the upload split is unknown"
+  assert_contains "${out}" "make helper" "the degraded report points at 'make helper'"
+
+  # NOT-caught-up canned status → the wedge warning appears.
+  printf 'x <com.apple.CloudDocs[1] observer:smoke state:syncing>\n' > "${i3status}"
+  set +e; out="$(ICLOUD_HELPER="${i3help}" i3run --icloud-sync-status "${i3ss}" 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "sync-status exits 0 when the container is not caught up (advisory only)" "not-caught-up sync-status failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "NOT caught up" "the wedge warning appears when brctl status lacks caught-up"
+  printf 'x <com.apple.CloudDocs[1] observer:smoke state:caught-up>\n' > "${i3status}"
+
+  # --- download free-space gate (margin env override = primary seam; real df) ---
+  i3dl="${i3cd}/dl"; mkdir -p "${i3dl}"
+  printf 'dd\n' > "${i3dl}/h_DATALESS"   # dataless via stat shim (5 B)
+  printf 'mm\n' > "${i3dl}/h_mat"        # materialized — must NOT be downloaded
+  # huge margin (2^62) → deterministic refusal, in dry-run AND apply; zero downloads.
+  : > "${i3log}"
+  set +e; out="$(ICLOUD_DL_MARGIN_BYTES=4611686018427387904 i3run --icloud-download "${i3dl}" 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "download dry-run is refused when the margin cannot be kept (gate runs in dry-run too)"
+  assert_contains "${out}" "refusing to download" "the dry-run refusal says why"
+  set +e; out="$(ICLOUD_DL_MARGIN_BYTES=4611686018427387904 i3run --icloud-download "${i3dl}" --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "download --apply is refused when the margin cannot be kept"
+  assert_contains "${out}" "refusing to download" "the apply refusal says why"
+  if grep -q download "${i3log}" 2>/dev/null; then fail "a refused download still reached brctl: $(cat "${i3log}")"; else ok "refused downloads never reached brctl"; fi
+  # margin 0 → passes; dataless-only: exactly 1 download, targeting the dataless file.
+  : > "${i3log}"
+  set +e; out="$(ICLOUD_DL_MARGIN_BYTES=0 i3run --icloud-download "${i3dl}" --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "download --apply passes with margin 0 (deterministic pass seam)" "margin-0 download failed (exit ${rc}): ${out}"
+  i3dn="$(grep -c download "${i3log}" 2>/dev/null || printf 0)"
+  if [ "${i3dn}" -eq 1 ] && grep -q 'h_DATALESS' "${i3log}" && ! grep -q 'h_mat' "${i3log}"; then ok "dataless-only: exactly 1 download, targeting the dataless file"; else fail "dataless-only filter wrong — recorded: $(cat "${i3log}" 2>/dev/null)"; fi
+  # dry-run: plan header (count + bytes) present, zero downloads executed.
+  : > "${i3log}"
+  set +e; out="$(ICLOUD_DL_MARGIN_BYTES=0 i3run --icloud-download "${i3dl}" 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "download dry-run passes with margin 0" "margin-0 dry-run failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "download plan: 1 dataless file(s), 5 B" "the dry-run plan header shows count + bytes"
+  if grep -q download "${i3log}" 2>/dev/null; then fail "dry-run download executed brctl download"; else ok "dry-run download executed nothing"; fi
+  # nothing dataless → rc 0, nothing planned.
+  set +e; out="$(ICLOUD_DL_MARGIN_BYTES=0 i3run --icloud-download "${i3cd}/documents" --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "download of a no-dataless tree exits 0" "no-dataless download failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "nothing to download" "the no-dataless run says nothing to download"
+  # df FAILURE → fail-closed die (PATH-shimmed df used ONLY here).
+  i3dfshim="${sandbox}/i3-df-shim"; mkdir -p "${i3dfshim}"
+  printf '#!/bin/bash\nexit 1\n' > "${i3dfshim}/df"; chmod +x "${i3dfshim}/df"
+  : > "${i3log}"
+  set +e
+  out="$(PATH="${i3dfshim}:${i3shim}:${PATH}" BRCTL_LOG="${i3log}" BRCTL_STATUS_FILE="${i3status}" HOME="${i3h}" \
+    XDG_CONFIG_HOME="${i3h}/.config" XDG_CACHE_HOME="${i3h}/.cache" ICLOUD_DL_MARGIN_BYTES=0 \
+    /bin/bash "${PROV}" --icloud-download "${i3dl}" --apply 2>&1)"
+  rc=$?
+  set -e
+  assert_nonzero "${rc}" "download is refused when df fails (fail-closed, never blind)"
+  assert_contains "${out}" "cannot determine free space" "the df-failure refusal says why"
+  if grep -q download "${i3log}" 2>/dev/null; then fail "df-failure path still reached brctl download"; else ok "df-failure path downloaded nothing"; fi
+else
+  echo "smoke: I3 iCloud resolver/sync-status/download gate — SKIPPED (macOS-only; uname=$(uname -s))"
 fi
 
 # ===========================================================================
