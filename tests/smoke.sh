@@ -2548,6 +2548,33 @@ SH
   assert_contains "${out}" "NOT caught up" "the wedge warning appears when brctl status lacks caught-up"
   printf 'x <com.apple.CloudDocs[1] observer:smoke state:caught-up>\n' > "${i3status}"
 
+  # helper-contract break (blank line mid-output): the flush loop SKIPS blank
+  # lines, so the helper effectively answered fewer lines than it was asked —
+  # the end-of-flush deficit add must count the gap as an error (fail-closed
+  # accounting; TEST-phase mutation check: dropping the deficit add survived
+  # every prior assert). All fixture files are 4 B so the uploaded byte total
+  # stays stable even though a blank line shifts the order-join of sizes.
+  i3bl="${i3cd}/bl"; mkdir -p "${i3bl}"
+  printf 'aaa\n' > "${i3bl}/p_UP"; printf 'bbb\n' > "${i3bl}/q_BLANK"; printf 'ccc\n' > "${i3bl}/r_UP"
+  i3blhelp="${sandbox}/i3-helper-blank"
+  cat > "${i3blhelp}" <<'SH'
+#!/bin/bash
+for p; do
+  b="${p##*/}"
+  case "$b" in
+    *_UP*)    printf 'uploaded\t%s\n' "$p" ;;
+    *_BLANK*) printf '\n' ;;
+    *)        printf 'error\t%s\n' "$p" ;;
+  esac
+done
+exit 0
+SH
+  chmod +x "${i3blhelp}"
+  set +e; out="$(ICLOUD_HELPER="${i3blhelp}" i3run --icloud-sync-status "${i3bl}" 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "sync-status exits 0 when the helper emits a blank line (degraded, never fatal)" "blank-line helper output failed sync-status (exit ${rc}): ${out}"
+  assert_contains "${out}" "materialized + uploaded (evictable*): 2 file(s), 8 B" "the two answered files still count as uploaded"
+  assert_contains "${out}" "unreadable / helper-error: 1 file(s)" "the unanswered (blank) line is counted as an error — the deficit add, fail-closed"
+
   # --- download free-space gate (margin env override = primary seam; real df) ---
   i3dl="${i3cd}/dl"; mkdir -p "${i3dl}"
   printf 'dd\n' > "${i3dl}/h_DATALESS"   # dataless via stat shim (5 B)
