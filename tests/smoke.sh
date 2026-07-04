@@ -2617,6 +2617,49 @@ SH
   assert_nonzero "${rc}" "download is refused when df fails (fail-closed, never blind)"
   assert_contains "${out}" "cannot determine free space" "the df-failure refusal says why"
   if grep -q download "${i3log}" 2>/dev/null; then fail "df-failure path still reached brctl download"; else ok "df-failure path downloaded nothing"; fi
+  # CONTROLLED df → byte-exact boundary pin on the gate's bytes_need term (PR #45 review:
+  # the margin-extreme cases above (2^62 refuse / 0 pass) never make bytes_need the deciding
+  # term, so a mutant dropping it — `avail < margin` — survives them). df -P -k reports KB,
+  # so avail_bytes is always a multiple of 1024; the byte-exact boundary is therefore built
+  # by varying the MARGIN by 1 around a FIXED shimmed avail, not avail by 1:
+  #   need N = 5 B (h_DATALESS via the stat shim), avail = 4 KB = 4096 B
+  #   margin 4092 → N+margin = 4097 = avail+1 → ONE byte short → refuse  (kills drop-need)
+  #   margin 4091 → N+margin = 4096 = avail    → strict-< passes         (kills < → <=)
+  i3dfctl="${sandbox}/i3-df-ctl"; mkdir -p "${i3dfctl}"
+  cat > "${i3dfctl}/df" <<'SH'
+#!/bin/bash
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf 'smokefs 999999 999999 %s 50%% /\n' "${DF_AVAIL_KB:-0}"
+SH
+  chmod +x "${i3dfctl}/df"
+  i3dfrun() { PATH="${i3dfctl}:${i3shim}:${PATH}" BRCTL_LOG="${i3log}" BRCTL_STATUS_FILE="${i3status}" HOME="${i3h}" \
+    XDG_CONFIG_HOME="${i3h}/.config" XDG_CACHE_HOME="${i3h}/.cache" /bin/bash "${PROV}" "$@"; }
+  # one byte short: avail(4096) < need(5) + margin(4092) = 4097 → refused, nothing reaches brctl.
+  : > "${i3log}"
+  set +e; out="$(DF_AVAIL_KB=4 ICLOUD_DL_MARGIN_BYTES=4092 i3dfrun --icloud-download "${i3dl}" --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "boundary: download refused ONE byte short of need+margin (bytes_need term is live)"
+  assert_contains "${out}" "refusing to download" "the one-byte-short refusal says why"
+  if grep -q download "${i3log}" 2>/dev/null; then fail "one-byte-short refusal still reached brctl: $(cat "${i3log}")"; else ok "one-byte-short refusal downloaded nothing"; fi
+  # exact fit: avail(4096) == need(5) + margin(4091) → NOT < → passes; the dataless file downloads.
+  : > "${i3log}"
+  set +e; out="$(DF_AVAIL_KB=4 ICLOUD_DL_MARGIN_BYTES=4091 i3dfrun --icloud-download "${i3dl}" --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "boundary: download passes at avail == need+margin exactly (gate is strict-<)" "exact-fit download refused (exit ${rc}): ${out}"
+  if grep -q 'h_DATALESS' "${i3log}" 2>/dev/null; then ok "exact-fit pass downloaded the dataless file"; else fail "exact-fit pass reached no brctl download — recorded: $(cat "${i3log}" 2>/dev/null)"; fi
+  # ICLOUD_DL_MARGIN_BYTES load-time guard (fail-closed): the value flows into $((…)) where a
+  # crafted string EXECUTES at arithmetic-eval time — the guard must die on anything
+  # non-numeric BEFORE the gate's arithmetic can run (security regression pin).
+  : > "${i3log}"
+  set +e; out="$(ICLOUD_DL_MARGIN_BYTES=abc i3run --icloud-download "${i3dl}" --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "non-numeric ICLOUD_DL_MARGIN_BYTES is refused (fail-closed die at load)"
+  assert_contains "${out}" "must be a non-negative integer" "the margin-guard refusal says why"
+  if grep -q download "${i3log}" 2>/dev/null; then fail "non-numeric margin still reached brctl download"; else ok "non-numeric margin downloaded nothing"; fi
+  # arithmetic-injection payload: were the guard dropped, $((bytes_need + margin)) would
+  # EXECUTE the $(touch …) inside the array-subscript form. Assert die AND sentinel absent.
+  i3sent="${sandbox}/i3-INJ-SENTINEL"
+  rm -f "${i3sent}"
+  set +e; out="$(ICLOUD_DL_MARGIN_BYTES="x[\$(touch ${i3sent}; echo 0)]" i3run --icloud-download "${i3dl}" --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "injection-shaped ICLOUD_DL_MARGIN_BYTES is refused (fail-closed die at load)"
+  if [ -e "${i3sent}" ]; then fail "ARITHMETIC INJECTION EXECUTED — sentinel created by \$((…)) eval"; else ok "injection payload never executed (sentinel absent)"; fi
 else
   echo "smoke: I3 iCloud resolver/sync-status/download gate — SKIPPED (macOS-only; uname=$(uname -s))"
 fi

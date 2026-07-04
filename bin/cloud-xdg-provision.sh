@@ -121,6 +121,9 @@ ICLOUD_TARGET=""                                                    # resolved t
 # disk, where a %-of-download margin under-protects small downloads. Env-overridable as the smoke
 # seam (huge value => deterministic refusal; 0 => deterministic pass) and as a user knob.
 : "${ICLOUD_DL_MARGIN_BYTES:=1073741824}"
+# Validate ONCE at load: this value flows into an arithmetic context ($((bytes_need + …)))
+# where a crafted string executes at eval time — reject anything non-numeric fail-closed.
+case "${ICLOUD_DL_MARGIN_BYTES}" in ''|*[!0-9]*) die "ICLOUD_DL_MARGIN_BYTES must be a non-negative integer" ;; esac
 
 # State for the single master cleanup trap (cleanup_handler). bash 3.2 allows only
 # ONE handler per signal and has no trap-stacking, so the concurrency lock (#5c),
@@ -2155,7 +2158,8 @@ cmd_icloud_download() {                  # $1 = path
     NOT-CAUGHT-UP) warn "iCloud container is NOT caught up — downloads may stall behind a stuck item (advisory, not blocking)." ;;
   esac
 
-  while IFS= read -r f; do [ -z "$f" ] && continue; run brctl download "$f"; done < "$dtmp"
+  # </dev/null: keep brctl off the loop's stdin (the $dtmp file list) — same flush-exec fix as the helper.
+  while IFS= read -r f; do [ -z "$f" ] && continue; run brctl download "$f" < /dev/null; done < "$dtmp"
   rm -f "$dtmp"
   if [ "$DRY_RUN" -eq 1 ]; then info "[dry-run] would download (hydrate) the $n_dataless file(s) above (re-run with --apply)."
   else info "Download (hydrate) requested for $n_dataless file(s). Delivery is asynchronous (fileproviderd); check '$SELF --icloud-sync-status' after."; fi
