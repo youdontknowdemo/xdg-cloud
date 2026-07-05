@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-05
+
+Interactive iCloud sync: a read-only sync-status lane, a fail-closed download
+free-space gate, and the symlink-confinement fix that makes the iCloud lanes
+usable from `xdg-tui` on a provisioned home.
+
 ### Added
 - `--icloud-sync-status <path>`: read-only recursive iCloud sync summary —
   dataless / not-uploaded / in-sync counts, bytes-to-download, bytes-evictable,
@@ -30,12 +36,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tests without weakening production confinement (the root itself is resolved
   before every compare).
 
+### Security
+- `ICLOUD_DL_MARGIN_BYTES` is now validated digits-only at load. It flows into a
+  bash arithmetic context, where an array-subscript-with-command-substitution
+  value would execute at eval time; the fail-closed guard rejects any
+  non-numeric value before it reaches the gate. Found and re-verified in
+  adversarial review before this release. The chunk-flush helper exec and the
+  download-loop `brctl` exec also get `< /dev/null` so an inherited file-list
+  stdin can never reach them.
+
 ### Tests
 - Smoke Group I3 (escape matrix, sync-status semantics incl. helper-failure
-  degradation, free-space gate both directions, blank-line deficit accounting)
-  and TUI-level integration through the real script in a sandbox. Resolver,
-  gate, and accounting were mutation-verified (one surviving mutant found and
-  a killing assertion added). Gate: ~552 smoke assertions + 87 python tests.
+  degradation, free-space gate both directions incl. a controlled-`df` boundary
+  pinning the `bytes_need` term, injection-refusal with sentinel-absence, and
+  blank-line deficit accounting) plus TUI-level integration through the real
+  script in a sandbox. Resolver, gate, and accounting were mutation-verified.
+  Gate: ~562 smoke assertions + 87 python tests.
 
 ## [0.3.0] - 2026-07-03
 
