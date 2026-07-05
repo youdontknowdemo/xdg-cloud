@@ -535,5 +535,148 @@ class TestAbortedEvictIsReadOnly(SandboxCase):
         self.assertTrue(all(kind != "handover" for kind, _ in rex.calls))
 
 
+@unittest.skipUnless(sys.platform == "darwin", "iCloud lanes are macOS-gated")
+@unittest.skipUnless(os.path.exists("/bin/bash"), "/bin/bash required (bash 3.2 code path)")
+class TestICloudSyncStatusThroughExecutor(SandboxCase):
+    """TEST-phase addition: drive --icloud-sync-status through the TUI's REAL
+    seams (plan_action argv -> Executor.capture -> interpret_result) against
+    the real provision script in a sandbox. Smoke I3 already proves the bash
+    lane; this proves the python relay: rc 0 summary reaches the capture pane,
+    and a resolver refusal is relayed VERBATIM as a 'refused' outcome (rc 1).
+    Deterministic: sandbox HOME + explicit ICLOUD_ROOT + stub icloud-uploaded
+    helper + brctl PATH shim — no real CloudDocs, no real $HOME, ever.
+    """
+
+    HELPER_STUB = (
+        "#!/bin/bash\n"
+        "# basename -> state, one '<state>\\t<path>' line per argv arg, exit 1\n"
+        "# on any not-plain-uploaded file (like the real helper; the lane must\n"
+        "# ignore the rc — chunking breaks whole-set exit semantics).\n"
+        "rc=0\n"
+        'for p; do\n'
+        '  b="${p##*/}"\n'
+        '  case "$b" in\n'
+        "    *_UP*)   printf 'uploaded\\t%s\\n' \"$p\" ;;\n"
+        "    *_WAIT*) printf 'not-uploaded\\t%s\\n' \"$p\"; rc=1 ;;\n"
+        "    *)       printf 'error\\t%s\\n' \"$p\"; rc=1 ;;\n"
+        "  esac\n"
+        "done\n"
+        'exit "$rc"\n'
+    )
+
+    def setUp(self):
+        super(TestICloudSyncStatusThroughExecutor, self).setUp()
+        # Sandbox CloudDocs root (real dir; self.tmp is already realpath'd, so
+        # lexical == physical for every fixture path except the escape links).
+        self.cloud = os.path.join(
+            self.home, "Library", "Mobile Documents", "com~apple~CloudDocs"
+        )
+        docs = os.path.join(self.cloud, "documents")
+        os.makedirs(docs)
+        with open(os.path.join(docs, "r_UP"), "wb") as fh:
+            fh.write(b"aaa\n")          # 4 B, helper says uploaded
+        with open(os.path.join(docs, "s_WAIT"), "wb") as fh:
+            fh.write(b"bb\n")           # 3 B, helper says not-uploaded
+        # Provisioned-machine shape: $HOME/Documents is a symlink INTO the
+        # root — the exact target run_action builds ($HOME/<localName>).
+        os.symlink(docs, os.path.join(self.home, "Documents"))
+        # Escape shape: $HOME/Escape resolves OUTSIDE the root.
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(outside)
+        os.symlink(outside, os.path.join(self.home, "Escape"))
+
+        # Stub upload-state helper (ICLOUD_HELPER env seam).
+        self.helper = os.path.join(self.tmp, "icloud-helper")
+        with open(self.helper, "w") as fh:
+            fh.write(self.HELPER_STUB)
+        os.chmod(self.helper, 0o755)
+
+        # Recording brctl PATH shim: `status` answers from BRCTL_STATUS_FILE,
+        # anything else is recorded to BRCTL_LOG (must stay empty — read-only).
+        shim_dir = os.path.join(self.tmp, "shim-icloud")
+        os.makedirs(shim_dir)
+        with open(os.path.join(shim_dir, "brctl"), "w") as fh:
+            fh.write(
+                "#!/bin/bash\n"
+                'if [ "$1" = "status" ]; then cat "$BRCTL_STATUS_FILE" 2>/dev/null; exit 0; fi\n'
+                "printf '%s\\n' \"$*\" >> \"$BRCTL_LOG\"\n"
+                "exit 0\n"
+            )
+        os.chmod(os.path.join(shim_dir, "brctl"), 0o755)
+        self.brctl_log = os.path.join(self.tmp, "brctl.log")
+        status_file = os.path.join(self.tmp, "brctl-status")
+        with open(status_file, "w") as fh:
+            fh.write("x <com.apple.CloudDocs[1] observer:itest state:caught-up>\n")
+        open(self.brctl_log, "w").close()
+
+        self.env = self.sandbox_env(
+            path_prefix=shim_dir,
+            ICLOUD_ROOT=self.cloud,
+            ICLOUD_HELPER=self.helper,
+            BRCTL_LOG=self.brctl_log,
+            BRCTL_STATUS_FILE=status_file,
+        )
+        self.assert_contained(self.env, canonical="Documents")
+
+    def _brctl_mutations(self):
+        with open(self.brctl_log, "r") as fh:
+            return [l for l in fh.read().splitlines()
+                    if l.startswith(("download", "evict"))]
+
+    def test_sync_status_summary_reaches_the_capture_pane(self):
+        """Happy path: plan_action argv -> capture -> rc 0, summary text in
+        the captured stdout (what _show_pane renders), model 'ok'."""
+        target = os.path.join(self.env["HOME"], "Documents")  # run_action's shape
+        argv = xdg_tui.plan_action(target, "icloud-sync-status")
+        self.assertEqual(argv, ["--icloud-sync-status", target])
+        self.assertNotIn("--apply", argv)
+        self.assertTrue(xdg_tui.ACTIONS["icloud-sync-status"]["read_only"])
+
+        before = tree_digest(self.cloud)
+        rc, out, err = self.executor(self.env).capture(argv)
+        self.assertEqual(rc, 0, "sync-status failed:\n%s\n%s" % (out, err))
+        outcome = xdg_tui.interpret_result("icloud-sync-status", rc, out, err)
+        self.assertEqual(outcome.status, "ok")
+
+        # The pane content (stdout) carries the whole summary, with the
+        # RESOLVED CloudDocs path — the symlinked $HOME/Documents was accepted.
+        docs_resolved = os.path.realpath(os.path.join(self.home, "Documents"))
+        self.assertIn("iCloud sync status under: %s" % docs_resolved, out)
+        self.assertIn("scanned: 2 file(s)", out)
+        self.assertIn("dataless (to download): 0 file(s), 0 B", out)
+        self.assertIn("materialized + uploaded (evictable*): 1 file(s), 4 B", out)
+        self.assertIn("materialized, NOT uploaded (waiting on iCloud): 1 file(s)", out)
+        self.assertIn("container health (brctl status): caught-up", out)
+
+        # Read-only proof at the TUI seam: no lock, no brctl mutation verbs,
+        # fixture tree byte-identical.
+        self.assertFalse(os.path.exists(self.lock_dir(self.env)),
+                         "read-only sync-status left a lock dir")
+        self.assertEqual(self._brctl_mutations(), [],
+                         "read-only sync-status invoked brctl download/evict")
+        self.assertEqual(tree_digest(self.cloud), before,
+                         "sync-status mutated the fixture tree")
+
+    def test_escape_refusal_is_relayed_verbatim_as_refused(self):
+        """Refusal relay: an entry whose $HOME/<localName> resolves OUTSIDE
+        the root gets the resolver's die (rc 1) relayed VERBATIM through
+        interpret_result -> 'refused' (message == stderr, untouched)."""
+        target = os.path.join(self.env["HOME"], "Escape")
+        argv = xdg_tui.plan_action(target, "icloud-sync-status")
+        rc, out, err = self.executor(self.env).capture(argv)
+
+        self.assertEqual(rc, 1, "escape target must be refused:\n%s\n%s" % (out, err))
+        outcome = xdg_tui.interpret_result("icloud-sync-status", rc, out, err)
+        self.assertEqual(outcome.status, "refused")
+        self.assertEqual(outcome.message, err)  # verbatim relay, no rewriting
+        self.assertIn("path is not under iCloud Drive", outcome.message)
+        # The refusal names the RESOLVED (physical) out-of-root path:
+        self.assertIn(os.path.realpath(os.path.join(self.home, "Escape")),
+                      outcome.message)
+        # Nothing reached brctl; nothing locked.
+        self.assertEqual(self._brctl_mutations(), [])
+        self.assertFalse(os.path.exists(self.lock_dir(self.env)))
+
+
 if __name__ == "__main__":
     unittest.main()

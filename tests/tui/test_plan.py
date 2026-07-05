@@ -46,6 +46,19 @@ class TestArgvMatrix(unittest.TestCase):
     def test_icloud_status(self):
         self.assertEqual(_valid_argv("icloud-status"), ["--icloud-status", PATH])
 
+    def test_icloud_sync_status(self):
+        # New read-only lane (§3): plain path argv, mirrors icloud-status.
+        self.assertEqual(
+            _valid_argv("icloud-sync-status"), ["--icloud-sync-status", PATH]
+        )
+        # read_only in ACTIONS: run_action's capture->pane branch, no confirm.
+        self.assertTrue(xdg_tui.ACTIONS["icloud-sync-status"]["read_only"])
+        # Never --apply, never consent-gated on the TUI's actual call shape
+        # (read_only ops are only ever planned with confirmed=False).
+        argv = _valid_argv("icloud-sync-status")
+        self.assertNotIn("--apply", argv)
+        self.assertNotIn(RISK, argv)
+
     def test_icloud_download(self):
         self.assertEqual(_valid_argv("icloud-download"), ["--icloud-download", PATH])
         self.assertEqual(
