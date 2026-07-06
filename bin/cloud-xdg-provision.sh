@@ -1974,15 +1974,21 @@ SYNC_BYTES_EVICT=0
 # argv budget per helper exec. macOS ARG_MAX is 1 MiB INCLUDING envp and pointer space;
 # 128 KiB of path bytes + a 5000-arg cap leaves >= 7/8 headroom. Byte-budgeted (not
 # count-only) because PATH_MAX-length paths at a fixed large count could overflow.
-ICLOUD_CHUNK_MAX_BYTES=131072
-ICLOUD_CHUNK_MAX_ARGS=5000
+# Env-overridable as the smoke seam (a tiny cap drives the mid-walk flush path on a
+# small fixture). Validated at load like ICLOUD_DL_MARGIN_BYTES — fail-closed; a
+# non-numeric cap would silently disable the mid-walk flush ([ -ge ] errors are false).
+: "${ICLOUD_CHUNK_MAX_BYTES:=131072}"
+: "${ICLOUD_CHUNK_MAX_ARGS:=5000}"
+case "${ICLOUD_CHUNK_MAX_BYTES}" in ''|*[!0-9]*) die "ICLOUD_CHUNK_MAX_BYTES must be a non-negative integer" ;; esac
+case "${ICLOUD_CHUNK_MAX_ARGS}" in ''|*[!0-9]*) die "ICLOUD_CHUNK_MAX_ARGS must be a non-negative integer" ;; esac
 
-# Flush the pending chunk through ONE helper exec and aggregate PER-LINE states.
+# Flush the pending chunk through ONE helper exec and aggregate PER-RECORD states.
 # Chunking breaks the helper's whole-set exit-code semantics, so the rc is IGNORED here —
-# stdout ("<state>\t<path>", parse-stable per icloud-uploaded.swift) is the only signal.
-# Sizes join by ORDER: the helper prints one line per argv path in argv order, and
+# stdout (NUL-terminated "<state>\t<path>" records per icloud-uploaded.swift; a newline
+# can appear INSIDE a path, so \0 is the record separator) is the only signal.
+# Sizes join by ORDER: the helper prints one record per argv path in argv order, and
 # SYNC_SIZES was appended in lockstep with SYNC_CHUNK. Any input the helper failed to
-# answer (fewer output lines than args) is counted as an error — fail-closed accounting.
+# answer (fewer output records than args) is counted as an error — fail-closed accounting.
 icloud_sync_flush_chunk() {
   [ "${#SYNC_CHUNK[@]}" -gt 0 ] || return 0
   local hout line state size i tab
@@ -1991,7 +1997,7 @@ icloud_sync_flush_chunk() {
   # </dev/null: mid-walk flushes run inside a `while … < list` loop — the helper must never see the file list on stdin.
   "$ICLOUD_HELPER" ${SYNC_CHUNK[@]+"${SYNC_CHUNK[@]}"} < /dev/null > "$hout" 2>/dev/null || true
   i=0
-  while IFS= read -r line; do
+  while IFS= read -r -d '' line; do
     [ -z "$line" ] && continue
     state="${line%%"$tab"*}"
     size="${SYNC_SIZES[$i]:-0}"
@@ -2018,8 +2024,10 @@ cmd_icloud_status() {                    # $1 = path
   log "iCloud status under: $ICLOUD_TARGET (read-only)"
   local ftmp f ubi datal upl
   ftmp="$(mktemp "${TMPDIR:-/tmp}/xdg-icloud.XXXXXX")" || die "cannot create temp file"
-  find "$ICLOUD_TARGET" -type f > "$ftmp" 2>/dev/null || true
-  while IFS= read -r f; do
+  # NUL-delimited (-print0 / read -d ''): an embedded newline in a filename must not split
+  # into bogus records (dotfiles-lane idiom; NUL survives the tempfile, never a $()).
+  find "$ICLOUD_TARGET" -type f -print0 > "$ftmp" 2>/dev/null || true
+  while IFS= read -r -d '' f; do
     [ -z "$f" ] && continue
     if icloud_is_dataless "$f"; then datal="dataless"; else datal="materialized"; fi
     case "$(mdls -name kMDItemFSIsUbiquitous -raw "$f" 2>/dev/null)" in 1|"(1)"|true) ubi="in-icloud" ;; *) ubi="local?" ;; esac
@@ -2046,9 +2054,11 @@ cmd_icloud_sync_status() {               # $1 = path
   local ftmp f line size
   local n_total=0 n_dataless=0 bytes_down=0 n_mat_unknown=0 bytes_mat_unknown=0
   ftmp="$(mktemp "${TMPDIR:-/tmp}/xdg-icloud.XXXXXX")" || die "cannot create temp file"
-  find "$ICLOUD_TARGET" -type f > "$ftmp" 2>/dev/null || true
+  # NUL-delimited: a newline-in-filename split would both miscount n_total and desync the
+  # SYNC_SIZES/SYNC_CHUNK order-join (sizes appended in lockstep with paths below).
+  find "$ICLOUD_TARGET" -type f -print0 > "$ftmp" 2>/dev/null || true
 
-  while IFS= read -r f; do
+  while IFS= read -r -d '' f; do
     [ -z "$f" ] && continue
     n_total=$((n_total + 1))
     # size FIRST in the format: %Sf may be empty, and a trailing empty field parses
@@ -2120,15 +2130,17 @@ cmd_icloud_download() {                  # $1 = path
   local ftmp dtmp f line size n_dataless=0 bytes_need=0
   ftmp="$(mktemp "${TMPDIR:-/tmp}/xdg-icloud.XXXXXX")" || die "cannot create temp file"
   dtmp="$(mktemp "${TMPDIR:-/tmp}/xdg-icloud.XXXXXX")" || die "cannot create temp file"
-  find "$ICLOUD_TARGET" -type f > "$ftmp" 2>/dev/null || true
-  while IFS= read -r f; do
+  # NUL-delimited end-to-end (find AND the $dtmp queue): a newline-split path here would
+  # enqueue garbage to brctl download.
+  find "$ICLOUD_TARGET" -type f -print0 > "$ftmp" 2>/dev/null || true
+  while IFS= read -r -d '' f; do
     [ -z "$f" ] && continue
     line="$(stat -f '%z %Sf' "$f" 2>/dev/null)" || line=""
     case "$line" in *dataless*) : ;; *) continue ;; esac
     size="${line%% *}"
     case "$size" in ''|*[!0-9]*) size=0 ;; esac
     n_dataless=$((n_dataless + 1)); bytes_need=$((bytes_need + size))
-    printf '%s\n' "$f" >> "$dtmp"
+    printf '%s\0' "$f" >> "$dtmp"
   done < "$ftmp"
   rm -f "$ftmp"
   if [ "$n_dataless" -eq 0 ]; then
@@ -2159,7 +2171,7 @@ cmd_icloud_download() {                  # $1 = path
   esac
 
   # </dev/null: keep brctl off the loop's stdin (the $dtmp file list) — same flush-exec fix as the helper.
-  while IFS= read -r f; do [ -z "$f" ] && continue; run brctl download "$f" < /dev/null; done < "$dtmp"
+  while IFS= read -r -d '' f; do [ -z "$f" ] && continue; run brctl download "$f" < /dev/null; done < "$dtmp"
   rm -f "$dtmp"
   if [ "$DRY_RUN" -eq 1 ]; then info "[dry-run] would download (hydrate) the $n_dataless file(s) above (re-run with --apply)."
   else info "Download (hydrate) requested for $n_dataless file(s). Delivery is asynchronous (fileproviderd); check '$SELF --icloud-sync-status' after."; fi
@@ -2184,8 +2196,10 @@ cmd_icloud_evict() {                     # $1 = path
   # bash 3.2: temp file + while-read + indexed-array append (no mapfile / no process-substitution).
   local ftmp f; local candidates=()
   ftmp="$(mktemp "${TMPDIR:-/tmp}/xdg-icloud.XXXXXX")" || die "cannot create temp file"
-  find "$ICLOUD_TARGET" -type f > "$ftmp" 2>/dev/null || true
-  while IFS= read -r f; do [ -z "$f" ] && continue; icloud_is_dataless "$f" && continue; candidates+=("$f"); done < "$ftmp"
+  # NUL-delimited: a newline-split path could never pass the upload gate, but must not
+  # poison the candidate list either (read mechanism only — gate logic unchanged).
+  find "$ICLOUD_TARGET" -type f -print0 > "$ftmp" 2>/dev/null || true
+  while IFS= read -r -d '' f; do [ -z "$f" ] && continue; icloud_is_dataless "$f" && continue; candidates+=("$f"); done < "$ftmp"
   rm -f "$ftmp"
   [ "${#candidates[@]}" -gt 0 ] || { info "nothing to evict (all already dataless or empty)."; return 0; }
 
@@ -2195,7 +2209,9 @@ cmd_icloud_evict() {                     # $1 = path
   local hout; hout="$(mktemp "${TMPDIR:-/tmp}/xdg-icloud.XXXXXX")" || die "cannot create temp file"
   if ! "$ICLOUD_HELPER" "${candidates[@]}" > "$hout" 2>/dev/null; then
     warn "refusing to evict — NOT every target file is confirmed fully-uploaded (fail-closed):"
-    grep -v '^uploaded	' "$hout" 2>/dev/null | sed 's/^/    /' >&2 || true
+    # Display only (the DECISION above is exit-code-driven): helper records are NUL-terminated,
+    # so render them newline-separated for the human-readable "which files blocked" list.
+    tr '\0' '\n' < "$hout" 2>/dev/null | grep -v '^uploaded	' | sed 's/^/    /' >&2 || true
     rm -f "$hout"
     die "evict aborted. Wait for iCloud upload (check '$SELF --icloud-status <path>'), or use
   '$SELF --offload <dir>' for a verified space-free. Nothing was evicted."
