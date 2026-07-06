@@ -2340,6 +2340,25 @@ SH
   assert_nonzero "${rc}" "evict is refused when the helper errors"
   if grep -q evict "${i2log}" 2>/dev/null; then fail "DATA LOSS: evicted despite a helper error"; else ok "helper-error evicted NOTHING"; fi
 
+  # (j2) REFUSAL DIAGNOSTIC is NUL-record-aware: an UPLOADED file whose name embeds a
+  #      newline must NOT forge a fake "blocking" line in the operator-facing list (the
+  #      old tr|grep flattened NULs to newlines BEFORE filtering, so the post-newline
+  #      fragment leaked). The real blocker must still be listed. Display-only: the
+  #      refusal itself (helper exit 1) and zero-evict are asserted like (i)/(j).
+  i2forge="${sandbox}/i2-helper-forge"
+  cat > "${i2forge}" <<'SH'
+#!/bin/bash
+printf 'uploaded\t/ok/name-with\nnot-uploaded\t/forged-blocker\0not-uploaded\t/real-blocker\0'
+exit 1
+SH
+  chmod +x "${i2forge}"
+  : > "${i2log}"
+  set +e; out="$(ICLOUD_HELPER="${i2forge}" i2run --icloud-evict "${i2cd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "evict is refused on the newline-forgery helper set (exit-code gate unaffected)"
+  assert_contains "${out}" "/real-blocker" "the genuine blocking record is listed in the diagnostic"
+  assert_not_contains "${out}" "/forged-blocker" "the newline fragment inside an UPLOADED record forges NO blocking line"
+  if grep -q evict "${i2log}" 2>/dev/null; then fail "DATA LOSS: evicted despite the forgery-set refusal"; else ok "forgery-set refusal evicted NOTHING"; fi
+
   # (k) DATALESS-SKIP: a stat-shim reports one file dataless (icloud_is_dataless reads `stat -f %Sf`),
   #     so a dir with [dataless + uploaded] evicts ONLY the uploaded, non-dataless file.
   i2sshim="${sandbox}/i2-stat-shim"; mkdir -p "${i2sshim}"
@@ -2749,6 +2768,16 @@ SH
   set +e; out="$(ICLOUD_CHUNK_MAX_BYTES=1e6 i3run --icloud-sync-status "${i3mf}" 2>&1)"; rc=$?; set -e
   assert_nonzero "${rc}" "non-numeric ICLOUD_CHUNK_MAX_BYTES is refused (fail-closed die at load)"
   assert_contains "${out}" "ICLOUD_CHUNK_MAX_BYTES must be a non-negative integer" "the bytes-cap guard refusal says why"
+  # over-ceiling caps: an over-int64 digits-only value would make the mid-walk [ -ge ]
+  # flush compare error->false and silently DISABLE chunk flushing (the thing the guard
+  # exists to prevent). Both the over-int64 (length path) and the in-int64-but-over-1GiB
+  # (numeric path) values must die at load, naming the var.
+  set +e; out="$(ICLOUD_CHUNK_MAX_ARGS=99999999999999999999999 i3run --icloud-sync-status "${i3mf}" 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "over-int64 ICLOUD_CHUNK_MAX_ARGS is refused (fail-closed die at load)"
+  assert_contains "${out}" "ICLOUD_CHUNK_MAX_ARGS must be <= 1073741824" "the args-cap ceiling refusal names the var and the bound"
+  set +e; out="$(ICLOUD_CHUNK_MAX_BYTES=2147483648 i3run --icloud-sync-status "${i3mf}" 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "over-ceiling ICLOUD_CHUNK_MAX_BYTES is refused (fail-closed die at load)"
+  assert_contains "${out}" "ICLOUD_CHUNK_MAX_BYTES must be <= 1073741824" "the bytes-cap ceiling refusal names the var and the bound"
 else
   echo "smoke: I3 iCloud resolver/sync-status/download gate — SKIPPED (macOS-only; uname=$(uname -s))"
 fi

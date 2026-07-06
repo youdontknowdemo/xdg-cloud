@@ -1976,11 +1976,20 @@ SYNC_BYTES_EVICT=0
 # count-only) because PATH_MAX-length paths at a fixed large count could overflow.
 # Env-overridable as the smoke seam (a tiny cap drives the mid-walk flush path on a
 # small fixture). Validated at load like ICLOUD_DL_MARGIN_BYTES — fail-closed; a
-# non-numeric cap would silently disable the mid-walk flush ([ -ge ] errors are false).
+# non-numeric cap would silently disable the mid-walk flush ([ -ge ] errors are false),
+# and so would an over-int64 digits-only cap (same [ -ge ] error->false path) — hence
+# the 1073741824 ceiling (1 GiB of argv bytes / 1e9 args is absurd for either budget):
+# an over-ceiling cap dies HERE at load instead of silently disabling the flush.
 : "${ICLOUD_CHUNK_MAX_BYTES:=131072}"
 : "${ICLOUD_CHUNK_MAX_ARGS:=5000}"
 case "${ICLOUD_CHUNK_MAX_BYTES}" in ''|*[!0-9]*) die "ICLOUD_CHUNK_MAX_BYTES must be a non-negative integer" ;; esac
 case "${ICLOUD_CHUNK_MAX_ARGS}" in ''|*[!0-9]*) die "ICLOUD_CHUNK_MAX_ARGS must be a non-negative integer" ;; esac
+# Ceiling guards: the length check runs FIRST, so the numeric [ -le ] never sees an
+# over-int64 operand (digits-only is proven above; 10 digits tops out at 9999999999).
+[ "${#ICLOUD_CHUNK_MAX_BYTES}" -le 10 ] && [ "${ICLOUD_CHUNK_MAX_BYTES}" -le 1073741824 ] \
+  || die "ICLOUD_CHUNK_MAX_BYTES must be <= 1073741824"
+[ "${#ICLOUD_CHUNK_MAX_ARGS}" -le 10 ] && [ "${ICLOUD_CHUNK_MAX_ARGS}" -le 1073741824 ] \
+  || die "ICLOUD_CHUNK_MAX_ARGS must be <= 1073741824"
 
 # Flush the pending chunk through ONE helper exec and aggregate PER-RECORD states.
 # Chunking breaks the helper's whole-set exit-code semantics, so the rc is IGNORED here —
@@ -2209,9 +2218,18 @@ cmd_icloud_evict() {                     # $1 = path
   local hout; hout="$(mktemp "${TMPDIR:-/tmp}/xdg-icloud.XXXXXX")" || die "cannot create temp file"
   if ! "$ICLOUD_HELPER" "${candidates[@]}" > "$hout" 2>/dev/null; then
     warn "refusing to evict — NOT every target file is confirmed fully-uploaded (fail-closed):"
-    # Display only (the DECISION above is exit-code-driven): helper records are NUL-terminated,
-    # so render them newline-separated for the human-readable "which files blocked" list.
-    tr '\0' '\n' < "$hout" 2>/dev/null | grep -v '^uploaded	' | sed 's/^/    /' >&2 || true
+    # Display only (the DECISION above is exit-code-driven): print the BLOCKING records,
+    # filtering per NUL record. Flattening NULs to newlines BEFORE the filter (the old
+    # tr|grep) let an uploaded file with a newline in its NAME split into two display
+    # lines, and the post-newline fragment forged a fake "blocking" entry. Filtering on
+    # the whole record keeps any embedded newline inside its one (skipped) record.
+    local tab rec; tab="$(printf '\t')"
+    while IFS= read -r -d '' rec; do
+      case "$rec" in
+        ''|uploaded"$tab"*) ;;              # empty / confirmed-uploaded — not a blocker
+        *) printf '    %s\n' "$rec" >&2 ;;  # blocking record, indented
+      esac
+    done < "$hout" || true
     rm -f "$hout"
     die "evict aborted. Wait for iCloud upload (check '$SELF --icloud-status <path>'), or use
   '$SELF --offload <dir>' for a verified space-free. Nothing was evicted."
