@@ -2224,10 +2224,10 @@ if [ "$(uname -s)" = "Darwin" ]; then
   chmod +x "${i1shim}/brctl"
   i1ok="${sandbox}/helper-ok"
   # shellcheck disable=SC2016   # $p is literal inside the shim script being written, not expanded here
-  printf '#!/bin/bash\nfor p; do printf "uploaded\\t%%s\\n" "$p"; done\nexit 0\n' > "${i1ok}"; chmod +x "${i1ok}"
+  printf '#!/bin/bash\nfor p; do printf "uploaded\\t%%s\\0" "$p"; done\nexit 0\n' > "${i1ok}"; chmod +x "${i1ok}"
   i1no="${sandbox}/helper-no"
   # shellcheck disable=SC2016   # $p is literal inside the shim script being written, not expanded here
-  printf '#!/bin/bash\nfor p; do printf "not-uploaded\\t%%s\\n" "$p"; done\nexit 1\n' > "${i1no}"; chmod +x "${i1no}"
+  printf '#!/bin/bash\nfor p; do printf "not-uploaded\\t%%s\\0" "$p"; done\nexit 1\n' > "${i1no}"; chmod +x "${i1no}"
   i1run() { PATH="${i1shim}:${PATH}" HOME="${i1h}" XDG_CONFIG_HOME="${i1h}/.config" XDG_CACHE_HOME="${i1h}/.cache" \
     /bin/bash "${PROV}" "$@"; }
   : > "${sandbox}/brctl.log"
@@ -2290,7 +2290,7 @@ SH
   i2ok="${sandbox}/i2-helper-ok"
   cat > "${i2ok}" <<'SH'
 #!/bin/bash
-for p; do printf 'uploaded\t%s\n' "$p"; done
+for p; do printf 'uploaded\t%s\0' "$p"; done
 exit 0
 SH
   chmod +x "${i2ok}"
@@ -2298,7 +2298,7 @@ SH
   cat > "${i2mix}" <<'SH'
 #!/bin/bash
 i=0
-for p; do i=$((i + 1)); if [ "$i" = 1 ]; then printf 'uploaded\t%s\n' "$p"; else printf 'not-uploaded\t%s\n' "$p"; fi; done
+for p; do i=$((i + 1)); if [ "$i" = 1 ]; then printf 'uploaded\t%s\0' "$p"; else printf 'not-uploaded\t%s\0' "$p"; fi; done
 exit 1
 SH
   chmod +x "${i2mix}"
@@ -2339,6 +2339,25 @@ SH
   set +e; out="$(ICLOUD_HELPER="${i2err}" i2run --icloud-evict "${i2cd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
   assert_nonzero "${rc}" "evict is refused when the helper errors"
   if grep -q evict "${i2log}" 2>/dev/null; then fail "DATA LOSS: evicted despite a helper error"; else ok "helper-error evicted NOTHING"; fi
+
+  # (j2) REFUSAL DIAGNOSTIC is NUL-record-aware: an UPLOADED file whose name embeds a
+  #      newline must NOT forge a fake "blocking" line in the operator-facing list (the
+  #      old tr|grep flattened NULs to newlines BEFORE filtering, so the post-newline
+  #      fragment leaked). The real blocker must still be listed. Display-only: the
+  #      refusal itself (helper exit 1) and zero-evict are asserted like (i)/(j).
+  i2forge="${sandbox}/i2-helper-forge"
+  cat > "${i2forge}" <<'SH'
+#!/bin/bash
+printf 'uploaded\t/ok/name-with\nnot-uploaded\t/forged-blocker\0not-uploaded\t/real-blocker\0'
+exit 1
+SH
+  chmod +x "${i2forge}"
+  : > "${i2log}"
+  set +e; out="$(ICLOUD_HELPER="${i2forge}" i2run --icloud-evict "${i2cd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "evict is refused on the newline-forgery helper set (exit-code gate unaffected)"
+  assert_contains "${out}" "/real-blocker" "the genuine blocking record is listed in the diagnostic"
+  assert_not_contains "${out}" "/forged-blocker" "the newline fragment inside an UPLOADED record forges NO blocking line"
+  if grep -q evict "${i2log}" 2>/dev/null; then fail "DATA LOSS: evicted despite the forgery-set refusal"; else ok "forgery-set refusal evicted NOTHING"; fi
 
   # (k) DATALESS-SKIP: a stat-shim reports one file dataless (icloud_is_dataless reads `stat -f %Sf`),
   #     so a dir with [dataless + uploaded] evicts ONLY the uploaded, non-dataless file.
@@ -2443,9 +2462,10 @@ esac
 exec /usr/bin/stat "$@"
 SH
   chmod +x "${i3shim}/stat"
-  # Upload-state helper stub: basename → state, one "<state>\t<path>" line per argv arg, exit 1
-  # whenever any file is not plain-uploaded (like the real helper). sync-status must IGNORE that
-  # rc (chunking breaks whole-set exit semantics) — asserted below.
+  # Upload-state helper stub: basename → state, one NUL-terminated "<state>\t<path>" record per
+  # argv arg (matching the real helper's \0 record separator), exit 1 whenever any file is not
+  # plain-uploaded (like the real helper). sync-status must IGNORE that rc (chunking breaks
+  # whole-set exit semantics) — asserted below.
   i3help="${sandbox}/i3-helper"
   cat > "${i3help}" <<'SH'
 #!/bin/bash
@@ -2453,10 +2473,10 @@ rc=0
 for p; do
   b="${p##*/}"
   case "$b" in
-    *_UP*)              printf 'uploaded\t%s\n' "$p" ;;
-    *_WAIT*)            printf 'not-uploaded\t%s\n' "$p"; rc=1 ;;
-    .DS_Store|*_NOTIN*) printf 'not-in-icloud\t%s\n' "$p"; rc=1 ;;
-    *)                  printf 'error\t%s\n' "$p"; rc=1 ;;
+    *_UP*)              printf 'uploaded\t%s\0' "$p" ;;
+    *_WAIT*)            printf 'not-uploaded\t%s\0' "$p"; rc=1 ;;
+    .DS_Store|*_NOTIN*) printf 'not-in-icloud\t%s\0' "$p"; rc=1 ;;
+    *)                  printf 'error\t%s\0' "$p"; rc=1 ;;
   esac
 done
 exit "$rc"
@@ -2548,12 +2568,12 @@ SH
   assert_contains "${out}" "NOT caught up" "the wedge warning appears when brctl status lacks caught-up"
   printf 'x <com.apple.CloudDocs[1] observer:smoke state:caught-up>\n' > "${i3status}"
 
-  # helper-contract break (blank line mid-output): the flush loop SKIPS blank
-  # lines, so the helper effectively answered fewer lines than it was asked —
-  # the end-of-flush deficit add must count the gap as an error (fail-closed
-  # accounting; TEST-phase mutation check: dropping the deficit add survived
-  # every prior assert). All fixture files are 4 B so the uploaded byte total
-  # stays stable even though a blank line shifts the order-join of sizes.
+  # helper-contract break (EMPTY record mid-output — a bare NUL): the flush loop
+  # SKIPS empty records, so the helper effectively answered fewer records than it
+  # was asked — the end-of-flush deficit add must count the gap as an error
+  # (fail-closed accounting; TEST-phase mutation check: dropping the deficit add
+  # survived every prior assert). All fixture files are 4 B so the uploaded byte
+  # total stays stable even though the empty record shifts the order-join of sizes.
   i3bl="${i3cd}/bl"; mkdir -p "${i3bl}"
   printf 'aaa\n' > "${i3bl}/p_UP"; printf 'bbb\n' > "${i3bl}/q_BLANK"; printf 'ccc\n' > "${i3bl}/r_UP"
   i3blhelp="${sandbox}/i3-helper-blank"
@@ -2562,18 +2582,18 @@ SH
 for p; do
   b="${p##*/}"
   case "$b" in
-    *_UP*)    printf 'uploaded\t%s\n' "$p" ;;
-    *_BLANK*) printf '\n' ;;
-    *)        printf 'error\t%s\n' "$p" ;;
+    *_UP*)    printf 'uploaded\t%s\0' "$p" ;;
+    *_BLANK*) printf '\0' ;;
+    *)        printf 'error\t%s\0' "$p" ;;
   esac
 done
 exit 0
 SH
   chmod +x "${i3blhelp}"
   set +e; out="$(ICLOUD_HELPER="${i3blhelp}" i3run --icloud-sync-status "${i3bl}" 2>&1)"; rc=$?; set -e
-  pass_if "${rc}" "sync-status exits 0 when the helper emits a blank line (degraded, never fatal)" "blank-line helper output failed sync-status (exit ${rc}): ${out}"
+  pass_if "${rc}" "sync-status exits 0 when the helper emits an empty record (degraded, never fatal)" "empty-record helper output failed sync-status (exit ${rc}): ${out}"
   assert_contains "${out}" "materialized + uploaded (evictable*): 2 file(s), 8 B" "the two answered files still count as uploaded"
-  assert_contains "${out}" "unreadable / helper-error: 1 file(s)" "the unanswered (blank) line is counted as an error — the deficit add, fail-closed"
+  assert_contains "${out}" "unreadable / helper-error: 1 file(s)" "the unanswered (empty) record is counted as an error — the deficit add, fail-closed"
 
   # --- download free-space gate (margin env override = primary seam; real df) ---
   i3dl="${i3cd}/dl"; mkdir -p "${i3dl}"
@@ -2660,6 +2680,104 @@ SH
   set +e; out="$(ICLOUD_DL_MARGIN_BYTES="x[\$(touch ${i3sent}; echo 0)]" i3run --icloud-download "${i3dl}" --apply 2>&1)"; rc=$?; set -e
   assert_nonzero "${rc}" "injection-shaped ICLOUD_DL_MARGIN_BYTES is refused (fail-closed die at load)"
   if [ -e "${i3sent}" ]; then fail "ARITHMETIC INJECTION EXECUTED — sentinel created by \$((…)) eval"; else ok "injection payload never executed (sentinel absent)"; fi
+
+  # --- NUL-delimited enumeration (PR #45 deferred): an embedded NEWLINE in a filename must
+  #     not split into bogus records in the iCloud lanes (-print0 / read -d '' sweep). ---
+  i3nl="${i3cd}/nl"; mkdir -p "${i3nl}"
+  i3nlf="${i3nl}/pre
+post_DATALESS"
+  printf 'nn\n' > "${i3nlf}"
+  # sync-status: ONE file with the RIGHT byte total (5 B via the stat shim). A newline split
+  # would scan 2 records, and neither stat-less half would land in the dataless bucket.
+  set +e; out="$(ICLOUD_HELPER="${i3help}" i3run --icloud-sync-status "${i3nl}" 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "sync-status exits 0 on a newline-in-filename fixture" "newline fixture failed sync-status (exit ${rc}): ${out}"
+  assert_contains "${out}" "scanned: 1 file(s)" "newline filename counts as ONE file (NUL-delimited find)"
+  assert_contains "${out}" "dataless (to download): 1 file(s), 5 B" "newline filename's size joins the RIGHT file (no order desync)"
+  # download: exactly ONE brctl call carrying the FULL path. The shim logs "$*", so the intact
+  # path spans two log lines ('download <head>' + bare tail); a split would instead log TWO
+  # '^download ' lines with the tail as its own bogus 'download post_DATALESS' call.
+  : > "${i3log}"
+  set +e; out="$(ICLOUD_DL_MARGIN_BYTES=0 i3run --icloud-download "${i3nl}" --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "download --apply exits 0 on the newline fixture" "newline download failed (exit ${rc}): ${out}"
+  i3nlc="$(grep -c '^download ' "${i3log}" 2>/dev/null || printf 0)"
+  if [ "${i3nlc}" -eq 1 ] && grep -qxF "post_DATALESS" "${i3log}"; then ok "download enqueued ONE brctl call with the full newline path (no split)"; else fail "newline path split before brctl download — recorded: $(cat "${i3log}" 2>/dev/null)"; fi
+  # evict: the gate sees the whole path (helper stub answers 'uploaded' for *_UP), then exactly
+  # ONE brctl evict with the full path. A split half would fail the gate → evict NOTHING → rc!=0.
+  i3nle="${i3cd}/nle"; mkdir -p "${i3nle}"
+  i3nlef="${i3nle}/ev
+tail_UP"
+  printf 'aaa\n' > "${i3nlef}"
+  : > "${i3log}"
+  set +e; out="$(ICLOUD_HELPER="${i3help}" i3run --icloud-evict "${i3nle}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "evict --apply exits 0 on a newline-in-filename fixture (gate sees the whole path)" "newline evict failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "Evicted 1 fully-uploaded file(s)" "evict counted ONE candidate (no split)"
+  i3nlc="$(grep -c '^evict ' "${i3log}" 2>/dev/null || printf 0)"
+  if [ "${i3nlc}" -eq 1 ] && grep -qxF "tail_UP" "${i3log}"; then ok "evict issued ONE brctl call with the full newline path (no split)"; else fail "newline path split before brctl evict — recorded: $(cat "${i3log}" 2>/dev/null)"; fi
+  # helper-STDOUT order-join across an embedded newline (only testable now the helper's
+  # records are NUL-terminated): a MATERIALIZED newline-named *_UP file must aggregate as
+  # exactly ONE uploaded record with the RIGHT byte total. Pre-fix (newline-terminated
+  # helper records) the record split in two: head counted uploaded, tail fell to the error
+  # bucket — so the DISCRIMINATING assert is the error warn-line (printed only when
+  # errors > 0) being ABSENT.
+  i3nlu="${i3cd}/nlu"; mkdir -p "${i3nlu}"
+  i3nluf="${i3nlu}/mat
+tail_UP"
+  printf 'aaa\n' > "${i3nluf}"   # 4 B via real stat — materialized (no DATALESS marker)
+  set +e; out="$(ICLOUD_HELPER="${i3help}" i3run --icloud-sync-status "${i3nlu}" 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "sync-status exits 0 on a MATERIALIZED newline-in-filename fixture" "materialized newline fixture failed sync-status (exit ${rc}): ${out}"
+  assert_contains "${out}" "scanned: 1 file(s)" "the materialized newline filename scans as ONE file"
+  assert_contains "${out}" "materialized + uploaded (evictable*): 1 file(s), 4 B" "ONE uploaded record with the RIGHT bytes (helper-stdout order-join intact across the newline)"
+  assert_not_contains "${out}" "unreadable / helper-error" "no split tail lands in the error bucket (NUL-terminated helper records)"
+
+  # --- chunk-cap env seam (PR #45 deferred): a tiny cap drives the MID-WALK flush path on a
+  #     small fixture (multiple helper execs) and proves the `< /dev/null` helper-stdin sever
+  #     under real multi-chunk conditions: this helper DRAINS its stdin before answering —
+  #     without the sever, the first mid-walk flush would eat the walk's remaining file list
+  #     (scanned would drop from 3 to 1). Outer </dev/null keeps a hypothetical regression
+  #     deterministic (drain hits EOF instead of blocking on the suite's stdin). ---
+  i3mf="${i3cd}/mf"; mkdir -p "${i3mf}"
+  printf 'aaa\n' > "${i3mf}/x_UP"; printf 'bbb\n' > "${i3mf}/y_UP"; printf 'ccc\n' > "${i3mf}/z_UP"
+  i3sevlog="${sandbox}/i3-sever-execs"
+  i3sevhelp="${sandbox}/i3-helper-sever"
+  cat > "${i3sevhelp}" <<'SH'
+#!/bin/bash
+printf 'exec %s\n' "$#" >> "$SEV_LOG"
+cat > /dev/null
+for p; do printf 'uploaded\t%s\0' "$p"; done
+exit 0
+SH
+  chmod +x "${i3sevhelp}"
+  : > "${i3sevlog}"
+  set +e; out="$(ICLOUD_CHUNK_MAX_ARGS=1 SEV_LOG="${i3sevlog}" ICLOUD_HELPER="${i3sevhelp}" i3run --icloud-sync-status "${i3mf}" 2>&1 < /dev/null)"; rc=$?; set -e
+  pass_if "${rc}" "sync-status exits 0 with ICLOUD_CHUNK_MAX_ARGS=1 (mid-walk multi-flush)" "tiny-arg-cap sync-status failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "scanned: 3 file(s)" "the stdin-draining helper did NOT eat the walk's file list (stdin sever holds mid-flush)"
+  assert_contains "${out}" "materialized + uploaded (evictable*): 3 file(s), 12 B" "totals aggregate correctly ACROSS flushes (3 x 4 B over 3 helper execs)"
+  i3sevc="$(grep -cx 'exec 1' "${i3sevlog}" 2>/dev/null || printf 0)"
+  if [ "${i3sevc}" -eq 3 ]; then ok "ICLOUD_CHUNK_MAX_ARGS=1 drove 3 single-arg helper execs (flush path live)"; else fail "expected 3 single-arg helper execs, got: $(cat "${i3sevlog}" 2>/dev/null)"; fi
+  # byte-cap seam: ICLOUD_CHUNK_MAX_BYTES=1 must drive the same per-file flushes.
+  : > "${i3sevlog}"
+  set +e; out="$(ICLOUD_CHUNK_MAX_BYTES=1 SEV_LOG="${i3sevlog}" ICLOUD_HELPER="${i3sevhelp}" i3run --icloud-sync-status "${i3mf}" 2>&1 < /dev/null)"; rc=$?; set -e
+  pass_if "${rc}" "sync-status exits 0 with ICLOUD_CHUNK_MAX_BYTES=1 (byte-cap multi-flush)" "tiny-byte-cap sync-status failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "materialized + uploaded (evictable*): 3 file(s), 12 B" "byte-cap flushes aggregate the same totals"
+  i3sevc="$(grep -cx 'exec 1' "${i3sevlog}" 2>/dev/null || printf 0)"
+  if [ "${i3sevc}" -eq 3 ]; then ok "ICLOUD_CHUNK_MAX_BYTES=1 drove 3 single-arg helper execs"; else fail "byte-cap: expected 3 single-arg execs, got: $(cat "${i3sevlog}" 2>/dev/null)"; fi
+  # cap guards: non-numeric caps die fail-closed at load (same idiom as the margin guard).
+  set +e; out="$(ICLOUD_CHUNK_MAX_ARGS=abc i3run --icloud-sync-status "${i3mf}" 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "non-numeric ICLOUD_CHUNK_MAX_ARGS is refused (fail-closed die at load)"
+  assert_contains "${out}" "ICLOUD_CHUNK_MAX_ARGS must be a non-negative integer" "the args-cap guard refusal says why"
+  set +e; out="$(ICLOUD_CHUNK_MAX_BYTES=1e6 i3run --icloud-sync-status "${i3mf}" 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "non-numeric ICLOUD_CHUNK_MAX_BYTES is refused (fail-closed die at load)"
+  assert_contains "${out}" "ICLOUD_CHUNK_MAX_BYTES must be a non-negative integer" "the bytes-cap guard refusal says why"
+  # over-ceiling caps: an over-int64 digits-only value would make the mid-walk [ -ge ]
+  # flush compare error->false and silently DISABLE chunk flushing (the thing the guard
+  # exists to prevent). Both the over-int64 (length path) and the in-int64-but-over-1GiB
+  # (numeric path) values must die at load, naming the var.
+  set +e; out="$(ICLOUD_CHUNK_MAX_ARGS=99999999999999999999999 i3run --icloud-sync-status "${i3mf}" 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "over-int64 ICLOUD_CHUNK_MAX_ARGS is refused (fail-closed die at load)"
+  assert_contains "${out}" "ICLOUD_CHUNK_MAX_ARGS must be <= 1073741824" "the args-cap ceiling refusal names the var and the bound"
+  set +e; out="$(ICLOUD_CHUNK_MAX_BYTES=2147483648 i3run --icloud-sync-status "${i3mf}" 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "over-ceiling ICLOUD_CHUNK_MAX_BYTES is refused (fail-closed die at load)"
+  assert_contains "${out}" "ICLOUD_CHUNK_MAX_BYTES must be <= 1073741824" "the bytes-cap ceiling refusal names the var and the bound"
 else
   echo "smoke: I3 iCloud resolver/sync-status/download gate — SKIPPED (macOS-only; uname=$(uname -s))"
 fi

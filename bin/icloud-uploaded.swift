@@ -6,7 +6,9 @@ import Foundation
 // has no stock CLI surface, which is why this tiny compiled reader exists.
 //
 // argv:   one or more file paths.
-// stdout: one line per path — "<state>\t<path>", state ∈ {uploaded, not-uploaded, not-in-icloud, error}.
+// stdout: one NUL-terminated record per path — "<state>\t<path>\0" (NOT newline-terminated:
+//         a newline can appear INSIDE a filename, so \0 is the record separator),
+//         state ∈ {uploaded, not-uploaded, not-in-icloud, error}.
 // exit:   0  iff EVERY argv path is `uploaded` (safe to evict)
 //         1  if any path is not-uploaded / not-in-icloud / unreadable  (fail closed → do NOT evict)
 //         2  usage error
@@ -41,6 +43,6 @@ for path in args {
     } catch {
         state = "error"; allSafe = false                        // FAIL CLOSED on any read error
     }
-    print("\(state)\t\(path)")
+    print("\(state)\t\(path)", terminator: "\u{0}")
 }
 exit(allSafe ? 0 : 1)

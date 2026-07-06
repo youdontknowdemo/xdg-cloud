@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Newline-in-filename robustness across all iCloud lanes. The four lanes now
+  enumerate files NUL-delimited (`find -print0`), and the upload-state helper
+  (`icloud-uploaded`) emits NUL-terminated records, so a filename containing a
+  newline can no longer split an enumeration line or desync the `--icloud-sync-status`
+  size/state order-join. **Behavior delta**: a materialized file whose name
+  contains a newline is now handled correctly — previously it split into bogus
+  candidates that made `--icloud-evict` refuse the whole set fail-closed; such a
+  file (if confirmed uploaded) is now evictable like any other. The evict gate
+  itself is unchanged — still exit-code-driven and fail-closed on any
+  not-uploaded/error file.
+
+### Changed
+- `ICLOUD_CHUNK_MAX_BYTES` / `ICLOUD_CHUNK_MAX_ARGS` are now env-overridable
+  (numeric-guarded at load), exposing the batched-helper flush path to tests.
+
 ## [0.4.0] - 2026-07-05
 
 Interactive iCloud sync: a read-only sync-status lane, a fail-closed download

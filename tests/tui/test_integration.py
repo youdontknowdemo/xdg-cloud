@@ -549,16 +549,17 @@ class TestICloudSyncStatusThroughExecutor(SandboxCase):
 
     HELPER_STUB = (
         "#!/bin/bash\n"
-        "# basename -> state, one '<state>\\t<path>' line per argv arg, exit 1\n"
-        "# on any not-plain-uploaded file (like the real helper; the lane must\n"
+        "# basename -> state, one NUL-terminated '<state>\\t<path>' record per\n"
+        "# argv arg (the real helper's \\0 record separator), exit 1 on any\n"
+        "# not-plain-uploaded file (like the real helper; the lane must\n"
         "# ignore the rc — chunking breaks whole-set exit semantics).\n"
         "rc=0\n"
         'for p; do\n'
         '  b="${p##*/}"\n'
         '  case "$b" in\n'
-        "    *_UP*)   printf 'uploaded\\t%s\\n' \"$p\" ;;\n"
-        "    *_WAIT*) printf 'not-uploaded\\t%s\\n' \"$p\"; rc=1 ;;\n"
-        "    *)       printf 'error\\t%s\\n' \"$p\"; rc=1 ;;\n"
+        "    *_UP*)   printf 'uploaded\\t%s\\0' \"$p\" ;;\n"
+        "    *_WAIT*) printf 'not-uploaded\\t%s\\0' \"$p\"; rc=1 ;;\n"
+        "    *)       printf 'error\\t%s\\0' \"$p\"; rc=1 ;;\n"
         "  esac\n"
         "done\n"
         'exit "$rc"\n'
