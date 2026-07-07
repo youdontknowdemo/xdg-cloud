@@ -123,7 +123,10 @@ ICLOUD_TARGET=""                                                    # resolved t
 : "${ICLOUD_DL_MARGIN_BYTES:=1073741824}"
 # Validate ONCE at load: this value flows into an arithmetic context ($((bytes_need + …)))
 # where a crafted string executes at eval time — reject anything non-numeric fail-closed.
-case "${ICLOUD_DL_MARGIN_BYTES}" in ''|*[!0-9]*) die "ICLOUD_DL_MARGIN_BYTES must be a non-negative integer" ;; esac
+# Leading zeros are ALSO rejected (0?* — bare 0 stays valid): $(( )) reads a leading-zero
+# constant as OCTAL, so 0100000000 would silently gate with 16777216 (~6x smaller margin),
+# and a leading-zero value containing 8/9 errors at arithmetic time instead of load.
+case "${ICLOUD_DL_MARGIN_BYTES}" in ''|*[!0-9]*|0?*) die "ICLOUD_DL_MARGIN_BYTES must be a non-negative integer (no leading zeros)" ;; esac
 # Magnitude ceiling (2^53 = 9007199254740992, ~8 PiB): $(( )) wraps mod 2^64 SILENTLY — a
 # digits-only margin of exactly 2^64 becomes 0 at the free-space gate, deleting the ENOSPC
 # margin with no error (fail-OPEN; worse than the chunk caps, whose [ -ge ] at least errors

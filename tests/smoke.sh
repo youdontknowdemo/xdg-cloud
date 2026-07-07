@@ -2690,6 +2690,22 @@ SH
   assert_nonzero "${rc}" "over-ceiling ICLOUD_DL_MARGIN_BYTES (2^64, would wrap to 0) is refused at load"
   assert_contains "${out}" "ICLOUD_DL_MARGIN_BYTES must be <= 9007199254740992" "the ceiling refusal names the var and the bound"
   if grep -q download "${i3log}" 2>/dev/null; then fail "over-ceiling margin still reached brctl download (wrap fail-open)"; else ok "over-ceiling margin downloaded nothing"; fi
+  # leading-zero margin (security review MEDIUM): a leading-zero digits-only value passes a
+  # plain decimal shape case but $(( )) reads it as OCTAL — 0100000000 (meant as 100000000)
+  # would silently gate with 16777216, a ~6x smaller margin (fail-open-ish shrink). The load
+  # guard's 0?* branch must die BEFORE the gate arithmetic can read the value as octal.
+  : > "${i3log}"
+  set +e; out="$(ICLOUD_DL_MARGIN_BYTES=0100000000 i3run --icloud-download "${i3dl}" --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "leading-zero ICLOUD_DL_MARGIN_BYTES (octal-shrink shape) is refused at load"
+  assert_contains "${out}" "ICLOUD_DL_MARGIN_BYTES must be a non-negative integer (no leading zeros)" "the leading-zero refusal names the var and the rule"
+  if grep -q download "${i3log}" 2>/dev/null; then fail "leading-zero margin still reached brctl download (octal shrink)"; else ok "leading-zero margin downloaded nothing"; fi
+  # …and bare 0 still PASSES the guard: 0?* matches 0-followed-by-more, not zero itself —
+  # zero is the legit "keep no margin" value (boundary pair with the refusal above; the
+  # margin-0 pass/dry-run pins earlier in this suite cover the real-df path).
+  : > "${i3log}"
+  set +e; out="$(DF_AVAIL_KB=4 ICLOUD_DL_MARGIN_BYTES=0 i3dfrun --icloud-download "${i3dl}" --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "bare-0 margin still accepted after the leading-zero guard (0?* does not match bare 0)" "bare-0 margin rejected (exit ${rc}): ${out}"
+  if grep -q 'h_DATALESS' "${i3log}" 2>/dev/null; then ok "bare-0 margin run gated normally and downloaded the dataless file"; else fail "bare-0 margin run reached no brctl download — recorded: $(cat "${i3log}" 2>/dev/null)"; fi
   # …and the ceiling is not too tight: a legitimately LARGE margin (100 GiB) is accepted and
   # the gate arithmetic runs normally (controlled df: 200 GiB avail > 5 B need + 100 GiB margin
   # → passes and downloads; deterministic — real df would make this depend on the host disk).
