@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- `ICLOUD_DL_MARGIN_BYTES` is now magnitude- and format-guarded at load, closing
+  two arithmetic-context gaps in the free-space gate (`$((bytes_need + MARGIN))`).
+  A value of exactly 2^64 previously passed the digits-only check and then wrapped
+  to 0 — silently deleting the ENOSPC margin (fail-open); a leading-zero value
+  (e.g. `0100000000`) was read as octal, silently shrinking the margin ~6×. The
+  guard now rejects over-2^53 values and leading zeros at load (bare `0` stays
+  valid). Env-set, operator-self-inflicted; no privilege boundary crossed.
+
 ## [0.4.1] - 2026-07-06
 
 A robustness patch: newline-in-filename correctness across the iCloud lanes,

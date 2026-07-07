@@ -123,7 +123,20 @@ ICLOUD_TARGET=""                                                    # resolved t
 : "${ICLOUD_DL_MARGIN_BYTES:=1073741824}"
 # Validate ONCE at load: this value flows into an arithmetic context ($((bytes_need + …)))
 # where a crafted string executes at eval time — reject anything non-numeric fail-closed.
-case "${ICLOUD_DL_MARGIN_BYTES}" in ''|*[!0-9]*) die "ICLOUD_DL_MARGIN_BYTES must be a non-negative integer" ;; esac
+# Leading zeros are ALSO rejected (0?* — bare 0 stays valid): $(( )) reads a leading-zero
+# constant as OCTAL, so 0100000000 would silently gate with 16777216 (~6x smaller margin),
+# and a leading-zero value containing 8/9 errors at arithmetic time instead of load.
+case "${ICLOUD_DL_MARGIN_BYTES}" in ''|*[!0-9]*|0?*) die "ICLOUD_DL_MARGIN_BYTES must be a non-negative integer (no leading zeros)" ;; esac
+# Magnitude ceiling (2^53 = 9007199254740992, ~8 PiB): $(( )) wraps mod 2^64 SILENTLY — a
+# digits-only margin of exactly 2^64 becomes 0 at the free-space gate, deleting the ENOSPC
+# margin with no error (fail-OPEN; worse than the chunk caps, whose [ -ge ] at least errors
+# to the refusing side). So over-ceiling must die HERE at load. 2^53 still allows any
+# realistic keep-free margin (PiB-scale) while leaving int64 headroom: bytes_need + 2^53
+# cannot overflow with any real byte count. Length gate runs FIRST (digits-only is proven
+# above; 16 digits tops out at ~1e16 < int64 max), so the numeric [ -le ] never sees an
+# over-int64 operand.
+[ "${#ICLOUD_DL_MARGIN_BYTES}" -le 16 ] && [ "${ICLOUD_DL_MARGIN_BYTES}" -le 9007199254740992 ] \
+  || die "ICLOUD_DL_MARGIN_BYTES must be <= 9007199254740992"
 
 # State for the single master cleanup trap (cleanup_handler). bash 3.2 allows only
 # ONE handler per signal and has no trap-stacking, so the concurrency lock (#5c),
