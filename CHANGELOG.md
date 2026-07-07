@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-07
+
+A security-hardening patch: closes two arithmetic-context gaps in the
+`--icloud-download` free-space gate.
+
 ### Security
 - `ICLOUD_DL_MARGIN_BYTES` is now magnitude- and format-guarded at load, closing
   two arithmetic-context gaps in the free-space gate (`$((bytes_need + MARGIN))`).
