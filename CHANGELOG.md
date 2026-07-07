@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-06
+
+A robustness patch: newline-in-filename correctness across the iCloud lanes,
+plus security-review fixes to the evict diagnostic and the chunk-cap guards.
+
 ### Fixed
 - Newline-in-filename robustness across all iCloud lanes. The four lanes now
   enumerate files NUL-delimited (`find -print0`), and the upload-state helper
@@ -22,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - `ICLOUD_CHUNK_MAX_BYTES` / `ICLOUD_CHUNK_MAX_ARGS` are now env-overridable
   (numeric-guarded at load), exposing the batched-helper flush path to tests.
+
+### Security
+- The `--icloud-evict` refuse-diagnostic now filters per NUL record instead of
+  flattening records to newlines before the filter — a crafted filename
+  containing a newline could otherwise forge a fake "blocking" entry in the
+  operator-facing list. Display-only; the evict decision was and remains
+  exit-code-driven.
+- The chunk-cap guards reject over-`int64` values (magnitude ceiling, not just a
+  digits-only shape check): a huge digits-only value previously made the
+  `[ -ge ]` comparison error out and silently disable the mid-walk flush.
 
 ## [0.4.0] - 2026-07-05
 
