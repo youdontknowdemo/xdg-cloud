@@ -2915,6 +2915,257 @@ SH
   assert_nonzero "${rc}" "a record deficit dies (count-match, deficit direction)"
   assert_contains "${out}" "answered 1 of 2" "the die reports the answered/candidate counts"
   if grep -q evict "${i4log}" 2>/dev/null; then fail "DATA LOSS: evicted despite the count deficit"; else ok "count-deficit die evicted NOTHING (answered prefix NOT trusted)"; fi
+
+  # --- TEST-phase extension (remaining §4.2 rows + plan P1/P2 adversarial set). Every row
+  #     owns a SIBLING dir of td under the sandbox CloudDocs root — no cross-row candidate
+  #     pollution (i4cd itself gained defi/ in row (e) above). Stateful stubs count their
+  #     calls in a file under ${sandbox} (phase 1 = call 1, phase 2 = call >= 2). The
+  #     load-bearing surface for every "evicted"/"never evicted" claim is the brctl-shim
+  #     LOG (the destructive boundary), never report prose. ---
+  i4root="${i4cd%/td}"
+
+  # (b) full-matrix dry-run vs apply (spec b + plan P1 "dry-run subset == apply subset"):
+  #     dry-run makes ZERO brctl calls, the skip report NAMES each skipped file by reason
+  #     (expected lines built with the script's own '    %-15s %s' printf — format drift
+  #     fails here), and the apply-destroyed set byte-matches the dry-run-previewed set.
+  i4bd="${i4root}/i4b"; mkdir -p "${i4bd}"
+  printf 'u\n' > "${i4bd}/mb_UP"; printf 'w\n' > "${i4bd}/mb_WAIT"
+  printf 'd\n' > "${i4bd}/.DS_Store"; printf 'e\n' > "${i4bd}/mb_ERRX"
+  : > "${i4log}"
+  set +e; out="$(ICLOUD_HELPER="${i4help}" i4run --icloud-evict "${i4bd}" --i-understand-data-loss-risk 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "dry-run of the 4-file matrix completes with rc 0" "dry-run matrix failed (exit ${rc}): ${out}"
+  if [ -s "${i4log}" ]; then fail "dry-run made a brctl call: $(cat "${i4log}")"; else ok "dry-run made ZERO brctl calls"; fi
+  assert_contains "${out}" "evict plan: 1 of 4" "dry-run plans 1 of 4 proven uploaded"
+  assert_contains "${out}" "skipped: 3 file(s) — not-uploaded: 1, not-in-icloud: 1, helper-error: 1, unanswered: 0, drift: 0" "dry-run summary line tallies every reason (drift 0 by definition)"
+  assert_contains "${out}" "[dry-run] would evict the 1 proven-uploaded" "dry-run trailer names the planned count"
+  i4exp="$(printf '    %-15s %s' not-uploaded "${i4bd}/mb_WAIT")"
+  assert_contains "${out}" "${i4exp}" "skip listing names the not-uploaded file by reason"
+  i4exp="$(printf '    %-15s %s' not-in-icloud "${i4bd}/.DS_Store")"
+  assert_contains "${out}" "${i4exp}" "skip listing names the not-in-icloud file by reason"
+  i4exp="$(printf '    %-15s %s' helper-error "${i4bd}/mb_ERRX")"
+  assert_contains "${out}" "${i4exp}" "skip listing names the helper-error file by reason"
+  i4led="$(printf '%s\n' "${out}" | grep 'brctl evict' || true)"
+  i4nl="$(printf '%s\n' "${i4led}" | grep -c 'brctl evict' || true)"
+  if [ "${i4nl}" -eq 1 ]; then ok "dry-run ledger previews exactly 1 evict"; else fail "dry-run ledger previewed ${i4nl} evicts: ${i4led}"; fi
+  assert_contains "${i4led}" "mb_UP" "dry-run ledger previews the proven-uploaded file"
+  assert_not_contains "${i4led}" "mb_WAIT" "dry-run ledger excludes the not-uploaded file"
+  set +e; out="$(ICLOUD_HELPER="${i4help}" i4run --icloud-evict "${i4bd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "apply on the same matrix completes with rc 0" "apply matrix failed (exit ${rc}): ${out}"
+  i4ne="$(grep -c '^evict ' "${i4log}" || true)"
+  if [ "${i4ne}" -eq 1 ] && grep -qF 'mb_UP' "${i4log}" && ! grep -qF 'mb_WAIT' "${i4log}" && ! grep -qF '.DS_Store' "${i4log}" && ! grep -qF 'mb_ERRX' "${i4log}"; then ok "apply destroyed EXACTLY the dry-run-previewed subset (1 brctl call, mb_UP only)"; else fail "apply set != dry-run set — recorded: $(cat "${i4log}" 2>/dev/null)"; fi
+
+  # (d) reversed record order: honest states, records emitted in REVERSED argv order →
+  #     the FIRST record already fails the path-echo byte-equality. Order is load-bearing
+  #     by design; path-echo makes any reorder fatal instead of silently remapping states.
+  i4dr="${i4root}/i4d"; mkdir -p "${i4dr}"
+  printf 'a\n' > "${i4dr}/rv1_UP"; printf 'b\n' > "${i4dr}/rv2_UP"
+  i4rev="${sandbox}/i4-helper-rev"
+  cat > "${i4rev}" <<'SH'
+#!/bin/bash
+i=$#
+while [ "$i" -ge 1 ]; do
+  eval "p=\${$i}"
+  printf 'uploaded\t%s\0' "$p"
+  i=$((i - 1))
+done
+exit 0
+SH
+  chmod +x "${i4rev}"
+  : > "${i4log}"
+  set +e; out="$(ICLOUD_HELPER="${i4rev}" i4run --icloud-evict "${i4dr}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "reversed record order dies (path-echo join assertion)"
+  assert_contains "${out}" "does not echo its argv path" "the reversed-order die names the join desync"
+  if grep -q evict "${i4log}" 2>/dev/null; then fail "DATA LOSS: evicted despite the reversed-order die"; else ok "reversed-order die evicted NOTHING"; fi
+
+  # (f) surplus records: honest record per argv path + one EXTRA forged 'uploaded' record →
+  #     count-match dies in the surplus direction; the extra path never reaches brctl.
+  i4fd="${i4root}/i4f"; mkdir -p "${i4fd}"
+  printf 's\n' > "${i4fd}/sf_UP"
+  i4sur="${sandbox}/i4-helper-surplus"
+  cat > "${i4sur}" <<'SH'
+#!/bin/bash
+for p; do printf 'uploaded\t%s\0' "$p"; done
+printf 'uploaded\t/i4-extra-record\0'
+exit 0
+SH
+  chmod +x "${i4sur}"
+  : > "${i4log}"
+  set +e; out="$(ICLOUD_HELPER="${i4sur}" i4run --icloud-evict "${i4fd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "surplus records die (count-match, surplus direction)"
+  assert_contains "${out}" "MORE records" "the surplus die names the contract violation"
+  if grep -q evict "${i4log}" 2>/dev/null; then fail "DATA LOSS: evicted despite the surplus die"; else ok "surplus die evicted NOTHING"; fi
+  if grep -qF '/i4-extra-record' "${i4log}" 2>/dev/null; then fail "DATA LOSS: the surplus record's path reached brctl"; else ok "the surplus record's path never reached brctl"; fi
+
+  # (g) empty output on a non-empty candidate set: helper exits 1 with NO stdout →
+  #     zero-records abort ("refusing to evict blind"), nothing evicted.
+  i4gd="${i4root}/i4g"; mkdir -p "${i4gd}"
+  printf 'x\n' > "${i4gd}/eo_UP"
+  i4emp="${sandbox}/i4-helper-empty"
+  printf '#!/bin/bash\nexit 1\n' > "${i4emp}"; chmod +x "${i4emp}"
+  : > "${i4log}"
+  set +e; out="$(ICLOUD_HELPER="${i4emp}" i4run --icloud-evict "${i4gd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "empty helper output dies (zero-records abort)"
+  assert_contains "${out}" "produced no output" "the die refuses to evict blind"
+  if grep -q evict "${i4log}" 2>/dev/null; then fail "DATA LOSS: evicted despite the zero-records abort"; else ok "zero-records abort evicted NOTHING"; fi
+
+  # (g0) zero-uploaded set (plan P1): every candidate skipped → uniform flow, rc 0, zero
+  #     brctl calls, full plan/summary/trailer shape (no special case, no wedge).
+  i4zd="${i4root}/i4z"; mkdir -p "${i4zd}"
+  printf 'w\n' > "${i4zd}/z1_WAIT"; printf 'n\n' > "${i4zd}/z2_NOTIN"
+  : > "${i4log}"
+  set +e; out="$(ICLOUD_HELPER="${i4help}" i4run --icloud-evict "${i4zd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "zero-uploaded set completes with rc 0 (all skipped, sweep not refused)" "zero-uploaded set failed (exit ${rc}): ${out}"
+  if [ -s "${i4log}" ]; then fail "DATA LOSS: zero-uploaded set made a brctl call: $(cat "${i4log}")"; else ok "zero-uploaded set evicted NOTHING"; fi
+  assert_contains "${out}" "evict plan: 0 of 2" "the plan reports 0 of 2 proven uploaded"
+  assert_contains "${out}" "skipped: 2 file(s) — not-uploaded: 1, not-in-icloud: 1, helper-error: 0, unanswered: 0, drift: 0" "the summary line tallies both skips"
+  assert_contains "${out}" "Evicted 0 of 0 proven-uploaded" "the apply trailer reports a clean empty sweep"
+
+  # (h) PHASE-2 RE-GATE (mutation target: delete phase 2): stub answers all-uploaded/rc 0
+  #     in phase 1 (call 1) but not-uploaded/rc 1 in phase 2 (call >= 2) → the whole chunk
+  #     is skipped as drift, ZERO evicts, sweep still completes rc 0.
+  i4hd="${i4root}/i4p2"; mkdir -p "${i4hd}"
+  printf 'a\n' > "${i4hd}/p2a_UP"; printf 'b\n' > "${i4hd}/p2b_UP"
+  i4flip="${sandbox}/i4-helper-flip"
+  cat > "${i4flip}" <<'SH'
+#!/bin/bash
+n=0
+[ -f "$I4_CALLS" ] && n="$(cat "$I4_CALLS")"
+n=$((n + 1))
+printf '%s\n' "$n" > "$I4_CALLS"
+if [ "$n" -eq 1 ]; then
+  for p; do printf 'uploaded\t%s\0' "$p"; done
+  exit 0
+fi
+for p; do printf 'not-uploaded\t%s\0' "$p"; done
+exit 1
+SH
+  chmod +x "${i4flip}"
+  rm -f "${sandbox}/i4-flip.calls"; : > "${i4log}"
+  set +e; out="$(ICLOUD_HELPER="${i4flip}" I4_CALLS="${sandbox}/i4-flip.calls" i4run --icloud-evict "${i4hd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "phase-2 flip completes with rc 0 (chunk skipped as drift, sweep not aborted)" "phase-2 flip run failed (exit ${rc}): ${out}"
+  if [ -s "${i4log}" ]; then fail "DATA LOSS: evicted despite the phase-2 rc!=0 re-gate: $(cat "${i4log}")"; else ok "phase-2 re-gate refused the chunk — evicted NOTHING"; fi
+  assert_contains "${out}" "phase-2 re-check failed" "the drift warn names the phase-2 refusal"
+  assert_contains "${out}" "skipped: 2 file(s) — not-uploaded: 0, not-in-icloud: 0, helper-error: 0, unanswered: 0, drift: 2" "both chunk members are tallied as drift"
+  assert_contains "${out}" "Evicted 0 of 2 proven-uploaded" "the trailer reports 0 evicted of 2 planned"
+
+  # (i) LSTAT DRIFT GUARD (mutation target: delete the pre-evict re-snapshot): the phase-2
+  #     stub APPENDS A BYTE to the file (a real content change between the selection
+  #     snapshot and the pre-evict lstat) then still answers uploaded/rc 0 — only the
+  #     per-file guard stands between the dirtied file and brctl.
+  i4id="${i4root}/i4dr2"; mkdir -p "${i4id}"
+  printf 'orig\n' > "${i4id}/dr_UP"
+  i4drift="${sandbox}/i4-helper-drift"
+  cat > "${i4drift}" <<'SH'
+#!/bin/bash
+n=0
+[ -f "$I4_CALLS" ] && n="$(cat "$I4_CALLS")"
+n=$((n + 1))
+printf '%s\n' "$n" > "$I4_CALLS"
+if [ "$n" -ge 2 ]; then printf 'x' >> "$1"; fi
+for p; do printf 'uploaded\t%s\0' "$p"; done
+exit 0
+SH
+  chmod +x "${i4drift}"
+  rm -f "${sandbox}/i4-drift.calls"; : > "${i4log}"
+  set +e; out="$(ICLOUD_HELPER="${i4drift}" I4_CALLS="${sandbox}/i4-drift.calls" i4run --icloud-evict "${i4id}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "lstat-drift run completes with rc 0 (file skipped, sweep not aborted)" "lstat-drift run failed (exit ${rc}): ${out}"
+  if [ -s "${i4log}" ]; then fail "DATA LOSS: evicted a file that changed after its selection snapshot: $(cat "${i4log}")"; else ok "lstat guard refused the dirtied file — evicted NOTHING"; fi
+  assert_contains "${out}" "file changed since plan" "the drift warn names the lstat mismatch"
+  assert_contains "${out}" "drift: 1" "the dirtied file is tallied as drift"
+  assert_contains "${out}" "Evicted 0 of 1 proven-uploaded" "the trailer reports 0 evicted of 1 planned"
+
+  # (j) symlink inside the target → outside file: find -type f excludes the link at walk
+  #     time, so it is never a candidate and its target never reaches brctl.
+  i4sd="${i4root}/i4sl"; mkdir -p "${i4sd}"
+  printf 'r\n' > "${i4sd}/sl_UP"
+  printf 'o\n' > "${sandbox}/i4-outside-file"
+  ln -s "${sandbox}/i4-outside-file" "${i4sd}/lnk"
+  : > "${i4log}"
+  set +e; out="$(ICLOUD_HELPER="${i4help}" i4run --icloud-evict "${i4sd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "symlink-in-target run completes with rc 0" "symlink-in-target run failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "evict plan: 1 of 1" "the symlink is never a candidate (plan 1 of 1)"
+  i4ne="$(grep -c '^evict ' "${i4log}" || true)"
+  if [ "${i4ne}" -eq 1 ] && grep -qF 'sl_UP' "${i4log}" && ! grep -qF 'lnk' "${i4log}" && ! grep -qF 'i4-outside-file' "${i4log}"; then ok "exactly the regular file evicted; neither link nor link target reached brctl"; else fail "wrong evict set with symlink present — recorded: $(cat "${i4log}" 2>/dev/null)"; fi
+
+  # (k) multi-chunk partition: ICLOUD_CHUNK_MAX_ARGS=1 over a 3-file mixed set → 3 phase-1
+  #     execs (argc 1 each) + 2 phase-2 execs (only chunks with an uploaded member), the
+  #     right 2 files evicted across chunks — proves EVICT_CHUNK_LEN + the base/len walk.
+  i4kd="${i4root}/i4k"; mkdir -p "${i4kd}"
+  printf 'a\n' > "${i4kd}/ka_UP"; printf 'b\n' > "${i4kd}/kb_WAIT"; printf 'c\n' > "${i4kd}/kc_UP"
+  i4cnt="${sandbox}/i4-helper-count"
+  cat > "${i4cnt}" <<'SH'
+#!/bin/bash
+printf '%s\n' "$#" >> "$I4_EXECS"
+rc=0
+for p; do
+  b="${p##*/}"
+  case "$b" in
+    *_UP*)   printf 'uploaded\t%s\0' "$p" ;;
+    *_WAIT*) printf 'not-uploaded\t%s\0' "$p"; rc=1 ;;
+    *)       printf 'error\t%s\0' "$p"; rc=1 ;;
+  esac
+done
+exit "$rc"
+SH
+  chmod +x "${i4cnt}"
+  i4ex="${sandbox}/i4-execs"; rm -f "${i4ex}"; : > "${i4log}"
+  set +e; out="$(ICLOUD_HELPER="${i4cnt}" I4_EXECS="${i4ex}" ICLOUD_CHUNK_MAX_ARGS=1 i4run --icloud-evict "${i4kd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "multi-chunk (max-args 1) sweep completes with rc 0" "multi-chunk sweep failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "evict plan: 2 of 3" "the plan aggregates across chunks (2 of 3)"
+  i4ne="$(grep -c '^evict ' "${i4log}" || true)"
+  if [ "${i4ne}" -eq 2 ] && grep -qF 'ka_UP' "${i4log}" && grep -qF 'kc_UP' "${i4log}" && ! grep -qF 'kb_WAIT' "${i4log}"; then ok "exactly the 2 proven files evicted across chunks (kb_WAIT skipped)"; else fail "wrong multi-chunk evict set — recorded: $(cat "${i4log}" 2>/dev/null)"; fi
+  i4nx="$(grep -c . "${i4ex}" || true)"
+  if [ "${i4nx}" -eq 5 ]; then ok "helper exec count is 5 (3 phase-1 chunks + 2 phase-2 re-gates)"; else fail "expected 5 helper execs, saw ${i4nx}: $(cat "${i4ex}" 2>/dev/null)"; fi
+  i4bad="$(grep -cvx '1' "${i4ex}" || true)"
+  if [ "${i4bad}" -eq 0 ]; then ok "every helper exec carried exactly 1 arg (chunk partition holds)"; else fail "helper exec with argc != 1: $(cat "${i4ex}" 2>/dev/null)"; fi
+
+  # (nc) non-candidate record: the helper answers with a path that was NEVER a candidate →
+  #     path-echo die; the alien path never reaches brctl.
+  i4nd="${i4root}/i4nc"; mkdir -p "${i4nd}"
+  printf 'n\n' > "${i4nd}/nc_UP"
+  i4non="${sandbox}/i4-helper-noncand"
+  cat > "${i4non}" <<'SH'
+#!/bin/bash
+printf 'uploaded\t/i4-nowhere-nc\0'
+exit 0
+SH
+  chmod +x "${i4non}"
+  : > "${i4log}"
+  set +e; out="$(ICLOUD_HELPER="${i4non}" i4run --icloud-evict "${i4nd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "a non-candidate record path dies (path-echo)"
+  assert_contains "${out}" "does not echo its argv path" "the non-candidate die names the join desync"
+  if grep -q evict "${i4log}" 2>/dev/null; then fail "DATA LOSS: evicted despite the non-candidate die"; else ok "non-candidate die evicted NOTHING"; fi
+  if grep -qF '/i4-nowhere-nc' "${i4log}" 2>/dev/null; then fail "DATA LOSS: the non-candidate path reached brctl"; else ok "the non-candidate path never reached brctl"; fi
+
+  # (l) tab-in-filename round-trip (plan P2): state splits at the FIRST tab only, so the
+  #     embedded tab survives into echo_path, the join holds, and brctl gets the full path.
+  i4tb="${i4root}/i4tab"; mkdir -p "${i4tb}"
+  i4tname="$(printf 'ta\tb_UP')"
+  printf 't\n' > "${i4tb}/${i4tname}"
+  : > "${i4log}"
+  set +e; out="$(ICLOUD_HELPER="${i4help}" i4run --icloud-evict "${i4tb}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "tab-in-filename evict completes with rc 0" "tab-in-filename evict failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "Evicted 1 of 1 proven-uploaded" "the trailer reports the tab-named file evicted"
+  i4tneedle="$(printf 'evict %s/%s' "${i4tb}" "${i4tname}")"
+  if grep -qF "${i4tneedle}" "${i4log}" 2>/dev/null; then ok "brctl received the FULL tab-containing path (round-trip intact)"; else fail "tab path mangled — recorded: $(cat "${i4log}" 2>/dev/null)"; fi
+
+  # (t) truncated final record (plan P2): the last record has no NUL terminator → read -d ''
+  #     DROPS it (no tail salvage by design) → count-match dies in the deficit direction.
+  i4trd="${i4root}/i4tr"; mkdir -p "${i4trd}"
+  printf 'a\n' > "${i4trd}/tra_UP"; printf 'b\n' > "${i4trd}/trb_UP"
+  i4tru="${sandbox}/i4-helper-trunc"
+  cat > "${i4tru}" <<'SH'
+#!/bin/bash
+printf 'uploaded\t%s\0' "$1"
+printf 'uploaded\t%s' "$2"
+exit 0
+SH
+  chmod +x "${i4tru}"
+  : > "${i4log}"
+  set +e; out="$(ICLOUD_HELPER="${i4tru}" i4run --icloud-evict "${i4trd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "a truncated final record dies (dropped record -> count deficit)"
+  assert_contains "${out}" "answered 1 of 2" "the truncated record is DROPPED, not salvaged"
+  if grep -q evict "${i4log}" 2>/dev/null; then fail "DATA LOSS: evicted despite the truncated-record die"; else ok "truncated-record die evicted NOTHING"; fi
 else
   echo "smoke: I4 bulk evict subset semantics — SKIPPED (macOS-only; uname=$(uname -s))"
 fi
