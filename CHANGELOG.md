@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-08
+
+Directory-usable iCloud evict. `--icloud-evict` becomes a proven-subset sweep —
+a **breaking** change to a data-destructive lane, hence the minor bump.
+
 ### Changed
 - **BREAKING — `--icloud-evict` is now a proven-subset sweep.** It evicts only the
   files the upload-state helper individually confirms `uploaded` and
@@ -35,7 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   partition, non-candidate record, tab-in-filename, truncated record — every case
   asserts on the recording `brctl` shim's log (the destructive boundary), not report
   prose. A mutation merge gate proves that deleting any of the six safety mechanisms
-  reds a committed test (6/6). Gate: ~673 smoke assertions + 87 python tests.
+  reds a committed test (6/6). Gate: ~686 smoke assertions + 87 python tests.
+
+### Fixed
+- Evict dry-run plan accuracy (adversarial-review remediation): a file whose
+  `stat` fails at selection is now excluded from the previewed evict set and
+  tallied as skipped, instead of being counted "proven uploaded" and then
+  silently drift-skipped at apply — the destruction preview now matches what
+  `--apply` does. Fail-closed either way.
 
 ## [0.4.2] - 2026-07-07
 
