@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING — `--icloud-evict` is now a proven-subset sweep.** It evicts only the
+  files the upload-state helper individually confirms `uploaded` and
+  **skips-and-reports** the rest (never-synced files like `.DS_Store`, not-yet-uploaded
+  files, files that changed since the plan). Previously it refused the *whole*
+  directory if any single file wasn't fully uploaded — which the ever-present
+  `.DS_Store` (`not-in-icloud`) made trigger on essentially every real directory,
+  leaving directory evict unusable. **Exit-code change**: a mixed set now exits `0`
+  and prints a report instead of exiting `1` and refusing. Any script using
+  `--icloud-evict`'s exit code as an "is everything uploaded?" probe must move that
+  check to `--icloud-status` / `--icloud-sync-status`.
+
+  The per-file destruction predicate is *stronger*, not weaker: a file is evicted only
+  when (a) the batched helper emits an `uploaded` record whose path byte-matches the
+  find-derived candidate (targets are never taken from helper stdout), (b) a second
+  helper pass over exactly the chosen subset returns success, and (c) an immediate
+  pre-evict `stat` re-snapshot (type, dataless-state, size, nanosecond mtime) matches
+  the selection-time snapshot and the path is still confined under the resolved
+  CloudDocs root. Any mismatch skips that file. Both consent gates
+  (`--i-understand-data-loss-risk`, the TUI typed-path acknowledgment) are unchanged,
+  and a bare invocation previews the exact subset before `--apply`.
+
+### Tests
+- Smoke group I4 (subset-evict safety matrix): 4-file mixed matrix, reversed/surplus/
+  deficit/zero-uploaded record sets, phase-2 re-gate flip, lstat drift, multi-chunk
+  partition, non-candidate record, tab-in-filename, truncated record — every case
+  asserts on the recording `brctl` shim's log (the destructive boundary), not report
+  prose. A mutation merge gate proves that deleting any of the six safety mechanisms
+  reds a committed test (6/6). Gate: ~673 smoke assertions + 87 python tests.
+
 ## [0.4.2] - 2026-07-07
 
 A security-hardening patch: closes two arithmetic-context gaps in the

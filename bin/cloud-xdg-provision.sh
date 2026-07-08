@@ -413,9 +413,12 @@ iCloud (macOS only; paths under ~/Library/Mobile Documents/com~apple~CloudDocs):
   --icloud-download <path>  Materialize (hydrate) DATALESS files — only ADDS data, reversible.
                             Refuses (fail-closed) when the download would not leave a 1 GiB
                             free-space margin (ENOSPC jams iCloud sync).
-  --icloud-evict <path>     Free local space by evicting FULLY-UPLOADED files to dataless
-                            placeholders. Requires the compiled upload-state helper (make helper)
-                            AND --i-understand-data-loss-risk. dry-run unless --apply.
+  --icloud-evict <path>     Free local space by evicting files to dataless placeholders.
+                            Evicts ONLY files INDIVIDUALLY proven fully-uploaded; skips and
+                            reports the rest (.DS_Store, still-uploading, ...) — a mixed tree
+                            no longer refuses (exit 0 + report; probe with --icloud-status).
+                            Requires the compiled upload-state helper (make helper) AND
+                            --i-understand-data-loss-risk. dry-run unless --apply.
                             NOTE: for guaranteed space-freeing prefer the rclone offload (--offload);
                             it verifies durable upload before dropping local.
   --i-understand-data-loss-risk  Required consent for --icloud-evict (no reliable programmatic
@@ -1882,8 +1885,10 @@ ${refused}  Fix the repo (remove escaping paths; untrack managed dirs), then ret
 
 # ---------------------------------------------------------------------------
 # iCloud brctl lane (slice 5, step 9) — macOS-only. SECONDARY to the rclone --offload (which
-# verifies durable upload before dropping local). --icloud-evict is fail-closed: it evicts NOTHING
-# unless every gate passes AND the compiled helper confirms EVERY candidate is fully uploaded.
+# verifies durable upload before dropping local). --icloud-evict is fail-closed PER FILE: it
+# evicts ONLY files the compiled helper individually proves fully uploaded (and re-verifies at
+# apply time — phase-2 chunk re-gate + per-file lstat re-snapshot); every other candidate is
+# skipped and reported, never evicted. Structural failures (helper desync/truncation) still die.
 # --icloud-status is read-only; --icloud-download only ADDS data (reversible). Live iCloud is not
 # testable in smoke — brctl is invoked via run() (PATH-shimmable) and the helper via $ICLOUD_HELPER.
 # ---------------------------------------------------------------------------
@@ -2199,20 +2204,142 @@ cmd_icloud_download() {                  # $1 = path
   else info "Download (hydrate) requested for $n_dataless file(s). Delivery is asynchronous (fileproviderd); check '$SELF --icloud-sync-status' after."; fi
 }
 
-# --icloud-evict <path>: THE fail-closed gate. Evict local copies of FULLY-UPLOADED files to dataless
-# placeholders. Gates cheapest -> most-expensive; ANY fail => die, evict NOTHING. No trap flag: each
-# evict is pre-proven-uploaded AND reversible (re-download), so a mid-batch interrupt is safe.
+# --- evict-lane chunked-classify state (globals: bash 3.2 functions cannot return arrays, and
+# the aggregation MUST run in the parent shell — the repo's invariant-#4 footgun). EVICT-LOCAL:
+# deliberately NOT the SYNC_* globals — the two lanes must never share mutable join state.
+# Initialized by cmd_icloud_evict before the walk; flushed by icloud_evict_classify_chunk.
+EVICT_CHUNK=()        # pending phase-1 helper argv — a verbatim, lockstep slice of candidates[]
+EVICT_CHUNK_BYTES=0   # accumulated argv bytes for the pending chunk
+EVICT_SET=()          # proven-uploaded evict targets — paths copied from EVICT_CHUNK, NEVER from helper stdout
+EVICT_SNAP=()         # lockstep with EVICT_SET: selection-time `stat -f '%HT|%Sf|%z|%Fm'` snapshot
+EVICT_CHUNK_LEN=()    # per flushed phase-1 chunk: how many EVICT_SET entries it contributed (phase-2 partition)
+EVICT_N_WAIT=0; EVICT_N_NOTIN=0; EVICT_N_ERR=0; EVICT_N_UNANS=0; EVICT_N_DRIFT=0
+EVICT_BYTES=0         # sum of snapshot %z over EVICT_SET (potential-free display)
+EVICT_SKIP_HDR=0      # lazy header flag for the skip listing
+
+# Print one skip line (DISPLAY ONLY — no decision ever parses this output; unlike the pre-v0.4.1
+# tr|grep diagnostic, a newline embedded in a skipped filename can at worst cosmetically forge an
+# extra display line, and the evict decision never reads this surface). Capped at 20 lines per
+# reason; the per-reason overflow pointer is printed after phase 1 by cmd_icloud_evict.
+icloud_evict_report_skip() {             # $1 = reason  $2 = running count for that reason  $3 = path
+  if [ "$EVICT_SKIP_HDR" -eq 0 ]; then
+    log "  skipped (NEVER evicted — fail-closed):"
+    EVICT_SKIP_HDR=1
+  fi
+  if [ "$2" -le 20 ]; then
+    printf '    %-15s %s\n' "$1" "$3"
+  fi
+  return 0
+}
+
+# PHASE 1: flush the pending chunk through ONE helper exec; ORDER-JOIN each NUL record back to
+# EVICT_CHUNK[i] with a PATH-ECHO byte-equality assertion and a COUNT-MATCH in BOTH directions.
+# SAFETY MODEL (resolved plan conflict — security's ruling): the evict target is ALWAYS the
+# find-derived EVICT_CHUNK[i] (a verbatim lockstep slice of candidates[]); helper stdout supplies
+# STATE ONLY. The record's own path field is used exclusively as an ASSERTION (byte-equal or die):
+# any desync, forgery, or truncation kills the run before anything is selected. The batch rc does
+# not gate selection (mixed sets are NORMAL under subset semantics) — but an rc outside {0,1} is a
+# structural failure (usage error / exec failure / signal) => die. Phase 2 re-applies the audited
+# rc==0 whole-set contract over exactly the evict subset, so a bug HERE can only ever
+# UNDER-select (skip), never over-evict.
+icloud_evict_classify_chunk() {
+  [ "${#EVICT_CHUNK[@]}" -gt 0 ] || return 0
+  local hout rec state echo_path p snap sz rest i n_up hrc tab
+  tab="$(printf '\t')"
+  hout="$(mktemp "${TMPDIR:-/tmp}/xdg-icloud.XXXXXX")" || die "cannot create temp file"
+  # </dev/null: the helper must NEVER read the script's stdin (same sever as icloud_sync_flush_chunk).
+  hrc=0
+  "$ICLOUD_HELPER" ${EVICT_CHUNK[@]+"${EVICT_CHUNK[@]}"} < /dev/null > "$hout" 2>/dev/null || hrc=$?
+  case "$hrc" in
+    0|1) : ;;   # 0 = all uploaded, 1 = mixed/none — both NORMAL; selection reads the records
+    *) rm -f "$hout"
+       die "upload-state helper failed structurally (exit $hrc) — refusing to evict blind. Nothing was evicted." ;;
+  esac
+  i=0; n_up=0
+  # shellcheck disable=SC2094   # false positive: the rm -f on the die paths UNLINKS $hout (no
+  # write); dying inside the `done < $hout` loop is fine — exit closes the fd (spec §5).
+  while IFS= read -r -d '' rec; do
+    [ -z "$rec" ] && continue
+    if [ "$i" -ge "${#EVICT_CHUNK[@]}" ]; then
+      rm -f "$hout"
+      die "upload-state helper produced MORE records than argv paths (contract violation — wrong ICLOUD_HELPER?). Nothing was evicted."
+    fi
+    p="${EVICT_CHUNK[$i]}"                # the find-derived path — the ONLY evict-target source
+    state="${rec%%"$tab"*}"
+    echo_path="${rec#*"$tab"}"
+    if [ "$echo_path" != "$p" ]; then     # PATH-ECHO: byte equality, or the join is broken
+      rm -f "$hout"
+      die "upload-state helper record #$((i + 1)) does not echo its argv path (join desync — refusing to trust ANY answer). Nothing was evicted."
+    fi
+    case "$state" in
+      uploaded)
+        # Selection-time snapshot. A failed stat (vanished/unreadable since find) means no
+        # trustworthy snapshot exists — the apply-side per-file guard would drift-skip it
+        # anyway ("selection snapshot unusable"), so tally it as drift HERE instead of
+        # appending to EVICT_SET: the dry-run plan must never list a file as evictable that
+        # apply is already guaranteed to skip. Same `drift` reason as the apply guard: both
+        # are the "could not establish/confirm the selection snapshot" class. NOTE: this
+        # branch still falls through to the i increment below — the record IS consumed, so
+        # the count-match (deficit/surplus) invariants are unaffected.
+        snap="$(stat -f '%HT|%Sf|%z|%Fm' -- "$p" 2>/dev/null)" || snap=""
+        if [ -z "$snap" ]; then
+          EVICT_N_DRIFT=$((EVICT_N_DRIFT + 1))
+          icloud_evict_report_skip drift "$EVICT_N_DRIFT" "$p"
+        else
+          EVICT_SET+=("$p"); EVICT_SNAP+=("$snap")
+          rest="${snap#*|}"; rest="${rest#*|}"; sz="${rest%%|*}"
+          case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+          EVICT_BYTES=$((EVICT_BYTES + sz))
+          n_up=$((n_up + 1))
+        fi ;;
+      not-uploaded)
+        EVICT_N_WAIT=$((EVICT_N_WAIT + 1))
+        icloud_evict_report_skip not-uploaded "$EVICT_N_WAIT" "$p" ;;
+      not-in-icloud)
+        EVICT_N_NOTIN=$((EVICT_N_NOTIN + 1))
+        icloud_evict_report_skip not-in-icloud "$EVICT_N_NOTIN" "$p" ;;
+      *)
+        EVICT_N_ERR=$((EVICT_N_ERR + 1))
+        icloud_evict_report_skip helper-error "$EVICT_N_ERR" "$p" ;;
+    esac
+    i=$((i + 1))
+  done < "$hout"
+  rm -f "$hout"
+  if [ "$i" -eq 0 ]; then
+    die "upload-state helper produced no output for ${#EVICT_CHUNK[@]} candidate(s) — refusing to evict blind. Nothing was evicted."
+  fi
+  if [ "$i" -ne "${#EVICT_CHUNK[@]}" ]; then
+    die "upload-state helper answered $i of ${#EVICT_CHUNK[@]} candidate(s) (count mismatch — truncated output?). Nothing was evicted."
+  fi
+  EVICT_CHUNK_LEN+=("$n_up")
+  EVICT_CHUNK=(); EVICT_CHUNK_BYTES=0
+  return 0
+}
+
+# --icloud-evict <path>: evict local copies of files INDIVIDUALLY PROVEN fully-uploaded to
+# dataless placeholders; SKIP-AND-REPORT everything else (fail-closed PER FILE — the .DS_Store
+# wedge fix). Gates (1)-(5) unchanged. Destruction is triple-gated:
+#   phase 1 (dry-run + apply): chunked helper classify — order-join + path-echo + count-match
+#            builds EVICT_SET (targets only ever from find) + the mandatory skip report;
+#   phase 2 (apply only, per phase-1 chunk): re-exec the helper over EXACTLY that chunk's evict
+#            subset and require rc==0 (the audited all-or-nothing exit-code contract, relocated
+#            to the destroyed set) — rc!=0 => the whole chunk is skipped as drift, never evicted;
+#   per-file (apply, immediately before each brctl evict): re-confine + lstat re-snapshot
+#            byte-compare (type|flags|size|fractional-mtime) — any drift => skip+warn, never die.
+# rc: 0 = completed sweep (INCLUDING all-skipped); 1 = gate failure / structural abort.
+# No trap flag (unchanged decision): every evict is individually pre-proven uploaded AND
+# reversible (re-download), so a mid-batch interrupt is safe.
 cmd_icloud_evict() {                     # $1 = path
   begin_mutating_mode
-  icloud_guard_macos                                   # (1) macOS only
-  icloud_resolve_under_root "$1"                       # (2) under CloudDocs (+ exists)
-  icloud_require_brctl                                 # (3) brctl present
+  icloud_guard_macos                                   # (1) macOS only            (unchanged bytes)
+  icloud_resolve_under_root "$1"                       # (2) under CloudDocs       (unchanged bytes)
+  icloud_require_brctl                                 # (3) brctl present         (unchanged bytes)
   [ -x "$ICLOUD_HELPER" ] || die "upload-state helper not built ($ICLOUD_HELPER).
   Run 'make helper' (needs Xcode Command Line Tools). Without it, upload state can't be verified, so
-  evict is refused. For guaranteed space-freeing use the rclone offload: '$SELF --offload <dir>'."   # (4) graceful degrade
+  evict is refused. For guaranteed space-freeing use the rclone offload: '$SELF --offload <dir>'."   # (4) (unchanged bytes)
   [ "$ICLOUD_CONFIRM" -eq 1 ] || die "evict can lose data if 'Optimize Mac Storage' is off or files
   aren't uploaded; that OS setting has no reliable programmatic check. Re-run with
-  --i-understand-data-loss-risk to proceed. (Safer alternative: '$SELF --offload <dir>'.)"           # (5) explicit consent
+  --i-understand-data-loss-risk to proceed. (Safer alternative: '$SELF --offload <dir>'.)"           # (5) (unchanged bytes)
 
   # (6) candidate list = every NON-dataless file (dataless = already evicted, skip as a no-op).
   # bash 3.2: temp file + while-read + indexed-array append (no mapfile / no process-substitution).
@@ -2225,39 +2352,121 @@ cmd_icloud_evict() {                     # $1 = path
   rm -f "$ftmp"
   [ "${#candidates[@]}" -gt 0 ] || { info "nothing to evict (all already dataless or empty)."; return 0; }
 
-  # (7) THE UPLOAD GATE — the helper must confirm EVERY candidate uploaded (rc 0), in ONE exec.
-  # Read-only; runs in dry-run too for an accurate preview. Fail-closed: any not-uploaded/error =>
-  # evict NOTHING (covers the WHOLE set before a single evict — no per-file interleave).
-  local hout; hout="$(mktemp "${TMPDIR:-/tmp}/xdg-icloud.XXXXXX")" || die "cannot create temp file"
-  if ! "$ICLOUD_HELPER" "${candidates[@]}" > "$hout" 2>/dev/null; then
-    warn "refusing to evict — NOT every target file is confirmed fully-uploaded (fail-closed):"
-    # Display only (the DECISION above is exit-code-driven): print the BLOCKING records,
-    # filtering per NUL record. Flattening NULs to newlines BEFORE the filter (the old
-    # tr|grep) let an uploaded file with a newline in its NAME split into two display
-    # lines, and the post-newline fragment forged a fake "blocking" entry. Filtering on
-    # the whole record keeps any embedded newline inside its one (skipped) record.
-    local tab rec; tab="$(printf '\t')"
-    while IFS= read -r -d '' rec; do
-      case "$rec" in
-        ''|uploaded"$tab"*) ;;              # empty / confirmed-uploaded — not a blocker
-        *) printf '    %s\n' "$rec" >&2 ;;  # blocking record, indented
-      esac
-    done < "$hout" || true
-    rm -f "$hout"
-    die "evict aborted. Wait for iCloud upload (check '$SELF --icloud-status <path>'), or use
-  '$SELF --offload <dir>' for a verified space-free. Nothing was evicted."
+  # (7) PHASE 1 — classify + select (dry-run AND apply). The skip report is MANDATORY and prints
+  # BEFORE any evict, both modes (operator-model safety: never destroy after a silent plan).
+  log "iCloud evict under: $ICLOUD_TARGET (evicts ONLY individually-proven-uploaded files; others skipped)"
+  EVICT_CHUNK=(); EVICT_CHUNK_BYTES=0
+  EVICT_SET=(); EVICT_SNAP=(); EVICT_CHUNK_LEN=()
+  EVICT_N_WAIT=0; EVICT_N_NOTIN=0; EVICT_N_ERR=0; EVICT_N_UNANS=0; EVICT_N_DRIFT=0
+  EVICT_BYTES=0; EVICT_SKIP_HDR=0
+  local idx=0
+  while [ "$idx" -lt "${#candidates[@]}" ]; do
+    f="${candidates[$idx]}"
+    EVICT_CHUNK+=("$f")
+    EVICT_CHUNK_BYTES=$((EVICT_CHUNK_BYTES + ${#f} + 1))
+    idx=$((idx + 1))
+    if [ "$EVICT_CHUNK_BYTES" -ge "$ICLOUD_CHUNK_MAX_BYTES" ] \
+       || [ "${#EVICT_CHUNK[@]}" -ge "$ICLOUD_CHUNK_MAX_ARGS" ]; then
+      icloud_evict_classify_chunk
+    fi
+  done
+  icloud_evict_classify_chunk
+  # per-reason overflow pointers (the listing above is capped at 20 lines per reason)
+  if [ "$EVICT_N_WAIT" -gt 20 ]; then
+    printf '    ... and %d more not-uploaded (see %s --icloud-status)\n' "$((EVICT_N_WAIT - 20))" "$SELF"
   fi
-  rm -f "$hout"
+  if [ "$EVICT_N_NOTIN" -gt 20 ]; then
+    printf '    ... and %d more not-in-icloud (see %s --icloud-status)\n' "$((EVICT_N_NOTIN - 20))" "$SELF"
+  fi
+  if [ "$EVICT_N_ERR" -gt 20 ]; then
+    printf '    ... and %d more helper-error (see %s --icloud-status)\n' "$((EVICT_N_ERR - 20))" "$SELF"
+  fi
+  # phase-1 drift = selection-time snapshot-stat failures (apply-side drift is warn'd inline,
+  # uncapped, and only accrues after this point — so this pointer is phase-1-accurate).
+  if [ "$EVICT_N_DRIFT" -gt 20 ]; then
+    printf '    ... and %d more drift (see %s --icloud-status)\n' "$((EVICT_N_DRIFT - 20))" "$SELF"
+  fi
+  local n_up n_skip n_evicted=0
+  n_up="${#EVICT_SET[@]}"
+  info "evict plan: $n_up of ${#candidates[@]} candidate file(s) proven uploaded — $(icloud_fmt_bytes "$EVICT_BYTES") potential free*"
+  info "*potential: with 'Optimize Mac Storage' OFF, evict frees nothing (no programmatic check)."
 
-  # (8) EVICT (apply only; dry-run prints via run()). Per-file — 'brctl evict <dir>' is undocumented.
-  local c
-  for c in "${candidates[@]}"; do run brctl evict "$c"; done
+  # (8) EVICT. Dry-run: ledger only (run() prints, never executes — invariant #3); phase 2 and
+  # the per-file guard are apply-only (they exist to protect the mutation, and re-stat'ing a
+  # plan-only pass would just narrate a window nobody is about to use).
   if [ "$DRY_RUN" -eq 1 ]; then
-    info "[dry-run] would evict ${#candidates[@]} fully-uploaded file(s). Re-run with --apply to act."
+    local c
+    for c in ${EVICT_SET[@]+"${EVICT_SET[@]}"}; do run brctl evict "$c"; done
   else
-    info "Evicted ${#candidates[@]} fully-uploaded file(s) to dataless placeholders. Re-download with
+    local base=0 k=0 len j sub c snap now
+    while [ "$k" -lt "${#EVICT_CHUNK_LEN[@]}" ]; do
+      len="${EVICT_CHUNK_LEN[$k]}"
+      k=$((k + 1))
+      if [ "$len" -gt 0 ]; then
+        sub=(); j="$base"
+        while [ "$j" -lt $((base + len)) ]; do sub+=("${EVICT_SET[$j]}"); j=$((j + 1)); done
+        # PHASE 2 RE-GATE: the audited whole-set rc==0 contract, over EXACTLY this chunk's
+        # subset, seconds before its evict loop. </dev/null: same stdin sever as phase 1.
+        if "$ICLOUD_HELPER" ${sub[@]+"${sub[@]}"} < /dev/null > /dev/null 2>&1; then
+          j="$base"
+          while [ "$j" -lt $((base + len)) ]; do
+            c="${EVICT_SET[$j]}"; snap="${EVICT_SNAP[$j]}"; j=$((j + 1))
+            # PER-FILE GUARD (TOCTOU residue): re-confine, then one lstat carrying all four
+            # checks — type (Regular File, not a symlink swap: stat(1) uses lstat(2) by
+            # default), flags (not dataless), size, and FRACTIONAL mtime (%Fm, ns resolution:
+            # a same-second same-size rewrite cannot slip past). Byte-compare to the
+            # selection-time snapshot; the compare subsumes the type/flags checks on the
+            # CURRENT stat when the snapshot itself is a regular, non-dataless one.
+            case "$c" in
+              "$ICLOUD_TARGET"|"$ICLOUD_TARGET"/*) : ;;
+              *) EVICT_N_DRIFT=$((EVICT_N_DRIFT + 1))
+                 warn "skipped (drift): no longer under $ICLOUD_TARGET: $c"
+                 continue ;;
+            esac
+            case "$snap" in
+              "Regular File|"*) : ;;
+              *) EVICT_N_DRIFT=$((EVICT_N_DRIFT + 1))
+                 warn "skipped (drift): selection snapshot unusable: $c"
+                 continue ;;
+            esac
+            case "$snap" in
+              *dataless*)
+                 EVICT_N_DRIFT=$((EVICT_N_DRIFT + 1))
+                 warn "skipped (drift): snapshot flags dataless: $c"
+                 continue ;;
+            esac
+            now="$(stat -f '%HT|%Sf|%z|%Fm' -- "$c" 2>/dev/null)" || now=""
+            if [ -z "$now" ] || [ "$now" != "$snap" ]; then
+              EVICT_N_DRIFT=$((EVICT_N_DRIFT + 1))
+              warn "skipped (drift): file changed since plan (type/flags/size/mtime): $c"
+              continue
+            fi
+            run brctl evict "$c"
+            n_evicted=$((n_evicted + 1))
+          done
+        else
+          EVICT_N_DRIFT=$((EVICT_N_DRIFT + len))
+          warn "skipped $len file(s): upload state changed since plan (phase-2 re-check failed for this chunk) — re-run to retry."
+        fi
+      fi
+      base=$((base + len))
+    done
+  fi
+
+  # Machine-stable summary line (smoke greps this exact shape). Printed AFTER the evict loop so
+  # the drift count is real: drift accrues in phase 1 (selection-time snapshot-stat failure,
+  # both modes) AND — apply only — in the evict loop (phase-2 re-gate refusal, per-file guard).
+  # `unanswered` is reserved: under the die-on-count-mismatch design it is structurally 0, and it
+  # stays in the line so the shape never changes if a future ruling downgrades deficit to skip.
+  n_skip=$((EVICT_N_WAIT + EVICT_N_NOTIN + EVICT_N_ERR + EVICT_N_UNANS + EVICT_N_DRIFT))
+  info "skipped: $n_skip file(s) — not-uploaded: $EVICT_N_WAIT, not-in-icloud: $EVICT_N_NOTIN, helper-error: $EVICT_N_ERR, unanswered: $EVICT_N_UNANS, drift: $EVICT_N_DRIFT"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "[dry-run] would evict the $n_up proven-uploaded file(s) above ($n_skip skipped). Re-run with --apply."
+  else
+    info "Evicted $n_evicted of $n_up proven-uploaded file(s) to dataless placeholders ($n_skip skipped). Re-download with
   '$SELF --icloud-download <path>' or by opening them."
   fi
+  return 0
 }
 
 # ---------------------------------------------------------------------------
