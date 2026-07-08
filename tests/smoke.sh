@@ -3364,6 +3364,23 @@ assert_contains "${out}" "[run]  rm -rf ~/Library/Caches/Homebrew/downloads/*" "
 if [ -e "${r5npx}/abc123" ]; then fail "apply left ~/.npm/_npx contents behind (the live-found 413M case)"; else ok "apply cleared ~/.npm/_npx contents"; fi
 if [ -e "${r5brew}/bottle.tar.gz" ]; then fail "apply left the brew bottle tarball behind (the live-found 203M case)"; else ok "apply cleared Homebrew downloads/ contents"; fi
 if [ -d "${r5npx}" ] && [ -d "${r5brew}" ]; then ok "apply kept the _npx and downloads/ parent dirs (contents-only sweep)"; else fail "apply removed a parent dir (must clear contents only, like DerivedData)"; fi
+# (c) SECURITY (swapped-symlink cache dir): if ~/.npm/_npx has been replaced by a
+# symlink (e.g. by a malicious postinstall that legitimately writes ~/.npm), the
+# contents-only sweep must NOT follow it into the target — `[ -d link ]` is true
+# for a symlink-to-dir, so without the `! -L` guard `rm -rf link/*` would wipe the
+# TARGET's contents. The symlinked dir is skipped silently: victim survives, exit 0.
+r5victim="${sandbox}/r5-victim"
+mkdir -p "${r5victim}"
+echo precious > "${r5victim}/sentinel.txt"
+rm -rf "${r5npx}"
+ln -s "${r5victim}" "${r5npx}"                     # the swapped cache dir
+set +e; out="$(r5run --reclaim "${r5h}/sweep" --global --apply 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "--global apply with a symlinked _npx exits 0 (skip is silent, not an error)" \
+  "--global apply failed on a symlinked _npx (exit ${rc}): ${out}"
+if [ -e "${r5victim}/sentinel.txt" ]; then ok "symlinked _npx was skipped — the victim's sentinel survives"; \
+  else fail "SECURITY: sweep followed the symlinked _npx and wiped the victim dir"; fi
+if [ -L "${r5npx}" ]; then ok "the symlink itself is left in place (skipped, not deleted)"; \
+  else fail "sweep removed the symlinked _npx entry itself"; fi
 
 # ===========================================================================
 # Group F2: home-tree.sh rclone filter — EVERY exclude line is asserted, plus

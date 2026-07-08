@@ -2651,11 +2651,12 @@ reclaim_global_caches() {
   # the bottle tarballs in downloads/). Contents-only rm — the parent dirs survive so
   # npx/brew re-populate them; both are regenerable (npx re-fetches, brew re-downloads).
   local nx="$HOME/.npm/_npx"
-  [ -d "$nx" ] && { printf '  [%s]  rm -rf ~/.npm/_npx/* (%s)\n' "$drun" "$(reclaim_size "$nx")"; [ "$DRY_RUN" -eq 0 ] && rm -rf "${nx:?}"/* 2>/dev/null; }
+  # `! -L`: a cache dir swapped for a symlink must not redirect the `rm -rf dir/*` into its target — skip it (destruction-lane invariant, mirrors the evict lane).
+  [ -d "$nx" ] && [ ! -L "$nx" ] && { printf '  [%s]  rm -rf ~/.npm/_npx/* (%s)\n' "$drun" "$(reclaim_size "$nx")"; [ "$DRY_RUN" -eq 0 ] && rm -rf "${nx:?}"/* 2>/dev/null; }
   local bd="$HOME/Library/Caches/Homebrew/downloads"
-  [ -d "$bd" ] && { printf '  [%s]  rm -rf ~/Library/Caches/Homebrew/downloads/* (%s)\n' "$drun" "$(reclaim_size "$bd")"; [ "$DRY_RUN" -eq 0 ] && rm -rf "${bd:?}"/* 2>/dev/null; }
+  [ -d "$bd" ] && [ ! -L "$bd" ] && { printf '  [%s]  rm -rf ~/Library/Caches/Homebrew/downloads/* (%s)\n' "$drun" "$(reclaim_size "$bd")"; [ "$DRY_RUN" -eq 0 ] && rm -rf "${bd:?}"/* 2>/dev/null; }
   local dd="$HOME/Library/Developer/Xcode/DerivedData"
-  [ -d "$dd" ] && { printf '  [%s]  rm -rf ~/Library/Developer/Xcode/DerivedData/* (%s)\n' "$drun" "$(reclaim_size "$dd")"; [ "$DRY_RUN" -eq 0 ] && rm -rf "${dd:?}"/* 2>/dev/null; }
+  [ -d "$dd" ] && [ ! -L "$dd" ] && { printf '  [%s]  rm -rf ~/Library/Developer/Xcode/DerivedData/* (%s)\n' "$drun" "$(reclaim_size "$dd")"; [ "$DRY_RUN" -eq 0 ] && rm -rf "${dd:?}"/* 2>/dev/null; }
   local gc="$HOME/.gradle/caches"
   [ -d "$gc" ] && { printf '  [%s]  rm -rf ~/.gradle/caches (%s)\n' "$drun" "$(reclaim_size "$gc")"; [ "$DRY_RUN" -eq 0 ] && rm -rf "${gc:?}" 2>/dev/null; }
   return 0
