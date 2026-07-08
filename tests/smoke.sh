@@ -2244,10 +2244,13 @@ if [ "$(uname -s)" = "Darwin" ]; then
   assert_nonzero "${rc}" "evict without the upload-state helper is refused"
   assert_contains "${out}" "make helper" "the helper-absent refusal tells the user to build it"
   assert_contains "${out}" "--offload" "the helper-absent refusal points at the safer rclone offload"
-  # (d) THE fail-closed gate: helper reports not-uploaded → refuse, evict NOTHING.
+  # (d) subset semantics (skip-and-report default): helper reports EVERY file not-uploaded →
+  #     rc 0 with the mandatory skip report, and evict NOTHING (fail-closed per file).
   set +e; out="$(ICLOUD_HELPER="${i1no}" i1run --icloud-evict "${i1cd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
-  assert_nonzero "${rc}" "evict is refused when the helper reports a file not-uploaded (fail-closed)"
-  assert_contains "${out}" "fail-closed" "the refusal states it is fail-closed"
+  pass_if "${rc}" "all-not-uploaded evict completes with rc 0 (skip-and-report, not refusal)" "all-not-uploaded evict failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "skipped (NEVER evicted — fail-closed):" "the skip listing header prints"
+  assert_contains "${out}" "not-uploaded: 2, not-in-icloud: 0, helper-error: 0, unanswered: 0, drift: 0" "the summary line tallies both files not-uploaded"
+  assert_contains "${out}" "evict plan: 0 of 2" "the evict plan reports 0 of 2 proven uploaded"
   if [ -s "${sandbox}/brctl.log" ] && grep -q evict "${sandbox}/brctl.log"; then fail "DATA LOSS: brctl evict was called despite a not-uploaded file"; else ok "brctl evict was NOT called on the not-uploaded set (evicted NOTHING)"; fi
   # (e) dry-run (helper OK) → previews, calls NO evict.
   : > "${sandbox}/brctl.log"
@@ -2295,11 +2298,14 @@ exit 0
 SH
   chmod +x "${i2ok}"
   i2mix="${sandbox}/i2-helper-mixed"
+  # Position-keyed: FIRST argv arg uploaded, the rest not. rc mirrors the real helper (0 iff
+  # every arg uploaded) so the stub self-consistently answers the phase-2 n=1 subset re-exec
+  # (single argv = first arg = uploaded = exit 0).
   cat > "${i2mix}" <<'SH'
 #!/bin/bash
-i=0
-for p; do i=$((i + 1)); if [ "$i" = 1 ]; then printf 'uploaded\t%s\0' "$p"; else printf 'not-uploaded\t%s\0' "$p"; fi; done
-exit 1
+i=0; rc=0
+for p; do i=$((i + 1)); if [ "$i" = 1 ]; then printf 'uploaded\t%s\0' "$p"; else printf 'not-uploaded\t%s\0' "$p"; rc=1; fi; done
+exit "$rc"
 SH
   chmod +x "${i2mix}"
   i2err="${sandbox}/i2-helper-err"
@@ -2328,11 +2334,15 @@ SH
   assert_contains "${out}" "brctl not found" "the brctl-absent refusal explains brctl is required"
   if grep -q evict "${i2log}" 2>/dev/null; then fail "DATA LOSS: an evict was recorded despite brctl being absent"; else ok "brctl-absent path evicted NOTHING"; fi
 
-  # (i) MIXED set (first uploaded, second not) → die, ZERO evict (whole set checked before any evict).
+  # (i) MIXED set (position-keyed: first argv arg uploaded, second not) → rc 0, evict EXACTLY
+  #     the one proven-uploaded file (subset semantics). Count-based assert only — find order
+  #     is not guaranteed, so WHICH basename got the 'uploaded' answer is not asserted.
   rm -f "${i2cd:?}"/*; printf '1\n' > "${i2cd}/f1"; printf '2\n' > "${i2cd}/f2"; : > "${i2log}"
   set +e; out="$(ICLOUD_HELPER="${i2mix}" i2run --icloud-evict "${i2cd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
-  assert_nonzero "${rc}" "evict is refused when the helper reports a MIXED (one not-uploaded) set"
-  if grep -q evict "${i2log}" 2>/dev/null; then fail "DATA LOSS: evicted despite a mixed not-uploaded set (per-file interleave)"; else ok "mixed set evicted NOTHING (whole set gated before any evict)"; fi
+  pass_if "${rc}" "mixed-set evict completes with rc 0 (skip-and-report subset semantics)" "mixed-set evict failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "not-uploaded: 1" "the not-uploaded file is tallied in the summary line"
+  i2me="$(grep -c '^evict ' "${i2log}" 2>/dev/null || printf 0)"
+  if [ "${i2me}" -eq 1 ]; then ok "mixed set evicted EXACTLY the one proven-uploaded file (1 brctl evict)"; else fail "mixed set expected exactly 1 brctl evict, got ${i2me}: $(cat "${i2log}" 2>/dev/null)"; fi
 
   # (j) helper ERROR (exit 2, no output) → die, ZERO evict.
   : > "${i2log}"
@@ -2340,11 +2350,10 @@ SH
   assert_nonzero "${rc}" "evict is refused when the helper errors"
   if grep -q evict "${i2log}" 2>/dev/null; then fail "DATA LOSS: evicted despite a helper error"; else ok "helper-error evicted NOTHING"; fi
 
-  # (j2) REFUSAL DIAGNOSTIC is NUL-record-aware: an UPLOADED file whose name embeds a
-  #      newline must NOT forge a fake "blocking" line in the operator-facing list (the
-  #      old tr|grep flattened NULs to newlines BEFORE filtering, so the post-newline
-  #      fragment leaked). The real blocker must still be listed. Display-only: the
-  #      refusal itself (helper exit 1) and zero-evict are asserted like (i)/(j).
+  # (j2) NEWLINE-FORGERY helper → PATH-ECHO die. The record's echoed path (which embeds a
+  #      newline + a forged second record) is byte-compared to the argv path; any inequality
+  #      kills the run before anything is selected (the old display-filter surface is gone).
+  #      Zero evicts, and the forged path never reaches brctl.
   i2forge="${sandbox}/i2-helper-forge"
   cat > "${i2forge}" <<'SH'
 #!/bin/bash
@@ -2354,10 +2363,10 @@ SH
   chmod +x "${i2forge}"
   : > "${i2log}"
   set +e; out="$(ICLOUD_HELPER="${i2forge}" i2run --icloud-evict "${i2cd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
-  assert_nonzero "${rc}" "evict is refused on the newline-forgery helper set (exit-code gate unaffected)"
-  assert_contains "${out}" "/real-blocker" "the genuine blocking record is listed in the diagnostic"
-  assert_not_contains "${out}" "/forged-blocker" "the newline fragment inside an UPLOADED record forges NO blocking line"
-  if grep -q evict "${i2log}" 2>/dev/null; then fail "DATA LOSS: evicted despite the forgery-set refusal"; else ok "forgery-set refusal evicted NOTHING"; fi
+  assert_nonzero "${rc}" "the newline-forgery helper set dies (path-echo assertion, fail-closed)"
+  assert_contains "${out}" "does not echo its argv path" "the die names the path-echo join desync"
+  if grep -q evict "${i2log}" 2>/dev/null; then fail "DATA LOSS: evicted despite the forgery-set die"; else ok "forgery-set die evicted NOTHING"; fi
+  if grep -q '/forged-blocker' "${i2log}" 2>/dev/null; then fail "DATA LOSS: the forged path reached brctl"; else ok "the forged path never reached brctl"; fi
 
   # (k) DATALESS-SKIP: a stat-shim reports one file dataless (icloud_is_dataless reads `stat -f %Sf`),
   #     so a dir with [dataless + uploaded] evicts ONLY the uploaded, non-dataless file.
@@ -2402,7 +2411,9 @@ SH
   pass_if "${rc}" "icloud-download --apply exits 0 (no helper needed)" "download failed (exit ${rc}): ${out}"
   i2dn="$(grep -c download "${i2log}" 2>/dev/null || printf 0)"
   if [ "${i2dn}" -eq 2 ]; then ok "download called brctl download once per dataless file (add-only, 2)"; else fail "expected 2 brctl download calls, got ${i2dn}"; fi
-  if grep -q evict "${i2log}" 2>/dev/null; then fail "download called brctl EVICT (must be add-only)"; else ok "download called NO evict (add-only)"; fi
+  # Anchored '^evict ': the logged download PATHS may themselves contain the substring
+  # "evict" (e.g. a worktree named feat-bulk-evict) — only the command word counts.
+  if grep -q '^evict ' "${i2log}" 2>/dev/null; then fail "download called brctl EVICT (must be add-only)"; else ok "download called NO evict (add-only)"; fi
 
   # (m) mode mutual-exclusion: two modes in one invocation → refused.
   set +e; out="$(i2run --icloud-evict "${i2cd}" --icloud-status "${i2cd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
@@ -2743,7 +2754,7 @@ tail_UP"
   : > "${i3log}"
   set +e; out="$(ICLOUD_HELPER="${i3help}" i3run --icloud-evict "${i3nle}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
   pass_if "${rc}" "evict --apply exits 0 on a newline-in-filename fixture (gate sees the whole path)" "newline evict failed (exit ${rc}): ${out}"
-  assert_contains "${out}" "Evicted 1 fully-uploaded file(s)" "evict counted ONE candidate (no split)"
+  assert_contains "${out}" "Evicted 1 of 1 proven-uploaded file(s)" "evict counted ONE candidate (no split)"
   i3nlc="$(grep -c '^evict ' "${i3log}" 2>/dev/null || printf 0)"
   if [ "${i3nlc}" -eq 1 ] && grep -qxF "tail_UP" "${i3log}"; then ok "evict issued ONE brctl call with the full newline path (no split)"; else fail "newline path split before brctl evict — recorded: $(cat "${i3log}" 2>/dev/null)"; fi
   # helper-STDOUT order-join across an embedded newline (only testable now the helper's
@@ -2813,6 +2824,99 @@ SH
   assert_contains "${out}" "ICLOUD_CHUNK_MAX_BYTES must be <= 1073741824" "the bytes-cap ceiling refusal names the var and the bound"
 else
   echo "smoke: I3 iCloud resolver/sync-status/download gate — SKIPPED (macOS-only; uname=$(uname -s))"
+fi
+
+# --- I4 (bulk evict): subset-evict safety matrix — P0 rows only (CODE-phase verification;
+#     the test-engineer extends this group per docs/architecture/bulk-evict-diff.md §4.2).
+#     Same mock model as I1-I3: sandbox HOME + CloudDocs tree, recording brctl PATH-shim
+#     ($BRCTL_LOG), basename-keyed ICLOUD_HELPER stub echoing the FULL argv path per NUL
+#     record, exit 0 iff every arg uploaded (the real helper's contract). macOS-gated;
+#     NEVER real brctl/iCloud. ---
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo "smoke: I4 — bulk evict subset semantics (P0: skip-and-report matrix, inverted forgery, count-deficit)"
+  i4h="${sandbox}/i4-home"; i4cd="${i4h}/Library/Mobile Documents/com~apple~CloudDocs/td"; mkdir -p "${i4cd}"
+  i4log="${sandbox}/i4-brctl.log"
+  i4shim="${sandbox}/i4-shim"; mkdir -p "${i4shim}"
+  cat > "${i4shim}/brctl" <<'SH'
+#!/bin/bash
+printf '%s\n' "$*" >> "$BRCTL_LOG"
+exit 0
+SH
+  chmod +x "${i4shim}/brctl"
+  i4help="${sandbox}/i4-helper"
+  cat > "${i4help}" <<'SH'
+#!/bin/bash
+rc=0
+for p; do
+  b="${p##*/}"
+  case "$b" in
+    *_UP*)              printf 'uploaded\t%s\0' "$p" ;;
+    *_WAIT*)            printf 'not-uploaded\t%s\0' "$p"; rc=1 ;;
+    .DS_Store|*_NOTIN*) printf 'not-in-icloud\t%s\0' "$p"; rc=1 ;;
+    *)                  printf 'error\t%s\0' "$p"; rc=1 ;;
+  esac
+done
+exit "$rc"
+SH
+  chmod +x "${i4help}"
+  i4run() { PATH="${i4shim}:${PATH}" BRCTL_LOG="${i4log}" HOME="${i4h}" \
+    XDG_CONFIG_HOME="${i4h}/.config" XDG_CACHE_HOME="${i4h}/.cache" /bin/bash "${PROV}" "$@"; }
+
+  # (a) P0 LOAD-BEARING: 1 uploaded + 3 distinct skip reasons → rc 0, EXACTLY the proven
+  #     file evicted, machine-stable summary line tallies every reason.
+  printf 'u\n' > "${i4cd}/f_UP"; printf 'w\n' > "${i4cd}/f_WAIT"
+  printf 'd\n' > "${i4cd}/.DS_Store"; printf 'e\n' > "${i4cd}/f_ERRX"
+  : > "${i4log}"
+  set +e; out="$(ICLOUD_HELPER="${i4help}" i4run --icloud-evict "${i4cd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "mixed 4-file tree completes with rc 0 (skip-and-report)" "mixed-tree evict failed (exit ${rc}): ${out}"
+  i4ne="$(grep -c '^evict ' "${i4log}" 2>/dev/null || printf 0)"
+  if [ "${i4ne}" -eq 1 ] && grep -qF 'f_UP' "${i4log}" && ! grep -qF 'f_WAIT' "${i4log}" && ! grep -qF '.DS_Store' "${i4log}"; then ok "exactly the proven-uploaded file was evicted (1 brctl call, f_UP only)"; else fail "wrong evict set — recorded: $(cat "${i4log}" 2>/dev/null)"; fi
+  assert_contains "${out}" "skipped: 3 file(s) — not-uploaded: 1, not-in-icloud: 1, helper-error: 1, unanswered: 0, drift: 0" "the summary line tallies every skip reason"
+  assert_contains "${out}" "evict plan: 1 of 4" "the evict plan reports 1 of 4 proven uploaded"
+
+  # (c) P0 INVERTED FORGERY: a SKIPPED record's echoed path embeds a newline + a forged
+  #     'uploaded' record for a victim → path-echo die; the victim never reaches brctl.
+  i4forge="${sandbox}/i4-helper-forge"
+  cat > "${i4forge}" <<'SH'
+#!/bin/bash
+rc=0
+for p; do
+  b="${p##*/}"
+  case "$b" in
+    *_UP*)   printf 'uploaded\t%s\0' "$p" ;;
+    *_WAIT*) printf 'not-uploaded\t%s\nuploaded\t/i4-forged-victim\0' "$p"; rc=1 ;;
+    *)       printf 'not-in-icloud\t%s\0' "$p"; rc=1 ;;
+  esac
+done
+exit "$rc"
+SH
+  chmod +x "${i4forge}"
+  : > "${i4log}"
+  set +e; out="$(ICLOUD_HELPER="${i4forge}" i4run --icloud-evict "${i4cd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "the inverted newline-forgery dies (path-echo assertion)"
+  assert_contains "${out}" "does not echo its argv path" "the die names the path-echo join desync"
+  if grep -q evict "${i4log}" 2>/dev/null; then fail "DATA LOSS: evicted despite the inverted-forgery die"; else ok "inverted-forgery die evicted NOTHING"; fi
+  if grep -qF '/i4-forged-victim' "${i4log}" 2>/dev/null; then fail "DATA LOSS: the forged victim path reached brctl"; else ok "the forged victim path never reached brctl"; fi
+
+  # (e) P0 COUNT-DEFICIT: the helper answers only argv[0] (honest record) then exits — the
+  #     count-match dies in the deficit direction (lead ruling F1: a wrong count means the
+  #     whole helper run is untrustworthy; no skip-and-continue).
+  i4defi="${sandbox}/i4-helper-deficit"
+  cat > "${i4defi}" <<'SH'
+#!/bin/bash
+printf 'uploaded\t%s\0' "$1"
+exit 1
+SH
+  chmod +x "${i4defi}"
+  i4dd="${i4cd}/defi"; mkdir -p "${i4dd}"
+  printf 'a\n' > "${i4dd}/a_UP"; printf 'b\n' > "${i4dd}/b_UP"
+  : > "${i4log}"
+  set +e; out="$(ICLOUD_HELPER="${i4defi}" i4run --icloud-evict "${i4dd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "a record deficit dies (count-match, deficit direction)"
+  assert_contains "${out}" "answered 1 of 2" "the die reports the answered/candidate counts"
+  if grep -q evict "${i4log}" 2>/dev/null; then fail "DATA LOSS: evicted despite the count deficit"; else ok "count-deficit die evicted NOTHING (answered prefix NOT trusted)"; fi
+else
+  echo "smoke: I4 bulk evict subset semantics — SKIPPED (macOS-only; uname=$(uname -s))"
 fi
 
 # ===========================================================================
