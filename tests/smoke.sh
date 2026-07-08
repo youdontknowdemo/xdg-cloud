@@ -2869,7 +2869,7 @@ SH
   : > "${i4log}"
   set +e; out="$(ICLOUD_HELPER="${i4help}" i4run --icloud-evict "${i4cd}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
   pass_if "${rc}" "mixed 4-file tree completes with rc 0 (skip-and-report)" "mixed-tree evict failed (exit ${rc}): ${out}"
-  i4ne="$(grep -c '^evict ' "${i4log}" 2>/dev/null || printf 0)"
+  i4ne="$(grep -c '^evict ' "${i4log}" || true)"
   if [ "${i4ne}" -eq 1 ] && grep -qF 'f_UP' "${i4log}" && ! grep -qF 'f_WAIT' "${i4log}" && ! grep -qF '.DS_Store' "${i4log}"; then ok "exactly the proven-uploaded file was evicted (1 brctl call, f_UP only)"; else fail "wrong evict set — recorded: $(cat "${i4log}" 2>/dev/null)"; fi
   assert_contains "${out}" "skipped: 3 file(s) — not-uploaded: 1, not-in-icloud: 1, helper-error: 1, unanswered: 0, drift: 0" "the summary line tallies every skip reason"
   assert_contains "${out}" "evict plan: 1 of 4" "the evict plan reports 1 of 4 proven uploaded"
@@ -2936,7 +2936,7 @@ SH
   pass_if "${rc}" "dry-run of the 4-file matrix completes with rc 0" "dry-run matrix failed (exit ${rc}): ${out}"
   if [ -s "${i4log}" ]; then fail "dry-run made a brctl call: $(cat "${i4log}")"; else ok "dry-run made ZERO brctl calls"; fi
   assert_contains "${out}" "evict plan: 1 of 4" "dry-run plans 1 of 4 proven uploaded"
-  assert_contains "${out}" "skipped: 3 file(s) — not-uploaded: 1, not-in-icloud: 1, helper-error: 1, unanswered: 0, drift: 0" "dry-run summary line tallies every reason (drift 0 by definition)"
+  assert_contains "${out}" "skipped: 3 file(s) — not-uploaded: 1, not-in-icloud: 1, helper-error: 1, unanswered: 0, drift: 0" "dry-run summary line tallies every reason (no drift in this fixture)"
   assert_contains "${out}" "[dry-run] would evict the 1 proven-uploaded" "dry-run trailer names the planned count"
   i4exp="$(printf '    %-15s %s' not-uploaded "${i4bd}/mb_WAIT")"
   assert_contains "${out}" "${i4exp}" "skip listing names the not-uploaded file by reason"
@@ -3166,6 +3166,60 @@ SH
   assert_nonzero "${rc}" "a truncated final record dies (dropped record -> count deficit)"
   assert_contains "${out}" "answered 1 of 2" "the truncated record is DROPPED, not salvaged"
   if grep -q evict "${i4log}" 2>/dev/null; then fail "DATA LOSS: evicted despite the truncated-record die"; else ok "truncated-record die evicted NOTHING"; fi
+
+  # (m) SELECTION-TIME STAT FAILURE (PR #51 remediation pin): a file classifies `uploaded`
+  #     but its phase-1 snapshot stat fails → it must NOT be planned/ledgered as evictable
+  #     and is tallied as drift (the same "no trustworthy snapshot" class the apply-side
+  #     per-file guard uses) — the dry-run plan matches what apply would do. The stat shim
+  #     fails ONLY the snapshot-format stat ('%HT|%Sf|%z|%Fm') of *_STATFAIL* basenames;
+  #     icloud_is_dataless ('%Sf') and every other stat call exec the real /usr/bin/stat,
+  #     so the file is a perfectly normal candidate in every other respect.
+  i4md="${i4root}/i4m"; mkdir -p "${i4md}"
+  printf 'g\n' > "${i4md}/sg_UP"; printf 's\n' > "${i4md}/sm_STATFAIL_UP"
+  i4stshim="${sandbox}/i4-stat-shim"; mkdir -p "${i4stshim}"
+  cat > "${i4stshim}/stat" <<'ST'
+#!/bin/bash
+if [ "$1" = "-f" ] && [ "$2" = "%HT|%Sf|%z|%Fm" ]; then
+  case "${!#}" in *_STATFAIL*) exit 1 ;; esac
+fi
+exec /usr/bin/stat "$@"
+ST
+  chmod +x "${i4stshim}/stat"
+  i4mrun() { PATH="${i4stshim}:${i4shim}:${PATH}" BRCTL_LOG="${i4log}" HOME="${i4h}" \
+    XDG_CONFIG_HOME="${i4h}/.config" XDG_CACHE_HOME="${i4h}/.cache" /bin/bash "${PROV}" "$@"; }
+  : > "${i4log}"
+  set +e; out="$(ICLOUD_HELPER="${i4help}" i4mrun --icloud-evict "${i4md}" --i-understand-data-loss-risk 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "selection-stat-fail dry-run completes with rc 0 (record consumed — count-match still balances)" "selection-stat-fail dry-run failed (exit ${rc}): ${out}"
+  assert_contains "${out}" "evict plan: 1 of 2" "the stat-failed file is NOT counted as proven uploaded"
+  assert_contains "${out}" "skipped: 1 file(s) — not-uploaded: 0, not-in-icloud: 0, helper-error: 0, unanswered: 0, drift: 1" "the dry-run summary tallies the stat-failed file as drift"
+  i4exp="$(printf '    %-15s %s' drift "${i4md}/sm_STATFAIL_UP")"
+  assert_contains "${out}" "${i4exp}" "the skip listing names the stat-failed file under drift"
+  i4led="$(printf '%s\n' "${out}" | grep 'brctl evict' || true)"
+  assert_contains "${i4led}" "sg_UP" "the dry-run ledger previews the healthy uploaded file"
+  assert_not_contains "${i4led}" "sm_STATFAIL_UP" "the dry-run ledger does NOT list the stat-failed file as evictable"
+  # apply on the same fixture: the plan holds byte-for-byte — healthy file evicted, the
+  # stat-failed file never reaches brctl (dry-run preview == apply destruction set).
+  : > "${i4log}"
+  set +e; out="$(ICLOUD_HELPER="${i4help}" i4mrun --icloud-evict "${i4md}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  pass_if "${rc}" "selection-stat-fail apply completes with rc 0" "selection-stat-fail apply failed (exit ${rc}): ${out}"
+  i4ne="$(grep -c '^evict ' "${i4log}" || true)"
+  if [ "${i4ne}" -eq 1 ] && grep -qF 'sg_UP' "${i4log}" && ! grep -qF 'sm_STATFAIL_UP' "${i4log}"; then ok "apply destroyed EXACTLY the dry-run-planned subset (sg_UP only; the stat-failed file never reached brctl)"; else fail "apply set != dry-run plan with a stat-failed member — recorded: $(cat "${i4log}" 2>/dev/null)"; fi
+  assert_contains "${out}" "drift: 1" "apply tallies the stat-failed file as drift"
+  assert_contains "${out}" "Evicted 1 of 1 proven-uploaded" "the trailer reports 1 of 1 planned (the stat-failed file was never planned)"
+
+  # (m2) count-match integrity THROUGH a stat-failed record (deterministic single-file
+  #      fixture, surplus helper): the stat-failed `uploaded` record must still be CONSUMED
+  #      (i++), so the helper's extra forged record trips the MORE-records surplus die — not
+  #      a path-echo desync — and nothing is evicted. (The deficit direction is pinned by
+  #      row (m) itself: rc 0 there proves both records were consumed — an unconsumed
+  #      stat-fail record would have died "answered 1 of 2".)
+  i4m2="${i4root}/i4m2"; mkdir -p "${i4m2}"
+  printf 'q\n' > "${i4m2}/s2_STATFAIL_UP"
+  : > "${i4log}"
+  set +e; out="$(ICLOUD_HELPER="${i4sur}" i4mrun --icloud-evict "${i4m2}" --i-understand-data-loss-risk --apply 2>&1)"; rc=$?; set -e
+  assert_nonzero "${rc}" "the surplus die still fires when the honest record's file stat-fails"
+  assert_contains "${out}" "MORE records" "the die is the count surplus, NOT a join desync (the stat-failed record was consumed first)"
+  if grep -q evict "${i4log}" 2>/dev/null; then fail "DATA LOSS: evicted despite the surplus die (stat-fail variant)"; else ok "surplus die (stat-fail variant) evicted NOTHING"; fi
 else
   echo "smoke: I4 bulk evict subset semantics — SKIPPED (macOS-only; uname=$(uname -s))"
 fi

@@ -141,12 +141,21 @@ icloud_evict_classify_chunk() {
     fi
     case "$state" in
       uploaded)
+        # AS-BUILT (review remediation): if the selection-time stat FAILS (snap=""), do NOT
+        # add the file to the plan — tally it as `drift` and skip it, so the dry-run plan
+        # matches what apply does (the apply-side guard would drift-skip an empty snapshot
+        # anyway; counting it as "proven uploaded" here would over-promise the destruction
+        # preview). Path-echo + i++ already ran above, so count-match stays balanced.
         snap="$(stat -f '%HT|%Sf|%z|%Fm' -- "$p" 2>/dev/null)" || snap=""
-        EVICT_SET+=("$p"); EVICT_SNAP+=("$snap")
-        rest="${snap#*|}"; rest="${rest#*|}"; sz="${rest%%|*}"
-        case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
-        EVICT_BYTES=$((EVICT_BYTES + sz))
-        n_up=$((n_up + 1)) ;;
+        if [ -z "$snap" ]; then
+          EVICT_N_DRIFT=$((EVICT_N_DRIFT + 1)); icloud_evict_report_skip drift "$p"
+        else
+          EVICT_SET+=("$p"); EVICT_SNAP+=("$snap")
+          rest="${snap#*|}"; rest="${rest#*|}"; sz="${rest%%|*}"
+          case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+          EVICT_BYTES=$((EVICT_BYTES + sz))
+          n_up=$((n_up + 1))
+        fi ;;
       not-uploaded)
         EVICT_N_WAIT=$((EVICT_N_WAIT + 1))
         icloud_evict_report_skip not-uploaded "$EVICT_N_WAIT" "$p" ;;
@@ -286,6 +295,15 @@ cmd_icloud_evict() {                     # $1 = path
             # a same-second same-size rewrite cannot slip past). Byte-compare to the
             # selection-time snapshot; the compare subsumes the type/flags checks on the
             # CURRENT stat when the snapshot itself is a regular, non-dataless one.
+            # SCOPE (review-noted, accepted residue): this re-confine `case` compares the
+            # unchanged find-derived string against $ICLOUD_TARGET — it guards against $c
+            # itself being corrupted, NOT against an INTERMEDIATE directory in the path being
+            # swapped to a symlink after selection (the lstat only stats the final component).
+            # A same-user attacker could stage a metadata-identical decoy in that window
+            # (touch -r replicates %Fm) to redirect the evict — but a same-user attacker can
+            # destroy data directly without this tool, and phase-2 rc==0 seconds earlier plus
+            # the ns-mtime compare narrow the window. Accepted under the consent gate; the
+            # true fix is the verb-taking helper (evictUbiquitousItem), recorded as future work.
             case "$c" in
               "$ICLOUD_TARGET"|"$ICLOUD_TARGET"/*) : ;;
               *) EVICT_N_DRIFT=$((EVICT_N_DRIFT + 1))
@@ -503,9 +521,10 @@ stateful stubs must write their call-count file under `${sandbox}`, not `/tmp`.
   blocks and explicit `return 0`.
 - **stat discipline**: one `stat -f '%HT|%Sf|%z|%Fm' -- "$p"` call carries all four guard
   checks (research-verified: `%Fm` is ns-resolution fractional mtime; `stat(1)` is `lstat(2)`
-  by default so a symlink swap prints `Symbolic Link`, never follows). `%Sf` may be EMPTY for a
-  plain file (`Regular File||4|…`) — the byte-compare and the `Regular File|` /
-  `*dataless*` case patterns are all safe on the empty field; the `%z` extraction is the
+  by default so a symlink swap prints `Symbolic Link`, never follows). `%Sf` prints `-` (a dash,
+  NOT empty) for a flag-less plain file (`Regular File|-|4|…`, verified on macOS 15.7.8) — the
+  byte-compare is symmetric (same format both sides, so dash-vs-empty cannot falsely match within
+  a run) and the `Regular File|` / `*dataless*` case patterns are safe either way; the `%z` extraction is the
   two-step `#*|` strip + `%%|*`, numeric-validated before arithmetic. Snapshot failure ⇒
   `snap=""` ⇒ the guard skips the file as drift (never evict on an unknown snapshot).
 - **Phase-1 rc handling**: `|| hrc=$?` then `case` — rc 0/1 are normal (selection reads

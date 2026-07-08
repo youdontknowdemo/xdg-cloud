@@ -1885,8 +1885,10 @@ ${refused}  Fix the repo (remove escaping paths; untrack managed dirs), then ret
 
 # ---------------------------------------------------------------------------
 # iCloud brctl lane (slice 5, step 9) — macOS-only. SECONDARY to the rclone --offload (which
-# verifies durable upload before dropping local). --icloud-evict is fail-closed: it evicts NOTHING
-# unless every gate passes AND the compiled helper confirms EVERY candidate is fully uploaded.
+# verifies durable upload before dropping local). --icloud-evict is fail-closed PER FILE: it
+# evicts ONLY files the compiled helper individually proves fully uploaded (and re-verifies at
+# apply time — phase-2 chunk re-gate + per-file lstat re-snapshot); every other candidate is
+# skipped and reported, never evicted. Structural failures (helper desync/truncation) still die.
 # --icloud-status is read-only; --icloud-download only ADDS data (reversible). Live iCloud is not
 # testable in smoke — brctl is invoked via run() (PATH-shimmable) and the helper via $ICLOUD_HELPER.
 # ---------------------------------------------------------------------------
@@ -2271,12 +2273,25 @@ icloud_evict_classify_chunk() {
     fi
     case "$state" in
       uploaded)
+        # Selection-time snapshot. A failed stat (vanished/unreadable since find) means no
+        # trustworthy snapshot exists — the apply-side per-file guard would drift-skip it
+        # anyway ("selection snapshot unusable"), so tally it as drift HERE instead of
+        # appending to EVICT_SET: the dry-run plan must never list a file as evictable that
+        # apply is already guaranteed to skip. Same `drift` reason as the apply guard: both
+        # are the "could not establish/confirm the selection snapshot" class. NOTE: this
+        # branch still falls through to the i increment below — the record IS consumed, so
+        # the count-match (deficit/surplus) invariants are unaffected.
         snap="$(stat -f '%HT|%Sf|%z|%Fm' -- "$p" 2>/dev/null)" || snap=""
-        EVICT_SET+=("$p"); EVICT_SNAP+=("$snap")
-        rest="${snap#*|}"; rest="${rest#*|}"; sz="${rest%%|*}"
-        case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
-        EVICT_BYTES=$((EVICT_BYTES + sz))
-        n_up=$((n_up + 1)) ;;
+        if [ -z "$snap" ]; then
+          EVICT_N_DRIFT=$((EVICT_N_DRIFT + 1))
+          icloud_evict_report_skip drift "$EVICT_N_DRIFT" "$p"
+        else
+          EVICT_SET+=("$p"); EVICT_SNAP+=("$snap")
+          rest="${snap#*|}"; rest="${rest#*|}"; sz="${rest%%|*}"
+          case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+          EVICT_BYTES=$((EVICT_BYTES + sz))
+          n_up=$((n_up + 1))
+        fi ;;
       not-uploaded)
         EVICT_N_WAIT=$((EVICT_N_WAIT + 1))
         icloud_evict_report_skip not-uploaded "$EVICT_N_WAIT" "$p" ;;
@@ -2366,6 +2381,11 @@ cmd_icloud_evict() {                     # $1 = path
   if [ "$EVICT_N_ERR" -gt 20 ]; then
     printf '    ... and %d more helper-error (see %s --icloud-status)\n' "$((EVICT_N_ERR - 20))" "$SELF"
   fi
+  # phase-1 drift = selection-time snapshot-stat failures (apply-side drift is warn'd inline,
+  # uncapped, and only accrues after this point — so this pointer is phase-1-accurate).
+  if [ "$EVICT_N_DRIFT" -gt 20 ]; then
+    printf '    ... and %d more drift (see %s --icloud-status)\n' "$((EVICT_N_DRIFT - 20))" "$SELF"
+  fi
   local n_up n_skip n_evicted=0
   n_up="${#EVICT_SET[@]}"
   info "evict plan: $n_up of ${#candidates[@]} candidate file(s) proven uploaded — $(icloud_fmt_bytes "$EVICT_BYTES") potential free*"
@@ -2434,7 +2454,8 @@ cmd_icloud_evict() {                     # $1 = path
   fi
 
   # Machine-stable summary line (smoke greps this exact shape). Printed AFTER the evict loop so
-  # the drift count is real (drift is only knowable post-loop; in dry-run it is definitionally 0).
+  # the drift count is real: drift accrues in phase 1 (selection-time snapshot-stat failure,
+  # both modes) AND — apply only — in the evict loop (phase-2 re-gate refusal, per-file guard).
   # `unanswered` is reserved: under the die-on-count-mismatch design it is structurally 0, and it
   # stays in the line so the shape never changes if a future ruling downgrades deficit to skip.
   n_skip=$((EVICT_N_WAIT + EVICT_N_NOTIN + EVICT_N_ERR + EVICT_N_UNANS + EVICT_N_DRIFT))
