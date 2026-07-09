@@ -3381,6 +3381,28 @@ if [ -e "${r5victim}/sentinel.txt" ]; then ok "symlinked _npx was skipped — th
   else fail "SECURITY: sweep followed the symlinked _npx and wiped the victim dir"; fi
 if [ -L "${r5npx}" ]; then ok "the symlink itself is left in place (skipped, not deleted)"; \
   else fail "sweep removed the symlinked _npx entry itself"; fi
+# (d) UNDELETABLE entry in one cache must NOT abort the sweep (regression guard:
+# the pre-fix `[ DRY_RUN -eq 0 ] && rm ...` made a failing rm the last command of
+# the && list — set -e aborted mid-sweep, silently skipping the remaining caches).
+# Injection: a mode-000 dir inside _npx whose child rm cannot unlink (portable,
+# reversible). Assert exit 0, a warn naming the stuck cache, and that the LATER
+# brew downloads/ fixture was STILL swept (continuation past the failure).
+# chmod is restored IMMEDIATELY after the run — before any assert (fail exits the
+# suite) — so the sandbox EXIT-trap teardown always works.
+rm -f "${r5npx}"                                   # drop (c)'s symlink
+mkdir -p "${r5npx}/stuck"
+echo pinned > "${r5npx}/stuck/cannot-unlink.txt"
+chmod 000 "${r5npx}/stuck"                         # child now un-unlinkable
+echo tar2 > "${r5brew}/bottle2.tar.gz"             # LATER cache: proves continuation
+set +e; out="$(r5run --reclaim "${r5h}/sweep" --global --apply 2>&1)"; rc=$?; set -e
+chmod -R u+rwx "${r5npx}" 2>/dev/null || true      # restore BEFORE asserts (teardown must work)
+pass_if "${rc}" "--global apply with an undeletable _npx entry exits 0 (sweep not aborted)" \
+  "--global apply ABORTED on an undeletable entry (exit ${rc}): ${out}"
+assert_contains "${out}" "could not fully sweep ~/.npm/_npx" "the stuck cache is named in a warn, not swallowed"
+if [ -e "${r5brew}/bottle2.tar.gz" ]; then fail "sweep stopped at the stuck cache — brew downloads/ was never reached"; \
+  else ok "sweep continued past the stuck cache and cleared brew downloads/"; fi
+if [ -e "${r5npx}/stuck/cannot-unlink.txt" ]; then ok "the undeletable entry itself is left as-is (fail-closed)"; \
+  else fail "the undeletable entry vanished — injection did not hold (test is not testing the failure path)"; fi
 
 # ===========================================================================
 # Group F2: home-tree.sh rclone filter — EVERY exclude line is asserted, plus
