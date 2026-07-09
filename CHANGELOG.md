@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-08
+
+A `--reclaim --global` fix: it now actually frees the caches it was missing, with
+a dry-run exit-code fix and a symlinked-cache-dir hardening.
+
 ### Fixed
 - `--reclaim --global` now actually frees the big caches: it directly sweeps the
   contents of `~/.npm/_npx` (the npx one-off-package download cache) and
@@ -20,6 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trailing `[ "$RECLAIM_GLOBAL" -eq 0 ] && info …` hint returned 1 when `--global`
   was set, and `set -e` turned that into a spurious failure exit (found by the new
   smoke group R5; now an explicit `if`/`fi`).
+
+### Security
+- The `--global` contents-only cache sweeps (`~/.npm/_npx`, Homebrew `downloads/`,
+  Xcode DerivedData) gained a `[ ! -L ]` guard: a `[ -d ]` test follows a symlink,
+  so a cache dir swapped for a symlink to somewhere sensitive (a malicious npm/brew
+  postinstall legitimately writes those dirs) would have made `rm -rf dir/*`
+  delete the link **target's** contents. A symlinked cache dir is now skipped, not
+  followed — mirroring the evict lane's destruction-lane `! -L` invariant. Requires
+  local code-exec to exploit (hence low-severity), but fixed pre-release. Pinned by
+  smoke R5(c).
 
 ## [0.5.0] - 2026-07-08
 
