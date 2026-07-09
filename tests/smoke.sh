@@ -3321,6 +3321,67 @@ out="$(/bin/bash "${PROV}" --reclaim "${symroot}" 2>&1)"
 assert_contains "${out}" "0 project artifact(s) would be reclaimed" "symlinked Cargo.toml does not anchor target/ (0 reclaimable)"
 if [ -e "${symroot}/proj/target/blob.o" ]; then ok "target/ with a symlinked manifest is left untouched"; else fail "target/ was reclaimed via a symlinked manifest (steering vector open)"; fi
 
+# --- Group R5: --global sweeps the CONTENTS of ~/.npm/_npx and the Homebrew
+# downloads/ cache — the two dirs the tool-native cleans MISS (npm cache clean
+# only clears _cacache; brew cleanup -s leaves the bottle tarballs). Contents
+# go, the parent dirs SURVIVE (npx/brew re-populate them). These rm's target
+# $HOME paths, so HOME is a sandbox dir (asserted != the real HOME before any
+# --apply), and brew/npm/pip3 are PATH-shimmed no-ops so no real tool ever runs.
+echo "smoke: reclaim R5 — --global sweeps _npx + brew downloads/ contents, keeps the dirs"
+r5h="${sandbox}/r5-home"
+r5npx="${r5h}/.npm/_npx"
+r5brew="${r5h}/Library/Caches/Homebrew/downloads"
+mkdir -p "${r5npx}/abc123/node_modules/somepkg" "${r5brew}" "${r5h}/sweep"
+echo x   > "${r5npx}/abc123/node_modules/somepkg/index.js"
+echo tar > "${r5brew}/bottle.tar.gz"
+r5shim="${sandbox}/r5-shim"; mkdir -p "${r5shim}"
+for r5tool in brew npm pip3; do
+  printf '#!/bin/bash\nexit 0\n' > "${r5shim}/${r5tool}"; chmod +x "${r5shim}/${r5tool}"
+done
+r5run() { PATH="${r5shim}:${PATH}" HOME="${r5h}" XDG_CONFIG_HOME="${r5h}/.config" \
+  XDG_CACHE_HOME="${r5h}/.cache" /bin/bash "${PROV}" "$@"; }
+# Airtightness gate: this group deletes under $HOME — refuse to proceed unless the
+# override target is a sandbox path and is NOT the real HOME of this shell.
+if [ "${r5h}" = "${HOME}" ]; then fail "R5 sandbox HOME equals the real HOME — refusing to run"; fi
+case "${r5h}" in "${sandbox}"/*) ok "R5 HOME override is confined to the sandbox" ;; \
+  *) fail "R5 HOME override escapes the sandbox: ${r5h}" ;; esac
+# (a) dry-run lists both fixed-path sweeps, deletes NOTHING, and exits 0 (regression
+# guard: the pre-fix trailing `[ RECLAIM_GLOBAL -eq 0 ] && info` made a successful
+# --global dry-run exit 1 under set -e).
+set +e; out="$(r5run --reclaim "${r5h}/sweep" --global 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "--global dry-run exits 0" "--global dry-run failed (exit ${rc}): ${out}"
+assert_contains "${out}" "Global caches (--global):" "dry-run announces the global-cache section"
+assert_contains "${out}" "[dry-run]  rm -rf ~/.npm/_npx/*" "dry-run lists the npx-cache sweep"
+assert_contains "${out}" "[dry-run]  rm -rf ~/Library/Caches/Homebrew/downloads/*" "dry-run lists the brew downloads/ sweep"
+for p in .npm/_npx/abc123/node_modules/somepkg/index.js Library/Caches/Homebrew/downloads/bottle.tar.gz; do
+  if [ -e "${r5h}/${p}" ]; then ok "dry-run left ${p} untouched"; else fail "dry-run DELETED ${p} (dry-run must never delete)"; fi
+done
+# (b) --apply clears the contents but KEEPS both parent dirs.
+set +e; out="$(r5run --reclaim "${r5h}/sweep" --global --apply 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "--global apply exits 0" "--global apply failed (exit ${rc}): ${out}"
+assert_contains "${out}" "[run]  rm -rf ~/.npm/_npx/*" "apply logs the npx-cache sweep"
+assert_contains "${out}" "[run]  rm -rf ~/Library/Caches/Homebrew/downloads/*" "apply logs the brew downloads/ sweep"
+if [ -e "${r5npx}/abc123" ]; then fail "apply left ~/.npm/_npx contents behind (the live-found 413M case)"; else ok "apply cleared ~/.npm/_npx contents"; fi
+if [ -e "${r5brew}/bottle.tar.gz" ]; then fail "apply left the brew bottle tarball behind (the live-found 203M case)"; else ok "apply cleared Homebrew downloads/ contents"; fi
+if [ -d "${r5npx}" ] && [ -d "${r5brew}" ]; then ok "apply kept the _npx and downloads/ parent dirs (contents-only sweep)"; else fail "apply removed a parent dir (must clear contents only, like DerivedData)"; fi
+# (c) SECURITY (swapped-symlink cache dir): if ~/.npm/_npx has been replaced by a
+# symlink (e.g. by a malicious postinstall that legitimately writes ~/.npm), the
+# contents-only sweep must NOT follow it into the target — `[ -d link ]` is true
+# for a symlink-to-dir, so without the `! -L` guard `rm -rf link/*` would wipe the
+# TARGET's contents. The symlinked dir is skipped silently: victim survives, exit 0.
+r5victim="${sandbox}/r5-victim"
+mkdir -p "${r5victim}"
+echo precious > "${r5victim}/sentinel.txt"
+rm -rf "${r5npx}"
+ln -s "${r5victim}" "${r5npx}"                     # the swapped cache dir
+set +e; out="$(r5run --reclaim "${r5h}/sweep" --global --apply 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "--global apply with a symlinked _npx exits 0 (skip is silent, not an error)" \
+  "--global apply failed on a symlinked _npx (exit ${rc}): ${out}"
+if [ -e "${r5victim}/sentinel.txt" ]; then ok "symlinked _npx was skipped — the victim's sentinel survives"; \
+  else fail "SECURITY: sweep followed the symlinked _npx and wiped the victim dir"; fi
+if [ -L "${r5npx}" ]; then ok "the symlink itself is left in place (skipped, not deleted)"; \
+  else fail "sweep removed the symlinked _npx entry itself"; fi
+
 # ===========================================================================
 # Group F2: home-tree.sh rclone filter — EVERY exclude line is asserted, plus
 # the deny -> allow -> catch-all ORDERING. Group 6 only spot-checks a few deny

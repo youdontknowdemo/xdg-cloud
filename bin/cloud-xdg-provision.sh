@@ -100,7 +100,9 @@ RC_TARGET=""                                              # resolved rc (set by 
 
 # Reclaim lane — DELETES regenerable build artifacts to free disk (counterpart to
 # --offload). dry-run default; --apply acts; --global also sweeps the fixed cache
-# allow-list. RECLAIM_ROOT is set by cmd_reclaim + read by reclaim_rm's guard.
+# allow-list (brew/npm/pip tool-cleans plus the dirs those cleans miss: ~/.npm/_npx,
+# Homebrew downloads/, Xcode DerivedData, ~/.gradle/caches). RECLAIM_ROOT is set by
+# cmd_reclaim + read by reclaim_rm's guard.
 RECLAIM_GLOBAL=0
 RECLAIM_ROOT=""
 
@@ -433,8 +435,9 @@ Reclaim (free local disk by deleting REGENERABLE build artifacts; dry-run unless
                             CAUTION: with --apply this EXECUTES project build tooling
                             (./gradlew, cargo/mvn/gradle clean) in swept dirs — only
                             point it at trees you trust.
-  --global                  Also sweep the fixed user-cache allow-list (Homebrew, npm,
-                            pip, Xcode DerivedData, ~/.gradle/caches). Opt-in.
+  --global                  Also sweep the fixed user-cache allow-list (Homebrew incl.
+                            downloads/ bottle tarballs, npm incl. the ~/.npm/_npx npx
+                            cache, pip, Xcode DerivedData, ~/.gradle/caches). Opt-in.
 
 Nothing is moved without --apply --relocate together.
 EOF
@@ -2643,8 +2646,17 @@ reclaim_global_caches() {
     printf '  [%s]  pip3 cache purge\n' "$drun"
     [ "$DRY_RUN" -eq 0 ] && { pip3 cache purge >/dev/null 2>&1 || true; }
   fi
+  # Fixed-path sweeps the tool-native cleans above MISS (found live: npm cache clean
+  # only clears ~/.npm/_cacache, never the npx download cache; brew cleanup -s leaves
+  # the bottle tarballs in downloads/). Contents-only rm — the parent dirs survive so
+  # npx/brew re-populate them; both are regenerable (npx re-fetches, brew re-downloads).
+  local nx="$HOME/.npm/_npx"
+  # `! -L`: a cache dir swapped for a symlink must not redirect the `rm -rf dir/*` into its target — skip it (destruction-lane invariant, mirrors the evict lane).
+  [ -d "$nx" ] && [ ! -L "$nx" ] && { printf '  [%s]  rm -rf ~/.npm/_npx/* (%s)\n' "$drun" "$(reclaim_size "$nx")"; [ "$DRY_RUN" -eq 0 ] && rm -rf "${nx:?}"/* 2>/dev/null; }
+  local bd="$HOME/Library/Caches/Homebrew/downloads"
+  [ -d "$bd" ] && [ ! -L "$bd" ] && { printf '  [%s]  rm -rf ~/Library/Caches/Homebrew/downloads/* (%s)\n' "$drun" "$(reclaim_size "$bd")"; [ "$DRY_RUN" -eq 0 ] && rm -rf "${bd:?}"/* 2>/dev/null; }
   local dd="$HOME/Library/Developer/Xcode/DerivedData"
-  [ -d "$dd" ] && { printf '  [%s]  rm -rf ~/Library/Developer/Xcode/DerivedData/* (%s)\n' "$drun" "$(reclaim_size "$dd")"; [ "$DRY_RUN" -eq 0 ] && rm -rf "${dd:?}"/* 2>/dev/null; }
+  [ -d "$dd" ] && [ ! -L "$dd" ] && { printf '  [%s]  rm -rf ~/Library/Developer/Xcode/DerivedData/* (%s)\n' "$drun" "$(reclaim_size "$dd")"; [ "$DRY_RUN" -eq 0 ] && rm -rf "${dd:?}"/* 2>/dev/null; }
   local gc="$HOME/.gradle/caches"
   [ -d "$gc" ] && { printf '  [%s]  rm -rf ~/.gradle/caches (%s)\n' "$drun" "$(reclaim_size "$gc")"; [ "$DRY_RUN" -eq 0 ] && rm -rf "${gc:?}" 2>/dev/null; }
   return 0
@@ -2755,7 +2767,12 @@ cmd_reclaim() {                       # $1 = optional root (default: cwd)
   printf '%s' "$plan"
   if [ "$DRY_RUN" -eq 1 ]; then
     log "$n project artifact(s) would be reclaimed. Re-run with --apply to delete."
-    [ "$RECLAIM_GLOBAL" -eq 0 ] && info "add --global to also sweep user caches (Homebrew, npm, pip, Xcode DerivedData, ~/.gradle/caches)."
+    # if/fi (NOT a trailing `[ … ] && info`): with --global the guard is false and a
+    # trailing AND-list would return 1 from cmd_reclaim — set -e turns that into a
+    # spurious exit-1 for a successful --global dry-run.
+    if [ "$RECLAIM_GLOBAL" -eq 0 ]; then
+      info "add --global to also sweep user caches (Homebrew incl. downloads/, npm incl. ~/.npm/_npx, pip, Xcode DerivedData, ~/.gradle/caches)."
+    fi
   else
     log "Reclaimed $n project artifact(s) under $rootreal."
   fi

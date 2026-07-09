@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `--reclaim --global` now actually frees the big caches: it directly sweeps the
+  contents of `~/.npm/_npx` (the npx one-off-package download cache) and
+  `~/Library/Caches/Homebrew/downloads` (bottle tarballs). Previously `--global`
+  only ran `npm cache clean --force` and `brew cleanup -s`, which exit 0 but touch
+  neither dir — on a real machine (found live with the disk at 93%) it reported
+  success while recovering ~0 bytes because the space lived exactly there. The
+  parent dirs are kept (contents-only `rm`, same idiom as the DerivedData entry);
+  both caches are regenerable (npx re-fetches, brew re-downloads).
+- A successful `--reclaim --global` **dry-run** no longer exits 1: the summary's
+  trailing `[ "$RECLAIM_GLOBAL" -eq 0 ] && info …` hint returned 1 when `--global`
+  was set, and `set -e` turned that into a spurious failure exit (found by the new
+  smoke group R5; now an explicit `if`/`fi`).
+
 ## [0.5.0] - 2026-07-08
 
 Directory-usable iCloud evict. `--icloud-evict` becomes a proven-subset sweep —

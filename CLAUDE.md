@@ -58,7 +58,8 @@ the file:
 The **delete-side** counterpart to `--offload`. It purges known-regenerable build/cache dirs
 (Rust `target/`, `node_modules`, Gradle/Maven/CMake `build/`, `__pycache__` + Python tool caches,
 `*.egg-info`, framework caches) under `PATH` (default: cwd), plus an opt-in fixed allow-list of
-global user caches (`--global`: Homebrew, npm, pip, Xcode DerivedData, `~/.gradle/caches`).
+global user caches (`--global`: Homebrew incl. `downloads/`, npm incl. `~/.npm/_npx`, pip,
+Xcode DerivedData, `~/.gradle/caches`).
 
 Unlike `--offload`, **there is no cloud copy** — deletion is the only outcome, so the entire design
 rests on **false-positive-safe detection**. The governing rule (from `docs/preparation/research-reclaim.md`,

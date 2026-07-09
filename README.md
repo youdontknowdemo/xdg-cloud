@@ -122,7 +122,9 @@ nothing until you add `--apply`.
 Purges known-regenerable build/cache dirs under `PATH` (default: cwd): Rust
 `target/`, `node_modules`, Gradle/Maven/CMake `build/`, `__pycache__` + Python
 tool caches, `*.egg-info`, and framework caches. Add `--global` to also sweep a
-fixed user-cache allow-list (Homebrew, npm, pip, Xcode DerivedData,
+fixed user-cache allow-list (Homebrew — including the `downloads/` bottle
+tarballs `brew cleanup -s` leaves behind, npm — including the `~/.npm/_npx`
+npx cache `npm cache clean` misses, pip, Xcode DerivedData,
 `~/.gradle/caches`).
 
 Unlike `--offload`, **there is no cloud copy — deletion is the only outcome** — so
