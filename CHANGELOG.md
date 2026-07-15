@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-07-14
+
+A `--reclaim --global` robustness patch: an undeletable entry in one cache no
+longer aborts the whole sweep.
+
 ### Fixed
 - `--reclaim --global` no longer aborts the whole sweep when one cache has an
   undeletable entry (e.g. a `chflags uchg` file or a non-writable parent dir):
