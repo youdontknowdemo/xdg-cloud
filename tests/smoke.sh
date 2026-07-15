@@ -4028,4 +4028,204 @@ else
   echo "smoke: PK5 — zsh sourced-function lane SKIPPED (no zsh)"
 fi
 
+# --- Group PK6: multi-value remote.origin.fetch survives park + restore
+# byte-for-byte (diff-spec §11; the reason option-b plumbing was chosen — a
+# config-replay with plain `git config k v` silently collapses the second
+# value, research §7 #7 / diff-spec §4 row 2).
+echo "smoke: PK6 — multi-value fetch refspecs survive park/restore byte-for-byte"
+git clone -q "${park_root}/origin.git" "${park_root}/refspec" 2>/dev/null
+pk6extra='+refs/heads/*:refs/remotes/origin/backup/*'
+git -C "${park_root}/refspec" config --add remote.origin.fetch "${pk6extra}"
+pk6want="$(git -C "${park_root}/refspec" config --get-all remote.origin.fetch)"
+if [ "$(printf '%s\n' "${pk6want}" | grep -c .)" -eq 2 ]; then
+  ok "fixture carries two fetch refspecs"
+else
+  fail "fixture setup broken: expected exactly 2 fetch refspecs"
+fi
+out="$(park_run repo-park --apply "${park_root}/refspec" 2>&1)"
+assert_contains "${out}" "remotes kept: origin" "the two-refspec clone parks"
+pk6got="$(git -C "${park_root}/refspec" config --get-all remote.origin.fetch)"
+if [ "${pk6got}" = "${pk6want}" ]; then
+  ok "both fetch refspecs survive the park byte-for-byte"
+else
+  fail "fetch refspecs mutated by park (expected [${pk6want}], got [${pk6got}])"
+fi
+# The kept config file itself still carries the custom value verbatim — proves
+# the file was preserved, not rebuilt.
+pk6raw="$(cat "${park_root}/refspec/.git/config")"
+assert_contains "${pk6raw}" "${pk6extra}" "the custom refspec sits verbatim in .git/config after park"
+out="$(park_run repo-restore "${park_root}/refspec" 2>&1)"
+assert_contains "${out}" "repo-restore: restored" "the two-refspec clone restores"
+pk6got="$(git -C "${park_root}/refspec" config --get-all remote.origin.fetch)"
+if [ "${pk6got}" = "${pk6want}" ]; then
+  ok "both fetch refspecs survive the restore byte-for-byte"
+else
+  fail "fetch refspecs mutated by restore (expected [${pk6want}], got [${pk6got}])"
+fi
+
+# --- Group PK7: the parkedBranch marker restores the branch you were ON
+# (not the remote default), and an explicit [branch] argument beats the marker
+# (restore preference 1 over 2). Slashed branch name is deliberate.
+echo "smoke: PK7 — parkedBranch round-trip + explicit [branch] argument"
+git clone -q "${park_root}/origin.git" "${park_root}/branchy" 2>/dev/null
+( cd "${park_root}/branchy" && git checkout -qb feature/topic \
+    && echo feat > feat.txt && git add feat.txt && git commit -qm feat \
+    && git push -q origin feature/topic )
+out="$(park_run repo-park --apply "${park_root}/branchy" 2>&1)"
+assert_contains "${out}" "remotes kept: origin" "the feature-branch clone parks"
+if [ "$(git -C "${park_root}/branchy" config --get xdgcloud.parkedBranch)" = "feature/topic" ]; then
+  ok "parkedBranch records the slashed feature branch"
+else
+  fail "parkedBranch did not record feature/topic"
+fi
+out="$(park_run repo-restore "${park_root}/branchy" 2>&1)"
+assert_contains "${out}" "on feature/topic (from origin)" "no-arg restore reports the parked branch"
+if [ "$(git -C "${park_root}/branchy" symbolic-ref --short HEAD)" = "feature/topic" ]; then
+  ok "no-arg restore lands on the parked branch, not the remote default"
+else
+  fail "no-arg restore landed on the wrong branch (expected feature/topic)"
+fi
+if [ "$(cat "${park_root}/branchy/feat.txt")" = "feat" ]; then
+  ok "feature-branch content round-tripped"
+else
+  fail "feat.txt lost in the feature-branch round trip"
+fi
+# Re-park (marker again says feature/topic), then restore with an EXPLICIT
+# branch — the argument must win over the marker.
+out="$(park_run repo-park --apply "${park_root}/branchy" 2>&1)"
+assert_contains "${out}" "remotes kept: origin" "re-park for the explicit-branch case"
+out="$(park_run repo-restore "${park_root}/branchy" "${defbr}" 2>&1)"
+assert_contains "${out}" "on ${defbr} (from origin)" "explicit-branch restore reports ${defbr}"
+if [ "$(git -C "${park_root}/branchy" symbolic-ref --short HEAD)" = "${defbr}" ]; then
+  ok "the explicit [branch] argument beats the parkedBranch marker"
+else
+  fail "explicit-branch restore ignored the argument (expected ${defbr})"
+fi
+if [ -e "${park_root}/branchy/feat.txt" ]; then
+  fail "explicit-branch restore left feature-branch content on ${defbr}"
+else
+  ok "the ${defbr} tree checked out cleanly (no feature-branch residue)"
+fi
+if [ "$(git -C "${park_root}/branchy" rev-parse --abbrev-ref '@{upstream}')" = "origin/${defbr}" ]; then
+  ok "explicit-branch restore re-established upstream (origin/${defbr})"
+else
+  fail "explicit-branch restore did not set upstream to origin/${defbr}"
+fi
+set +e; git -C "${park_root}/branchy" config --get xdgcloud.parkedBranch >/dev/null 2>&1; rc=$?; set -e
+assert_nonzero "${rc}" "explicit-branch restore clears the parkedBranch marker"
+
+# --- Group PK8: a stash entry refuses the park without -f (it would be
+# destroyed); -f overrides and the cycle still round-trips to the pushed state.
+echo "smoke: PK8 — stash refusal without -f; -f overrides"
+git clone -q "${park_root}/origin.git" "${park_root}/stashy" 2>/dev/null
+( cd "${park_root}/stashy" && echo tweak >> f.txt && git stash -q )
+set +e; out="$(park_run repo-park "${park_root}/stashy" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "a stash entry is refused without -f"
+assert_contains "${out}" "stash entries would be destroyed" "the stash refusal names the cause"
+if [ -e "${park_root}/stashy/f.txt" ]; then
+  ok "the stash refusal deleted nothing"
+else
+  fail "the stash refusal path DELETED f.txt"
+fi
+out="$(park_run repo-park -f --apply "${park_root}/stashy" 2>&1)"
+assert_contains "${out}" "remotes kept: origin" "-f overrides the stash refusal and parks"
+if [ -e "${park_root}/stashy/f.txt" ]; then
+  fail "-f --apply did not park the stashed clone (f.txt still present)"
+else
+  ok "-f --apply parked the stashed clone"
+fi
+out="$(park_run repo-restore "${park_root}/stashy" 2>&1)"
+assert_contains "${out}" "repo-restore: restored" "the stashed clone restores after a forced park"
+if [ "$(cat "${park_root}/stashy/f.txt")" = "hello" ]; then
+  ok "restored content is the pushed state (the stash is gone, as documented)"
+else
+  fail "restored f.txt is not the pushed content"
+fi
+
+# --- Group PK9: THE data-loss guard, adversarially. The dotfiles lane makes
+# the home dir a real git work tree — so fabricate a git-init'd sandbox HOME
+# that passes EVERY downstream refusal (clean, pushed, no stash, on a branch,
+# remote present). The Layer-1 degenerate-path case guard is then the ONLY
+# thing standing between repo-park --apply and rm -rf of the home dir.
+# Assert on the FILESYSTEM (sentinels survive), never just the message.
+echo "smoke: PK9 — a git-init'd sandbox \$HOME is refused; nothing under it is deleted"
+pk9home="${park_root}/fakehome"
+mkdir -p "${pk9home}/Documents"
+echo precious > "${pk9home}/Documents/keep.txt"
+echo dotfile > "${pk9home}/.secrets"
+git init -q "${pk9home}"
+git init -q --bare "${park_root}/home-origin.git"
+git -C "${pk9home}" remote add origin "${park_root}/home-origin.git"
+( cd "${pk9home}" && git add -A && git commit -qm home && git push -q origin HEAD )
+# park_run with HOME pointed at the fixture. The assignment prefixes the
+# /bin/bash SIMPLE command (not the park_run function), so it is scoped to the
+# child and never leaks into the harness shell.
+park_run_home() {
+  local pk9h="$1"; shift
+  HOME="${pk9h}" /bin/bash -c '. "$1"; shift; "$@"' _ "${PARKLIB}" "$@"
+}
+set +e; out="$(park_run_home "${pk9home}" repo-park "${pk9home}" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "dry-run refuses to park the home dir"
+assert_contains "${out}" "refusing to park" "the home-dir refusal names the cause (dry-run)"
+assert_not_contains "${out}" "[dry-run] rm -rf" "the refusal fires BEFORE any deletion plan is printed"
+set +e; out="$(park_run_home "${pk9home}" repo-park --apply "${pk9home}" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "--apply refuses to park the home dir"
+assert_contains "${out}" "refusing to park" "the home-dir refusal names the cause (--apply)"
+for p in Documents/keep.txt .secrets .git/objects; do
+  if [ -e "${pk9home}/${p}" ]; then
+    ok "home sentinel ${p} survives"
+  else
+    fail "repo-park DELETED home sentinel ${p}"
+  fi
+done
+if [ "$(cat "${pk9home}/Documents/keep.txt")" = "precious" ]; then
+  ok "home sentinel content intact"
+else
+  fail "home sentinel content changed"
+fi
+# Symlinked-HOME leg: HOME is a symlink to the fixture, so the literal-"$HOME"
+# arm can NOT match the pwd -P'd target — only the home_real (canonicalized)
+# arm of the case guard can catch it.
+ln -s "${pk9home}" "${park_root}/homelink"
+set +e; out="$(park_run_home "${park_root}/homelink" repo-park --apply "${pk9home}" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "a symlinked \$HOME still refuses (the home_real leg)"
+assert_contains "${out}" "refusing to park" "the symlinked-home refusal names the cause"
+for p in Documents/keep.txt .secrets; do
+  if [ -e "${pk9home}/${p}" ]; then
+    ok "home sentinel ${p} survives the symlinked-HOME probe"
+  else
+    fail "the symlinked-HOME probe DELETED ${p}"
+  fi
+done
+
+# --- Group PK10: the cycle stays idempotent — park→restore→re-park→restore
+# (work already round-tripped once in PK2/PK3; two more full cycles here).
+echo "smoke: PK10 — park/restore cycle repeats cleanly"
+for pk10i in 1 2; do
+  out="$(park_run repo-park --apply "${park_root}/work" 2>&1)"
+  assert_contains "${out}" "remotes kept: origin" "cycle ${pk10i}: re-park succeeds"
+  if [ -e "${park_root}/work/f.txt" ]; then
+    fail "cycle ${pk10i}: re-park left f.txt behind"
+  else
+    ok "cycle ${pk10i}: re-parked"
+  fi
+  out="$(park_run repo-restore "${park_root}/work" 2>&1)"
+  assert_contains "${out}" "repo-restore: restored" "cycle ${pk10i}: restore succeeds"
+  if [ "$(cat "${park_root}/work/f.txt")" = "hello" ]; then
+    ok "cycle ${pk10i}: content round-tripped"
+  else
+    fail "cycle ${pk10i}: content lost"
+  fi
+done
+if [ -z "$(git -C "${park_root}/work" status --porcelain)" ]; then
+  ok "final tree is clean after repeated cycles"
+else
+  fail "final tree is dirty after repeated cycles"
+fi
+if [ "$(git -C "${park_root}/work" rev-parse --abbrev-ref '@{upstream}')" = "origin/${defbr}" ]; then
+  ok "upstream tracking survives repeated cycles"
+else
+  fail "upstream tracking lost after repeated cycles"
+fi
+
 echo "smoke: PASS"
