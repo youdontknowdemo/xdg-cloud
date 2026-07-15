@@ -2652,13 +2652,13 @@ reclaim_global_caches() {
   # npx/brew re-populate them; both are regenerable (npx re-fetches, brew re-downloads).
   local nx="$HOME/.npm/_npx"
   # `! -L`: a cache dir swapped for a symlink must not redirect the `rm -rf dir/*` into its target — skip it (destruction-lane invariant, mirrors the evict lane).
-  [ -d "$nx" ] && [ ! -L "$nx" ] && { printf '  [%s]  rm -rf ~/.npm/_npx/* (%s)\n' "$drun" "$(reclaim_size "$nx")"; [ "$DRY_RUN" -eq 0 ] && rm -rf "${nx:?}"/* 2>/dev/null; }
+  [ -d "$nx" ] && [ ! -L "$nx" ] && { printf '  [%s]  rm -rf ~/.npm/_npx/* (%s)\n' "$drun" "$(reclaim_size "$nx")"; [ "$DRY_RUN" -eq 0 ] && { rm -rf "${nx:?}"/* 2>/dev/null || warn "  could not fully sweep ~/.npm/_npx (left as-is)"; }; }
   local bd="$HOME/Library/Caches/Homebrew/downloads"
-  [ -d "$bd" ] && [ ! -L "$bd" ] && { printf '  [%s]  rm -rf ~/Library/Caches/Homebrew/downloads/* (%s)\n' "$drun" "$(reclaim_size "$bd")"; [ "$DRY_RUN" -eq 0 ] && rm -rf "${bd:?}"/* 2>/dev/null; }
+  [ -d "$bd" ] && [ ! -L "$bd" ] && { printf '  [%s]  rm -rf ~/Library/Caches/Homebrew/downloads/* (%s)\n' "$drun" "$(reclaim_size "$bd")"; [ "$DRY_RUN" -eq 0 ] && { rm -rf "${bd:?}"/* 2>/dev/null || warn "  could not fully sweep ~/Library/Caches/Homebrew/downloads (left as-is)"; }; }
   local dd="$HOME/Library/Developer/Xcode/DerivedData"
-  [ -d "$dd" ] && [ ! -L "$dd" ] && { printf '  [%s]  rm -rf ~/Library/Developer/Xcode/DerivedData/* (%s)\n' "$drun" "$(reclaim_size "$dd")"; [ "$DRY_RUN" -eq 0 ] && rm -rf "${dd:?}"/* 2>/dev/null; }
+  [ -d "$dd" ] && [ ! -L "$dd" ] && { printf '  [%s]  rm -rf ~/Library/Developer/Xcode/DerivedData/* (%s)\n' "$drun" "$(reclaim_size "$dd")"; [ "$DRY_RUN" -eq 0 ] && { rm -rf "${dd:?}"/* 2>/dev/null || warn "  could not fully sweep ~/Library/Developer/Xcode/DerivedData (left as-is)"; }; }
   local gc="$HOME/.gradle/caches"
-  [ -d "$gc" ] && { printf '  [%s]  rm -rf ~/.gradle/caches (%s)\n' "$drun" "$(reclaim_size "$gc")"; [ "$DRY_RUN" -eq 0 ] && rm -rf "${gc:?}" 2>/dev/null; }
+  [ -d "$gc" ] && { printf '  [%s]  rm -rf ~/.gradle/caches (%s)\n' "$drun" "$(reclaim_size "$gc")"; [ "$DRY_RUN" -eq 0 ] && { rm -rf "${gc:?}" 2>/dev/null || warn "  could not fully sweep ~/.gradle/caches (left as-is)"; }; }
   return 0
 }
 

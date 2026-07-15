@@ -42,7 +42,14 @@ export TMPDIR="${sandbox}/tmp"
 # rec_root is a reclaim fixture created OUTSIDE the repo work tree (see the
 # reclaim group near the end) — cleaned here too. Empty until that group sets it.
 rec_root=""
-cleanup() { rm -rf "${sandbox}" ${rec_root:+"${rec_root}"}; }
+cleanup() {
+  # Teardown immunity: several tests (L1b, #12, R5 d/e) chmod a fixture to 000
+  # during a captured run. If the suite is interrupted inside that window, the
+  # EXIT trap still fires (verified on bash 3.2) but rm -rf cannot recurse into
+  # a 000 dir — stranding residue. Re-open perms first; must never itself fail.
+  chmod -R u+rwx "${sandbox}" 2>/dev/null || true
+  rm -rf "${sandbox}" ${rec_root:+"${rec_root}"}
+}
 trap cleanup EXIT
 
 # assert_contains HAYSTACK NEEDLE LABEL
@@ -3381,6 +3388,42 @@ if [ -e "${r5victim}/sentinel.txt" ]; then ok "symlinked _npx was skipped — th
   else fail "SECURITY: sweep followed the symlinked _npx and wiped the victim dir"; fi
 if [ -L "${r5npx}" ]; then ok "the symlink itself is left in place (skipped, not deleted)"; \
   else fail "sweep removed the symlinked _npx entry itself"; fi
+# (d) UNDELETABLE entry in one cache must NOT abort the sweep (regression guard:
+# the pre-fix `[ DRY_RUN -eq 0 ] && rm ...` made a failing rm the last command of
+# the && list — set -e aborted mid-sweep, silently skipping the remaining caches).
+# Injection: a mode-000 dir inside _npx whose child rm cannot unlink (portable,
+# reversible). Assert exit 0, a warn naming the stuck cache, and that the LATER
+# brew downloads/ fixture was STILL swept (continuation past the failure).
+# chmod is restored IMMEDIATELY after the run — before any assert (fail exits the
+# suite) — so the sandbox EXIT-trap teardown always works.
+rm -f "${r5npx}"                                   # drop (c)'s symlink
+mkdir -p "${r5npx}/stuck"
+echo pinned > "${r5npx}/stuck/cannot-unlink.txt"
+chmod 000 "${r5npx}/stuck"                         # child now un-unlinkable
+echo tar2 > "${r5brew}/bottle2.tar.gz"             # LATER cache: proves continuation
+set +e; out="$(r5run --reclaim "${r5h}/sweep" --global --apply 2>&1)"; rc=$?; set -e
+chmod -R u+rwx "${r5npx}" 2>/dev/null || true      # restore BEFORE asserts (teardown must work)
+pass_if "${rc}" "--global apply with an undeletable _npx entry exits 0 (sweep not aborted)" \
+  "--global apply ABORTED on an undeletable entry (exit ${rc}): ${out}"
+assert_contains "${out}" "could not fully sweep ~/.npm/_npx" "the stuck cache is named in a warn, not swallowed"
+if [ -e "${r5brew}/bottle2.tar.gz" ]; then fail "sweep stopped at the stuck cache — brew downloads/ was never reached"; \
+  else ok "sweep continued past the stuck cache and cleared brew downloads/"; fi
+if [ -e "${r5npx}/stuck/cannot-unlink.txt" ]; then ok "the undeletable entry itself is left as-is (fail-closed)"; \
+  else fail "the undeletable entry vanished — injection did not hold (test is not testing the failure path)"; fi
+# (e) DRY-RUN with the same stuck entry must NOT warn: the `[ DRY_RUN -eq 0 ]`
+# guard sits OUTSIDE the rm-or-warn group, so no rm ever runs and the sweep warn
+# cannot fire on a dry-run. Re-inject (d)'s mode-000 entry, run WITHOUT --apply,
+# and pin the property. Same restore discipline as (d): chmod back immediately
+# after the captured run, BEFORE any fail-able assert (fail exits the suite).
+chmod 000 "${r5npx}/stuck"                         # re-arm (d)'s undeletable entry
+set +e; out="$(r5run --reclaim "${r5h}/sweep" --global 2>&1)"; rc=$?; set -e
+chmod -R u+rwx "${r5npx}" 2>/dev/null || true      # restore BEFORE asserts (teardown must work)
+pass_if "${rc}" "--global dry-run with an undeletable entry exits 0" \
+  "--global dry-run failed with an undeletable entry present (exit ${rc}): ${out}"
+assert_not_contains "${out}" "could not fully sweep" \
+  "dry-run never emits the sweep warn (DRY_RUN guard is outside the rm-or-warn group)"
+if [ -e "${r5npx}/stuck/cannot-unlink.txt" ]; then ok "dry-run left the stuck entry untouched"; \
+  else fail "dry-run DELETED the stuck entry (dry-run must never delete)"; fi
 
 # ===========================================================================
 # Group F2: home-tree.sh rclone filter — EVERY exclude line is asserted, plus

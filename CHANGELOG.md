@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `--reclaim --global` no longer aborts the whole sweep when one cache has an
+  undeletable entry (e.g. a `chflags uchg` file or a non-writable parent dir):
+  a failing fixed-path `rm` was the last command of its `&&` list, so `set -e`
+  killed the run mid-sweep with the diagnostic swallowed by `2>/dev/null` —
+  remaining caches and the final summary were silently skipped. Each sweep now
+  warns (`could not fully sweep <cache> (left as-is)`) and continues. Pinned by
+  smoke R5(d).
+
 ## [0.5.1] - 2026-07-08
 
 A `--reclaim --global` fix: it now actually frees the caches it was missing, with
