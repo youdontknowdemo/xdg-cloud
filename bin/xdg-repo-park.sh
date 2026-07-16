@@ -28,8 +28,14 @@ _repo_park_rm() {
   case "$d" in
     ""|"/"|"$HOME"|"$home_real"|"$top")
       printf 'repo-park: internal: refusing rm of unsafe path: %s\n' "$d" >&2; return 1 ;;
-    *..*)
-      printf 'repo-park: internal: refusing rm of path with "..": %s\n' "$d" >&2; return 1 ;;
+    */../*|*/..|../*)
+      # Component match, NOT the substring *..* — every path here is
+      # "$top/<globbed basename>" with $top pwd -P-canonical, so a traversal
+      # ".." can only appear as a whole component; the substring form would
+      # refuse legitimate names like "a..b" (and everything the "$top"/..?*
+      # glob exists to enumerate). Leading ../ is impossible on these
+      # absolute paths - kept defensively.
+      printf 'repo-park: internal: refusing rm of path with a ".." component: %s\n' "$d" >&2; return 1 ;;
     "$top"/*) : ;;
     *)
       printf 'repo-park: internal: refusing rm outside %s: %s\n' "$top" "$d" >&2; return 1 ;;
@@ -172,16 +178,6 @@ repo-park() {
   printf '  branch: %s   remotes: %s   size: %s\n' \
     "${branch:-<detached>}" "$(printf '%s\n' "$remotes" | paste -sd, -)" "$sz"
 
-  # --- Bookkeeping (research §4): recorded BEFORE any deletion; survives in the
-  # kept config. parkedBranch makes restore's branch detection offline and exact.
-  if [ "$apply" -eq 1 ]; then
-    git -C "$top" config xdgcloud.parked 1
-    if [ -n "$branch" ]; then git -C "$top" config xdgcloud.parkedBranch "$branch"; fi
-    git -C "$top" config xdgcloud.parkedAt "$(date +%Y-%m-%dT%H:%M:%S)"
-  else
-    printf '  [dry-run] git config xdgcloud.parked 1 (+ parkedBranch, parkedAt)\n'
-  fi
-
   # --- Working tree: every toplevel entry except .git (research §4 delete set).
   # Glob loop, NOT find|while: no subshell (the counter works, `return 1` behaves
   # identically in bash and zsh), newline-safe filenames, empty-dir safe under
@@ -203,13 +199,23 @@ repo-park() {
     fi
   done
 
-  # --- Re-scaffold / summary -------------------------------------------------------
+  # --- Re-scaffold / bookkeeping / summary -----------------------------------------
+  # Bookkeeping (research §4) is written only AFTER both delete loops and the
+  # git init re-scaffold succeed: a park that aborts mid-delete must leave NO
+  # xdgcloud.parked marker, or the idempotency probe above would false-report
+  # "already parked" on the re-run. .git/config is outside the delete set and
+  # git init never rewrites an existing config, so the keys (and the remotes)
+  # persist. parkedBranch makes restore's branch detection offline and exact.
   if [ "$apply" -eq 1 ]; then
     git -C "$top" init -q \
       || { printf 'repo-park: git init failed in %s - repo-restore should still recover it\n' "$top" >&2; return 1; }
+    git -C "$top" config xdgcloud.parked 1
+    if [ -n "$branch" ]; then git -C "$top" config xdgcloud.parkedBranch "$branch"; fi
+    git -C "$top" config xdgcloud.parkedAt "$(date +%Y-%m-%dT%H:%M:%S)"
     printf 'repo-park: parked %s - remotes kept: %s\n' "$top" "$(git -C "$top" remote | paste -sd, -)"
   else
     printf '  [dry-run] git init -q   (re-scaffold; .git/config with remotes kept verbatim)\n'
+    printf '  [dry-run] git config xdgcloud.parked 1 (+ parkedBranch, parkedAt)\n'
     printf 'repo-park: %s working-tree entries + git objects would be deleted (currently %s). Re-run with --apply to park.\n' "$n" "$sz"
   fi
   return 0

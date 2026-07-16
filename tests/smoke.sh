@@ -4228,4 +4228,86 @@ else
   fail "upstream tracking lost after repeated cycles"
 fi
 
+# --- Group PK11: literal ".."-NAMED entries are legal working-tree content.
+# The _repo_park_rm guard refuses ".." only as a path COMPONENT (traversal),
+# never as a substring of a basename — the old *..* substring guard aborted
+# the whole park on a file named a..b (PR #57 review, both reviewers).
+echo "smoke: PK11 — dot-dot-NAMED entries park + restore; a /../ COMPONENT still refuses"
+git clone -q "${park_root}/origin.git" "${park_root}/dotdot" 2>/dev/null
+( cd "${park_root}/dotdot" && echo one > "a..b" && mkdir "x..y" \
+    && echo two > "x..y/inner.txt" && git add -A && git commit -qm dotdot \
+    && git push -q origin HEAD )
+out="$(park_run repo-park --apply "${park_root}/dotdot" 2>&1)"
+assert_contains "${out}" "remotes kept: origin" "a repo containing a..b and x..y/ parks (substring-guard regression)"
+assert_not_contains "${out}" "refusing rm" "no rm refusal fired on the dot-dot-named entries"
+for p in "a..b" "x..y"; do
+  if [ -e "${park_root}/dotdot/${p}" ]; then
+    fail "park left ${p} behind (dot-dot-named entry not deleted)"
+  else
+    ok "park deleted ${p}"
+  fi
+done
+out="$(park_run repo-restore "${park_root}/dotdot" 2>&1)"
+assert_contains "${out}" "repo-restore: restored" "the dot-dot-named clone restores"
+if [ "$(cat "${park_root}/dotdot/a..b")" = "one" ]; then
+  ok "a..b content round-tripped"
+else
+  fail "a..b lost in the park/restore round trip"
+fi
+if [ "$(cat "${park_root}/dotdot/x..y/inner.txt")" = "two" ]; then
+  ok "x..y/inner.txt content round-tripped"
+else
+  fail "x..y/inner.txt lost in the park/restore round trip"
+fi
+# The guard still refuses a synthetic traversal COMPONENT (the glob loop never
+# produces one — probe the helper directly) and still admits a dot-dot NAME.
+set +e; out="$(park_run _repo_park_rm 0 "${park_root}/dotdot" "${HOME}" "${park_root}/dotdot/../escape" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "a /../ traversal component is still refused by _repo_park_rm"
+assert_contains "${out}" 'refusing rm of path with a ".." component' "the component refusal names the cause"
+set +e; out="$(park_run _repo_park_rm 0 "${park_root}/dotdot" "${HOME}" "${park_root}/dotdot/a..b" 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "a dot-dot NAMED path passes the guard" \
+  "_repo_park_rm refused the legal name a..b (exit ${rc}): ${out}"
+assert_contains "${out}" "[dry-run] rm -rf" "the admitted name prints the dry-run ledger line"
+
+# --- Group PK12: the xdgcloud.parked marker is written only AFTER a fully
+# completed park (delete loops + git init). A refusal leaves NO marker — a
+# stranded marker would make the idempotency probe false-report "already
+# parked" on the re-run (PR #57 review, stranded-marker MEDIUM).
+echo "smoke: PK12 — parked marker set only on a completed park; refusals leave none"
+# Completed park -> marker present (fresh fixture, independent of PK2).
+git clone -q "${park_root}/origin.git" "${park_root}/marker" 2>/dev/null
+out="$(park_run repo-park --apply "${park_root}/marker" 2>&1)"
+assert_contains "${out}" "remotes kept: origin" "the marker fixture parks"
+if [ "$(git -C "${park_root}/marker" config --get xdgcloud.parked)" = "1" ]; then
+  ok "a completed park records xdgcloud.parked=1"
+else
+  fail "xdgcloud.parked missing after a completed park"
+fi
+# Refusal before any deletion (uncommitted changes) -> no marker, tree intact.
+git clone -q "${park_root}/origin.git" "${park_root}/refused" 2>/dev/null
+echo dirty >> "${park_root}/refused/f.txt"
+set +e; out="$(park_run repo-park --apply "${park_root}/refused" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "the uncommitted-changes --apply park is refused"
+set +e; git -C "${park_root}/refused" config --get xdgcloud.parked >/dev/null 2>&1; rc=$?; set -e
+assert_nonzero "${rc}" "a refused park (uncommitted) leaves NO xdgcloud.parked marker"
+set +e; git -C "${park_root}/refused" config --get xdgcloud.parkedBranch >/dev/null 2>&1; rc=$?; set -e
+assert_nonzero "${rc}" "a refused park leaves NO parkedBranch marker either"
+if [ -e "${park_root}/refused/f.txt" ]; then
+  ok "the refused park deleted nothing"
+else
+  fail "the refused park DELETED f.txt"
+fi
+# No-remotes HARD refusal -> no marker even under --apply -f.
+git init -q "${park_root}/nomarker"
+( cd "${park_root}/nomarker" && echo x > a.txt && git add a.txt && git commit -qm init )
+set +e; out="$(park_run repo-park --apply -f "${park_root}/nomarker" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "the no-remotes park is refused under --apply -f"
+set +e; git -C "${park_root}/nomarker" config --get xdgcloud.parked >/dev/null 2>&1; rc=$?; set -e
+assert_nonzero "${rc}" "a refused park (no remotes) leaves NO xdgcloud.parked marker"
+# Re-run after a refusal must plan a normal park, never "already parked".
+git -C "${park_root}/refused" checkout -qf -- f.txt
+out="$(park_run repo-park "${park_root}/refused" 2>&1)"
+assert_not_contains "${out}" "already parked" "post-refusal re-run does not false-report already parked"
+assert_contains "${out}" "dry-run - nothing deleted" "post-refusal re-run plans a normal park"
+
 echo "smoke: PASS"
