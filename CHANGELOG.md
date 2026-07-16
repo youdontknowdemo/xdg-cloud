@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-16
+
+Adds `repo-park` / `repo-restore` — the first **sourceable** shell-function file
+in the toolkit — for reclaiming disk from pushed git clones you want to keep as
+markers. Minor bump for the new user-facing capability.
+
+### Added
+- **`bin/xdg-repo-park.sh` — sourceable `repo-park` / `repo-restore` functions.**
+  Source it from your shellrc (documented as a recommended install in the README).
+  `repo-park <dir>` reduces a fully-pushed git clone to a remotes-only marker dir:
+  it keeps the directory and `.git/config` (so the remotes — including multi-value
+  fetch refspecs and paths with spaces — survive), deletes the working tree and
+  git objects, and re-scaffolds an empty repo. `repo-restore <dir>` (or a plain
+  `git pull`) rehydrates it from the remote later. Same destructive-lane discipline
+  as `--offload`/`--reclaim`/`--icloud-evict`: **dry-run by default** (prints the
+  plan, changes nothing); `--apply`/`-y` gates the deletion; degenerate-path
+  refusal before any `rm` (never `$HOME`/`""`/`/`/the repo root); refuses when the
+  repo has no remotes (nothing to restore from) or has uncommitted/stashed changes
+  unless `-f`/`--force`. Being sourceable, every error path `return`s (never
+  `exit`s) so a refusal can't kill the interactive shell, and it is zsh-safe.
+  Covered by sandboxed smoke groups PK1–PK12 (round-trip, multi-refspec survival,
+  `$HOME`-toplevel guard mutation-check, refusal paths) that never touch a real
+  repo or real `$HOME`.
+
 ## [0.5.2] - 2026-07-14
 
 A `--reclaim --global` robustness patch: an undeletable entry in one cache no
