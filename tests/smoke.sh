@@ -42,13 +42,16 @@ export TMPDIR="${sandbox}/tmp"
 # rec_root is a reclaim fixture created OUTSIDE the repo work tree (see the
 # reclaim group near the end) — cleaned here too. Empty until that group sets it.
 rec_root=""
+# park_root is the repo-park fixture root, same OUTSIDE-the-work-tree treatment
+# (see the PK groups near the end). Empty until that group sets it.
+park_root=""
 cleanup() {
   # Teardown immunity: several tests (L1b, #12, R5 d/e) chmod a fixture to 000
   # during a captured run. If the suite is interrupted inside that window, the
   # EXIT trap still fires (verified on bash 3.2) but rm -rf cannot recurse into
   # a 000 dir — stranding residue. Re-open perms first; must never itself fail.
   chmod -R u+rwx "${sandbox}" 2>/dev/null || true
-  rm -rf "${sandbox}" ${rec_root:+"${rec_root}"}
+  rm -rf "${sandbox}" ${rec_root:+"${rec_root}"} ${park_root:+"${park_root}"}
 }
 trap cleanup EXIT
 
@@ -3851,5 +3854,460 @@ if [ -e "${repo}/bin/xdg-tui" ]; then
 else
   ok "bin/xdg-tui not present — TUI pairing check not applicable"
 fi
+
+# ===========================================================================
+# repo-park / repo-restore (bin/xdg-repo-park.sh) — sourced-function contract.
+# Groups PK1–PK5 (diff-spec §5 P1–P5; renamed PK to avoid colliding with the
+# porcelain P-group labels above). Destructive-on-repos: every fixture lives
+# under park_root (mktemp, OUTSIDE the work tree — mandatory for the not-a-repo
+# refusal, same reasoning as rec_root), EXIT-trap cleaned. The hermetic git
+# identity exported for the reclaim groups is still in effect here.
+# CAPTURE-then-INSPECT throughout. The PK4 message-fragment asserts are the
+# CONTRACT: rewording a refusal in bin/xdg-repo-park.sh must update them here.
+# ===========================================================================
+PARKLIB="${repo}/bin/xdg-repo-park.sh"
+park_root="$(mktemp -d "${host_tmp}/xdg-park-smoke.XXXXXX")"
+# Invoke a function from the sourced file in a fresh /bin/bash (L3 pattern).
+park_run() { /bin/bash -c '. "$1"; shift; "$@"' _ "${PARKLIB}" "$@"; }
+
+# Fixture: local bare "remote" + a pushed clone with a spaces path.
+git init -q --bare "${park_root}/origin.git"
+git clone -q "${park_root}/origin.git" "${park_root}/work" 2>/dev/null
+( cd "${park_root}/work" && echo hello > f.txt && mkdir -p "dir with spaces" \
+    && echo deep > "dir with spaces/g.txt" && git add -A && git commit -qm init \
+    && git push -q origin HEAD )
+defbr="$(git -C "${park_root}/work" symbolic-ref --short HEAD)"   # main OR master — never assume
+
+# --- Group PK1: dry-run is the default and deletes NOTHING; -f is orthogonal.
+echo "smoke: PK1 — repo-park dry-run is the default and deletes nothing"
+out="$(park_run repo-park "${park_root}/work" 2>&1)"
+assert_contains "${out}" "dry-run - nothing deleted" "repo-park defaults to dry-run"
+assert_contains "${out}" "[dry-run] rm -rf" "dry-run prints the %q-quoted deletion plan"
+for p in f.txt "dir with spaces/g.txt" .git/objects; do
+  if [ -e "${park_root}/work/${p}" ]; then ok "dry-run left ${p} untouched"; else fail "dry-run DELETED ${p} (dry-run must never delete)"; fi
+done
+# -f without --apply must still be a dry-run (force widens WHICH repos may be
+# parked, never WHETHER deletion happens).
+out="$(park_run repo-park -f "${park_root}/work" 2>&1)"
+assert_contains "${out}" "dry-run - nothing deleted" "-f alone stays a dry-run (orthogonal to --apply)"
+for p in f.txt "dir with spaces/g.txt" .git/objects; do
+  if [ -e "${park_root}/work/${p}" ]; then ok "-f dry-run left ${p} untouched"; else fail "-f WITHOUT --apply deleted ${p} (force must never imply apply)"; fi
+done
+
+# --- Group PK2: --apply parks — working tree + objects gone, remotes kept.
+echo "smoke: PK2 — repo-park --apply reduces the clone to a remotes-only marker"
+out="$(park_run repo-park --apply "${park_root}/work" 2>&1)"
+assert_contains "${out}" "remotes kept: origin" "apply reports the kept remotes"
+for p in f.txt "dir with spaces" .git/index; do
+  if [ -e "${park_root}/work/${p}" ]; then fail "apply left ${p} behind (should have been deleted)"; else ok "apply deleted ${p}"; fi
+done
+# .git/objects is deleted then re-scaffolded EMPTY by git init -q — assert no
+# loose objects / packs survive rather than absence of the dir itself.
+if [ -z "$(find "${park_root}/work/.git/objects" -type f 2>/dev/null)" ]; then
+  ok "apply left no git objects behind (objects dir re-scaffolded empty)"
+else
+  fail "apply left git objects behind in .git/objects"
+fi
+pk2rem="$(git -C "${park_root}/work" remote -v)"
+assert_contains "${pk2rem}" "origin.git" "the origin remote URL survives in .git/config verbatim"
+if [ "$(git -C "${park_root}/work" config --get xdgcloud.parked)" = "1" ]; then
+  ok "xdgcloud.parked=1 marker recorded"
+else
+  fail "xdgcloud.parked marker missing after apply"
+fi
+if [ "$(git -C "${park_root}/work" config --get xdgcloud.parkedBranch)" = "${defbr}" ]; then
+  ok "xdgcloud.parkedBranch records ${defbr}"
+else
+  fail "xdgcloud.parkedBranch drifted from ${defbr}"
+fi
+if [ -e "${park_root}/work/.git/hooks" ]; then ok "apply kept .git/hooks"; else fail "apply deleted .git/hooks (user hooks are not recoverable from the remote)"; fi
+# Re-park of an already-parked dir is a no-op success (idempotency).
+set +e; out="$(park_run repo-park --apply "${park_root}/work" 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "re-park of a parked dir is a no-op success" "re-park of a parked dir failed (exit ${rc}): ${out}"
+assert_contains "${out}" "already parked" "re-park names the no-op"
+
+# --- Group PK3: repo-restore round-trips the parked clone.
+echo "smoke: PK3 — repo-restore rehydrates the parked clone"
+out="$(park_run repo-restore "${park_root}/work" 2>&1)"
+assert_contains "${out}" "repo-restore: restored" "restore reports success"
+if [ "$(cat "${park_root}/work/f.txt")" = "hello" ]; then ok "f.txt content round-tripped"; else fail "f.txt content lost in the park/restore round trip"; fi
+if [ "$(cat "${park_root}/work/dir with spaces/g.txt")" = "deep" ]; then ok "spaces-path content round-tripped"; else fail "dir with spaces/g.txt lost in the round trip"; fi
+if [ -z "$(git -C "${park_root}/work" status --porcelain)" ]; then ok "restored tree is clean"; else fail "restored tree is dirty"; fi
+if [ -n "$(git -C "${park_root}/work" log --oneline -1 2>/dev/null)" ]; then ok "restored repo has history"; else fail "restored repo has no commits"; fi
+if [ "$(git -C "${park_root}/work" symbolic-ref --short HEAD)" = "${defbr}" ]; then
+  ok "restore checked out the parked branch ${defbr}"
+else
+  fail "restore landed on the wrong branch (expected ${defbr})"
+fi
+set +e; git -C "${park_root}/work" config --get xdgcloud.parked >/dev/null 2>&1; rc=$?; set -e
+assert_nonzero "${rc}" "the xdgcloud.parked marker is cleared after restore"
+if [ "$(git -C "${park_root}/work" rev-parse --abbrev-ref '@{upstream}')" = "origin/${defbr}" ]; then
+  ok "restore re-established upstream tracking (origin/${defbr})"
+else
+  fail "restore did not re-establish upstream tracking"
+fi
+
+# --- Group PK4: every refusal exits non-zero and names the cause. work is LIVE
+# here (post-PK3); state-mutating cases restore it before the next case.
+echo "smoke: PK4 — repo-park/repo-restore refusal paths"
+# non-repo dir (park_root is outside the work tree, so no enclosing repo leaks in).
+mkdir "${park_root}/plain"
+set +e; out="$(park_run repo-park "${park_root}/plain" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "a plain non-repo dir is refused"
+assert_contains "${out}" "not a git work tree" "the non-repo refusal names the cause"
+# bare repo (the tested alias's --is-inside-work-tree hole: prints false, exits 0).
+set +e; out="$(park_run repo-park "${park_root}/origin.git" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "a bare repo is refused (never delete a bare repo's objects)"
+assert_contains "${out}" "not a git work tree (or bare)" "the bare-repo refusal names the cause"
+# subdir of a repo (toplevel identity — parking it would nuke the parent repo).
+set +e; out="$(park_run repo-park "${park_root}/work/dir with spaces" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "a subdir inside a repo is refused"
+assert_contains "${out}" "park the toplevel" "the subdir refusal points at the toplevel"
+# dirty tree — refused without -f.
+echo change >> "${park_root}/work/f.txt"
+set +e; out="$(park_run repo-park "${park_root}/work" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "uncommitted changes are refused without -f"
+assert_contains "${out}" "uncommitted changes" "the dirty refusal names the cause"
+git -C "${park_root}/work" checkout -qf -- f.txt
+# unpushed commit — refused without -f.
+( cd "${park_root}/work" && echo more > unpushed.txt && git add unpushed.txt && git commit -qm unpushed )
+set +e; out="$(park_run repo-park "${park_root}/work" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "unpushed commits are refused without -f"
+assert_contains "${out}" "not on any remote" "the unpushed refusal names the cause"
+git -C "${park_root}/work" reset -q --hard "origin/${defbr}"
+# no remotes — HARD refusal (nothing to restore from; -f never overrides).
+git init -q "${park_root}/noremote"
+( cd "${park_root}/noremote" && echo x > a.txt && git add a.txt && git commit -qm init )
+set +e; out="$(park_run repo-park -f "${park_root}/noremote" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "a repo with no remotes is refused even under -f"
+assert_contains "${out}" "no remotes" "the no-remotes refusal names the cause"
+# linked worktree — both sides refused (parking either strands the other).
+git -C "${park_root}/work" worktree add "${park_root}/linked" -b tmpbr >/dev/null 2>&1
+set +e; out="$(park_run repo-park "${park_root}/linked" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "a linked worktree dir is refused"
+assert_contains "${out}" "is a linked worktree" "the linked-worktree refusal names the cause"
+set +e; out="$(park_run repo-park "${park_root}/work" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "a main clone with attached worktrees is refused"
+assert_contains "${out}" "linked worktrees attached" "the attached-worktrees refusal names the cause"
+git -C "${park_root}/work" worktree remove "${park_root}/linked" >/dev/null 2>&1
+git -C "${park_root}/work" branch -qD tmpbr
+# detached HEAD — refused without -f.
+git -C "${park_root}/work" checkout -q --detach
+set +e; out="$(park_run repo-park "${park_root}/work" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "a detached HEAD is refused without -f"
+assert_contains "${out}" "detached HEAD" "the detached refusal names the cause"
+git -C "${park_root}/work" checkout -q "${defbr}"
+# restore on a LIVE repo — refused (checkout -f -B would discard local state).
+set +e; out="$(park_run repo-restore "${park_root}/work" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "repo-restore refuses a live (un-parked) repo"
+assert_contains "${out}" "not parked" "the live-repo refusal names the cause"
+# missing arg — usage + rc=2, and the SOURCING SHELL SURVIVES (the ${1:?}
+# shell-kill regression this file's explicit arg check replaces).
+set +e; out="$(/bin/bash -c '. "$1"; repo-park 2>&1; printf "rc=%s alive" "$?"' _ "${PARKLIB}")"; rc=$?; set -e
+pass_if "${rc}" "the sourcing shell survives a missing-arg call" "the missing-arg path killed the sourcing shell (exit ${rc})"
+assert_contains "${out}" "usage: repo-park" "missing arg prints the usage line"
+assert_contains "${out}" "rc=2 alive" "missing arg returns 2 without exiting the shell"
+# direct execution — the exec-guard self-explains and exits 64.
+set +e; out="$(/bin/bash "${PARKLIB}" 2>&1)"; rc=$?; set -e
+if [ "${rc}" -eq 64 ]; then ok "direct execution exits 64"; else fail "direct execution exited ${rc}, expected 64"; fi
+assert_contains "${out}" "source it" "the exec-guard tells the user to source the file"
+
+# --- Group PK5: zsh smoke (gated) — dry-run inert + a refusal RETURNS (no exit).
+if command -v zsh >/dev/null 2>&1; then
+  echo "smoke: PK5 — zsh sources the file; dry-run inert; refusals return, not exit"
+  out="$(zsh -c '. "$1"; shift; "$@" 2>&1; printf "rc=%s alive" "$?"' _ "${PARKLIB}" repo-park "${park_root}/work")"
+  assert_contains "${out}" "dry-run - nothing deleted" "zsh dry-run runs the plan lane"
+  assert_contains "${out}" "rc=0 alive" "zsh dry-run returns 0 and the shell survives"
+  for p in f.txt "dir with spaces/g.txt" .git/objects; do
+    if [ -e "${park_root}/work/${p}" ]; then ok "zsh dry-run left ${p} untouched"; else fail "zsh dry-run DELETED ${p}"; fi
+  done
+  out="$(zsh -c '. "$1"; shift; "$@" 2>&1; printf "rc=%s alive" "$?"' _ "${PARKLIB}" repo-park "${park_root}/plain")"
+  assert_contains "${out}" "not a git work tree" "zsh refusal names the cause"
+  assert_contains "${out}" "rc=1 alive" "zsh refusal RETURNS 1 — the sourcing shell survives (no exit fired)"
+else
+  echo "smoke: PK5 — zsh sourced-function lane SKIPPED (no zsh)"
+fi
+
+# --- Group PK6: multi-value remote.origin.fetch survives park + restore
+# byte-for-byte (diff-spec §11; the reason option-b plumbing was chosen — a
+# config-replay with plain `git config k v` silently collapses the second
+# value, research §7 #7 / diff-spec §4 row 2).
+echo "smoke: PK6 — multi-value fetch refspecs survive park/restore byte-for-byte"
+git clone -q "${park_root}/origin.git" "${park_root}/refspec" 2>/dev/null
+pk6extra='+refs/heads/*:refs/remotes/origin/backup/*'
+git -C "${park_root}/refspec" config --add remote.origin.fetch "${pk6extra}"
+pk6want="$(git -C "${park_root}/refspec" config --get-all remote.origin.fetch)"
+if [ "$(printf '%s\n' "${pk6want}" | grep -c .)" -eq 2 ]; then
+  ok "fixture carries two fetch refspecs"
+else
+  fail "fixture setup broken: expected exactly 2 fetch refspecs"
+fi
+out="$(park_run repo-park --apply "${park_root}/refspec" 2>&1)"
+assert_contains "${out}" "remotes kept: origin" "the two-refspec clone parks"
+pk6got="$(git -C "${park_root}/refspec" config --get-all remote.origin.fetch)"
+if [ "${pk6got}" = "${pk6want}" ]; then
+  ok "both fetch refspecs survive the park byte-for-byte"
+else
+  fail "fetch refspecs mutated by park (expected [${pk6want}], got [${pk6got}])"
+fi
+# The kept config file itself still carries the custom value verbatim — proves
+# the file was preserved, not rebuilt.
+pk6raw="$(cat "${park_root}/refspec/.git/config")"
+assert_contains "${pk6raw}" "${pk6extra}" "the custom refspec sits verbatim in .git/config after park"
+out="$(park_run repo-restore "${park_root}/refspec" 2>&1)"
+assert_contains "${out}" "repo-restore: restored" "the two-refspec clone restores"
+pk6got="$(git -C "${park_root}/refspec" config --get-all remote.origin.fetch)"
+if [ "${pk6got}" = "${pk6want}" ]; then
+  ok "both fetch refspecs survive the restore byte-for-byte"
+else
+  fail "fetch refspecs mutated by restore (expected [${pk6want}], got [${pk6got}])"
+fi
+
+# --- Group PK7: the parkedBranch marker restores the branch you were ON
+# (not the remote default), and an explicit [branch] argument beats the marker
+# (restore preference 1 over 2). Slashed branch name is deliberate.
+echo "smoke: PK7 — parkedBranch round-trip + explicit [branch] argument"
+git clone -q "${park_root}/origin.git" "${park_root}/branchy" 2>/dev/null
+( cd "${park_root}/branchy" && git checkout -qb feature/topic \
+    && echo feat > feat.txt && git add feat.txt && git commit -qm feat \
+    && git push -q origin feature/topic )
+out="$(park_run repo-park --apply "${park_root}/branchy" 2>&1)"
+assert_contains "${out}" "remotes kept: origin" "the feature-branch clone parks"
+if [ "$(git -C "${park_root}/branchy" config --get xdgcloud.parkedBranch)" = "feature/topic" ]; then
+  ok "parkedBranch records the slashed feature branch"
+else
+  fail "parkedBranch did not record feature/topic"
+fi
+out="$(park_run repo-restore "${park_root}/branchy" 2>&1)"
+assert_contains "${out}" "on feature/topic (from origin)" "no-arg restore reports the parked branch"
+if [ "$(git -C "${park_root}/branchy" symbolic-ref --short HEAD)" = "feature/topic" ]; then
+  ok "no-arg restore lands on the parked branch, not the remote default"
+else
+  fail "no-arg restore landed on the wrong branch (expected feature/topic)"
+fi
+if [ "$(cat "${park_root}/branchy/feat.txt")" = "feat" ]; then
+  ok "feature-branch content round-tripped"
+else
+  fail "feat.txt lost in the feature-branch round trip"
+fi
+# Re-park (marker again says feature/topic), then restore with an EXPLICIT
+# branch — the argument must win over the marker.
+out="$(park_run repo-park --apply "${park_root}/branchy" 2>&1)"
+assert_contains "${out}" "remotes kept: origin" "re-park for the explicit-branch case"
+out="$(park_run repo-restore "${park_root}/branchy" "${defbr}" 2>&1)"
+assert_contains "${out}" "on ${defbr} (from origin)" "explicit-branch restore reports ${defbr}"
+if [ "$(git -C "${park_root}/branchy" symbolic-ref --short HEAD)" = "${defbr}" ]; then
+  ok "the explicit [branch] argument beats the parkedBranch marker"
+else
+  fail "explicit-branch restore ignored the argument (expected ${defbr})"
+fi
+if [ -e "${park_root}/branchy/feat.txt" ]; then
+  fail "explicit-branch restore left feature-branch content on ${defbr}"
+else
+  ok "the ${defbr} tree checked out cleanly (no feature-branch residue)"
+fi
+if [ "$(git -C "${park_root}/branchy" rev-parse --abbrev-ref '@{upstream}')" = "origin/${defbr}" ]; then
+  ok "explicit-branch restore re-established upstream (origin/${defbr})"
+else
+  fail "explicit-branch restore did not set upstream to origin/${defbr}"
+fi
+set +e; git -C "${park_root}/branchy" config --get xdgcloud.parkedBranch >/dev/null 2>&1; rc=$?; set -e
+assert_nonzero "${rc}" "explicit-branch restore clears the parkedBranch marker"
+
+# --- Group PK8: a stash entry refuses the park without -f (it would be
+# destroyed); -f overrides and the cycle still round-trips to the pushed state.
+echo "smoke: PK8 — stash refusal without -f; -f overrides"
+git clone -q "${park_root}/origin.git" "${park_root}/stashy" 2>/dev/null
+( cd "${park_root}/stashy" && echo tweak >> f.txt && git stash -q )
+set +e; out="$(park_run repo-park "${park_root}/stashy" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "a stash entry is refused without -f"
+assert_contains "${out}" "stash entries would be destroyed" "the stash refusal names the cause"
+if [ -e "${park_root}/stashy/f.txt" ]; then
+  ok "the stash refusal deleted nothing"
+else
+  fail "the stash refusal path DELETED f.txt"
+fi
+out="$(park_run repo-park -f --apply "${park_root}/stashy" 2>&1)"
+assert_contains "${out}" "remotes kept: origin" "-f overrides the stash refusal and parks"
+if [ -e "${park_root}/stashy/f.txt" ]; then
+  fail "-f --apply did not park the stashed clone (f.txt still present)"
+else
+  ok "-f --apply parked the stashed clone"
+fi
+out="$(park_run repo-restore "${park_root}/stashy" 2>&1)"
+assert_contains "${out}" "repo-restore: restored" "the stashed clone restores after a forced park"
+if [ "$(cat "${park_root}/stashy/f.txt")" = "hello" ]; then
+  ok "restored content is the pushed state (the stash is gone, as documented)"
+else
+  fail "restored f.txt is not the pushed content"
+fi
+
+# --- Group PK9: THE data-loss guard, adversarially. The dotfiles lane makes
+# the home dir a real git work tree — so fabricate a git-init'd sandbox HOME
+# that passes EVERY downstream refusal (clean, pushed, no stash, on a branch,
+# remote present). The Layer-1 degenerate-path case guard is then the ONLY
+# thing standing between repo-park --apply and rm -rf of the home dir.
+# Assert on the FILESYSTEM (sentinels survive), never just the message.
+echo "smoke: PK9 — a git-init'd sandbox \$HOME is refused; nothing under it is deleted"
+pk9home="${park_root}/fakehome"
+mkdir -p "${pk9home}/Documents"
+echo precious > "${pk9home}/Documents/keep.txt"
+echo dotfile > "${pk9home}/.secrets"
+git init -q "${pk9home}"
+git init -q --bare "${park_root}/home-origin.git"
+git -C "${pk9home}" remote add origin "${park_root}/home-origin.git"
+( cd "${pk9home}" && git add -A && git commit -qm home && git push -q origin HEAD )
+# park_run with HOME pointed at the fixture. The assignment prefixes the
+# /bin/bash SIMPLE command (not the park_run function), so it is scoped to the
+# child and never leaks into the harness shell.
+park_run_home() {
+  local pk9h="$1"; shift
+  HOME="${pk9h}" /bin/bash -c '. "$1"; shift; "$@"' _ "${PARKLIB}" "$@"
+}
+set +e; out="$(park_run_home "${pk9home}" repo-park "${pk9home}" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "dry-run refuses to park the home dir"
+assert_contains "${out}" "refusing to park" "the home-dir refusal names the cause (dry-run)"
+assert_not_contains "${out}" "[dry-run] rm -rf" "the refusal fires BEFORE any deletion plan is printed"
+set +e; out="$(park_run_home "${pk9home}" repo-park --apply "${pk9home}" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "--apply refuses to park the home dir"
+assert_contains "${out}" "refusing to park" "the home-dir refusal names the cause (--apply)"
+for p in Documents/keep.txt .secrets .git/objects; do
+  if [ -e "${pk9home}/${p}" ]; then
+    ok "home sentinel ${p} survives"
+  else
+    fail "repo-park DELETED home sentinel ${p}"
+  fi
+done
+if [ "$(cat "${pk9home}/Documents/keep.txt")" = "precious" ]; then
+  ok "home sentinel content intact"
+else
+  fail "home sentinel content changed"
+fi
+# Symlinked-HOME leg: HOME is a symlink to the fixture, so the literal-"$HOME"
+# arm can NOT match the pwd -P'd target — only the home_real (canonicalized)
+# arm of the case guard can catch it.
+ln -s "${pk9home}" "${park_root}/homelink"
+set +e; out="$(park_run_home "${park_root}/homelink" repo-park --apply "${pk9home}" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "a symlinked \$HOME still refuses (the home_real leg)"
+assert_contains "${out}" "refusing to park" "the symlinked-home refusal names the cause"
+for p in Documents/keep.txt .secrets; do
+  if [ -e "${pk9home}/${p}" ]; then
+    ok "home sentinel ${p} survives the symlinked-HOME probe"
+  else
+    fail "the symlinked-HOME probe DELETED ${p}"
+  fi
+done
+
+# --- Group PK10: the cycle stays idempotent — park→restore→re-park→restore
+# (work already round-tripped once in PK2/PK3; two more full cycles here).
+echo "smoke: PK10 — park/restore cycle repeats cleanly"
+for pk10i in 1 2; do
+  out="$(park_run repo-park --apply "${park_root}/work" 2>&1)"
+  assert_contains "${out}" "remotes kept: origin" "cycle ${pk10i}: re-park succeeds"
+  if [ -e "${park_root}/work/f.txt" ]; then
+    fail "cycle ${pk10i}: re-park left f.txt behind"
+  else
+    ok "cycle ${pk10i}: re-parked"
+  fi
+  out="$(park_run repo-restore "${park_root}/work" 2>&1)"
+  assert_contains "${out}" "repo-restore: restored" "cycle ${pk10i}: restore succeeds"
+  if [ "$(cat "${park_root}/work/f.txt")" = "hello" ]; then
+    ok "cycle ${pk10i}: content round-tripped"
+  else
+    fail "cycle ${pk10i}: content lost"
+  fi
+done
+if [ -z "$(git -C "${park_root}/work" status --porcelain)" ]; then
+  ok "final tree is clean after repeated cycles"
+else
+  fail "final tree is dirty after repeated cycles"
+fi
+if [ "$(git -C "${park_root}/work" rev-parse --abbrev-ref '@{upstream}')" = "origin/${defbr}" ]; then
+  ok "upstream tracking survives repeated cycles"
+else
+  fail "upstream tracking lost after repeated cycles"
+fi
+
+# --- Group PK11: literal ".."-NAMED entries are legal working-tree content.
+# The _repo_park_rm guard refuses ".." only as a path COMPONENT (traversal),
+# never as a substring of a basename — the old *..* substring guard aborted
+# the whole park on a file named a..b (PR #57 review, both reviewers).
+echo "smoke: PK11 — dot-dot-NAMED entries park + restore; a /../ COMPONENT still refuses"
+git clone -q "${park_root}/origin.git" "${park_root}/dotdot" 2>/dev/null
+( cd "${park_root}/dotdot" && echo one > "a..b" && mkdir "x..y" \
+    && echo two > "x..y/inner.txt" && git add -A && git commit -qm dotdot \
+    && git push -q origin HEAD )
+out="$(park_run repo-park --apply "${park_root}/dotdot" 2>&1)"
+assert_contains "${out}" "remotes kept: origin" "a repo containing a..b and x..y/ parks (substring-guard regression)"
+assert_not_contains "${out}" "refusing rm" "no rm refusal fired on the dot-dot-named entries"
+for p in "a..b" "x..y"; do
+  if [ -e "${park_root}/dotdot/${p}" ]; then
+    fail "park left ${p} behind (dot-dot-named entry not deleted)"
+  else
+    ok "park deleted ${p}"
+  fi
+done
+out="$(park_run repo-restore "${park_root}/dotdot" 2>&1)"
+assert_contains "${out}" "repo-restore: restored" "the dot-dot-named clone restores"
+if [ "$(cat "${park_root}/dotdot/a..b")" = "one" ]; then
+  ok "a..b content round-tripped"
+else
+  fail "a..b lost in the park/restore round trip"
+fi
+if [ "$(cat "${park_root}/dotdot/x..y/inner.txt")" = "two" ]; then
+  ok "x..y/inner.txt content round-tripped"
+else
+  fail "x..y/inner.txt lost in the park/restore round trip"
+fi
+# The guard still refuses a synthetic traversal COMPONENT (the glob loop never
+# produces one — probe the helper directly) and still admits a dot-dot NAME.
+set +e; out="$(park_run _repo_park_rm 0 "${park_root}/dotdot" "${HOME}" "${park_root}/dotdot/../escape" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "a /../ traversal component is still refused by _repo_park_rm"
+assert_contains "${out}" 'refusing rm of path with a ".." component' "the component refusal names the cause"
+set +e; out="$(park_run _repo_park_rm 0 "${park_root}/dotdot" "${HOME}" "${park_root}/dotdot/a..b" 2>&1)"; rc=$?; set -e
+pass_if "${rc}" "a dot-dot NAMED path passes the guard" \
+  "_repo_park_rm refused the legal name a..b (exit ${rc}): ${out}"
+assert_contains "${out}" "[dry-run] rm -rf" "the admitted name prints the dry-run ledger line"
+
+# --- Group PK12: the xdgcloud.parked marker is written only AFTER a fully
+# completed park (delete loops + git init). A refusal leaves NO marker — a
+# stranded marker would make the idempotency probe false-report "already
+# parked" on the re-run (PR #57 review, stranded-marker MEDIUM).
+echo "smoke: PK12 — parked marker set only on a completed park; refusals leave none"
+# Completed park -> marker present (fresh fixture, independent of PK2).
+git clone -q "${park_root}/origin.git" "${park_root}/marker" 2>/dev/null
+out="$(park_run repo-park --apply "${park_root}/marker" 2>&1)"
+assert_contains "${out}" "remotes kept: origin" "the marker fixture parks"
+if [ "$(git -C "${park_root}/marker" config --get xdgcloud.parked)" = "1" ]; then
+  ok "a completed park records xdgcloud.parked=1"
+else
+  fail "xdgcloud.parked missing after a completed park"
+fi
+# Refusal before any deletion (uncommitted changes) -> no marker, tree intact.
+git clone -q "${park_root}/origin.git" "${park_root}/refused" 2>/dev/null
+echo dirty >> "${park_root}/refused/f.txt"
+set +e; out="$(park_run repo-park --apply "${park_root}/refused" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "the uncommitted-changes --apply park is refused"
+set +e; git -C "${park_root}/refused" config --get xdgcloud.parked >/dev/null 2>&1; rc=$?; set -e
+assert_nonzero "${rc}" "a refused park (uncommitted) leaves NO xdgcloud.parked marker"
+set +e; git -C "${park_root}/refused" config --get xdgcloud.parkedBranch >/dev/null 2>&1; rc=$?; set -e
+assert_nonzero "${rc}" "a refused park leaves NO parkedBranch marker either"
+if [ -e "${park_root}/refused/f.txt" ]; then
+  ok "the refused park deleted nothing"
+else
+  fail "the refused park DELETED f.txt"
+fi
+# No-remotes HARD refusal -> no marker even under --apply -f.
+git init -q "${park_root}/nomarker"
+( cd "${park_root}/nomarker" && echo x > a.txt && git add a.txt && git commit -qm init )
+set +e; out="$(park_run repo-park --apply -f "${park_root}/nomarker" 2>&1)"; rc=$?; set -e
+assert_nonzero "${rc}" "the no-remotes park is refused under --apply -f"
+set +e; git -C "${park_root}/nomarker" config --get xdgcloud.parked >/dev/null 2>&1; rc=$?; set -e
+assert_nonzero "${rc}" "a refused park (no remotes) leaves NO xdgcloud.parked marker"
+# Re-run after a refusal must plan a normal park, never "already parked".
+git -C "${park_root}/refused" checkout -qf -- f.txt
+out="$(park_run repo-park "${park_root}/refused" 2>&1)"
+assert_not_contains "${out}" "already parked" "post-refusal re-run does not false-report already parked"
+assert_contains "${out}" "dry-run - nothing deleted" "post-refusal re-run plans a normal park"
 
 echo "smoke: PASS"

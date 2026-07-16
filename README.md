@@ -163,6 +163,30 @@ the script, so rclone progress and any guard refusal render verbatim.
 - `bin/xdg-tui --dump` prints one dashboard frame to stdout (no tty needed);
   `--version` matches the toolkit version.
 
+## `xdg-repo-park.sh` — park/restore pushed git clones (optional, sourced)
+
+Frees the disk of a fully-pushed clone **without losing the ability to get it back**:
+`repo-park` deletes the working tree + git objects but keeps `.git/config` (your
+remotes, verbatim) so the directory stays a valid, remotes-only marker.
+`repo-restore` fetches and checks it back out — on the branch you were on.
+
+Add to your `~/.bashrc` / `~/.zshrc` (it defines functions; it is not a script):
+
+    . /path/to/xdg-cloud/bin/xdg-repo-park.sh
+
+    # ALWAYS dry-run first — prints exactly what would be deleted, touches nothing:
+    repo-park ~/repos/some-clone
+    # when the plan looks right:
+    repo-park --apply ~/repos/some-clone
+    # later, get it back:
+    repo-restore ~/repos/some-clone
+
+**Destructive under `--apply`** — anything not on a remote is gone for good.
+`repo-park` refuses dirty trees, unpushed commits, stashes, and detached HEAD
+(`-f` overrides those four; nothing overrides a repo with no remotes). Known
+blind spots: local-only tags and reflog-only commits are destroyed silently.
+Not supported: submodules, bare repos, linked worktrees (all refused).
+
 ## `home-tree.sh` — local home + safe backup mirror
 
 Provisions a clean local XDG tree and mirrors the human-facing folders to the
